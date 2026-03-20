@@ -1,0 +1,22 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "Allows all Jasmine app invoke commands used by the UI."
+commands.allow = [
+  "start_discovery",
+  "stop_discovery",
+  "get_peers",
+  "send_message",
+  "get_messages",
+  "create_group",
+  "send_group_message",
+  "send_file",
+  "accept_file",
+  "reject_file",
+  "cancel_transfer",
+  "get_transfers",
+  "get_identity",
+  "update_display_name",
+  "update_avatar",
+  "get_settings",
+  "update_settings",
+]
