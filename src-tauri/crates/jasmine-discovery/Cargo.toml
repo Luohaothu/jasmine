@@ -1,0 +1,14 @@
+[package]
+name = "jasmine-discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+jasmine-core.workspace = true
+mdns-sd = "0.18"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing.workspace = true
+uuid.workspace = true
