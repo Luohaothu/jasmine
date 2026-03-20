@@ -1,0 +1,116 @@
+.container {
+  position: relative;
+  width: 100%;
+  padding: 16px;
+  background-color: var(--bg-primary);
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-height: 80px;
+}
+
+.dropOverlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(59, 130, 246, 0.9);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  font-weight: 500;
+  z-index: 10;
+  backdrop-filter: blur(4px);
+  border: 2px dashed rgba(255, 255, 255, 0.5);
+  margin: 8px;
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.inputWrapper {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  background-color: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  transition: border-color 0.2s;
+}
+
+.inputWrapper:focus-within {
+  border-color: var(--accent);
+}
+
+.textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  resize: none;
+  min-height: 24px;
+  max-height: 120px;
+  padding: 4px 0;
+  overflow-y: auto;
+}
+
+.textarea:focus {
+  outline: none;
+}
+
+.textarea::placeholder {
+  color: var(--text-secondary);
+}
+
+.charCount {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  padding-bottom: 8px;
+  user-select: none;
+}
+
+.charCountLimit {
+  color: #ef4444;
+}
+
+.sendButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  background-color: var(--accent);
+  color: white;
+  cursor: pointer;
+  transition: opacity 0.2s, transform 0.1s;
+  flex-shrink: 0;
+}
+
+.sendButton:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.sendButton:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.sendButton:disabled {
+  background-color: var(--border-color);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.icon {
+  width: 18px;
+  height: 18px;
+}

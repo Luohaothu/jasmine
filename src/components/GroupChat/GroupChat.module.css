@@ -1,0 +1,103 @@
+.container {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  background-color: var(--bg-primary);
+  overflow: hidden;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.header {
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+}
+
+.headerInfo {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.subtitle {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.manageBtn {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background-color: transparent;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.manageBtn:hover {
+  background-color: var(--bg-secondary);
+}
+
+.activeManageBtn {
+  background-color: var(--bg-secondary);
+  border-color: var(--accent);
+}
+
+.messageList {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.messageWrapper {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 16px;
+  max-width: 80%;
+}
+
+.ownWrapper {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.peerWrapper {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.senderName {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+  margin-left: 4px;
+}
+
+.emptyState {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
