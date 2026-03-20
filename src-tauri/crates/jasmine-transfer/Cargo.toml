@@ -1,0 +1,25 @@
+[package]
+name = "jasmine-transfer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+tauri-channel = ["dep:tauri"]
+
+[dependencies]
+fs4 = "0.8"
+hex = "0.4"
+jasmine-core.workspace = true
+serde.workspace = true
+sha2 = "0.10"
+tauri = { version = "2", optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
