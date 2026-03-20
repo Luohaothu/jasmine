@@ -1,0 +1,230 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  frontend:
+    name: Frontend Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint frontend
+        run: pnpm lint
+
+      - name: Run frontend tests
+        run: pnpm test
+
+      - name: Run frontend coverage
+        run: pnpm test:coverage
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: coverage/
+
+  rust:
+    name: Rust Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xdg-utils \
+            build-essential \
+            curl \
+            wget \
+            file \
+            pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        working-directory: src-tauri
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust workspace tests
+        working-directory: src-tauri
+        run: cargo test --workspace
+
+      - name: Run app integration tests
+        working-directory: src-tauri
+        run: cargo test -p jasmine-app --test integration -- --nocapture
+
+  bundle-linux:
+    name: Linux Bundle Validation
+    runs-on: ubuntu-latest
+    needs:
+      - frontend
+      - rust
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xdg-utils \
+            build-essential \
+            curl \
+            wget \
+            file \
+            pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri bundles
+        run: pnpm tauri build
+
+      - name: Verify Linux bundle artifacts
+        run: |
+          test -f src-tauri/target/release/bundle/deb/Jasmine_0.1.0_amd64.deb
+          test -f src-tauri/target/release/bundle/appimage/Jasmine_0.1.0_amd64.AppImage
+
+      - name: Validate Tauri config
+        run: |
+          node -e "const config=require('./src-tauri/tauri.conf.json'); if (!config.bundle.targets.includes('deb') || !config.bundle.targets.includes('appimage') || !config.bundle.targets.includes('msi')) { throw new Error('bundle targets missing expected entries'); } if (config.productName !== 'Jasmine') { throw new Error('unexpected productName'); } if (config.identifier !== 'dev.jasmine.app') { throw new Error('unexpected identifier'); }"
+
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: jasmine-linux-bundles
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  windows-validate:
+    name: Windows Validation
+    runs-on: windows-latest
+    needs:
+      - frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate Windows bundle target config
+        run: |
+          node -e "const config=require('./src-tauri/tauri.conf.json'); if (!config.bundle.targets.includes('msi')) { throw new Error('windows msi target missing'); } if (config.productName !== 'Jasmine') { throw new Error('unexpected productName'); } if (config.identifier !== 'dev.jasmine.app') { throw new Error('unexpected identifier'); }"
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Compile Rust workspace
+        working-directory: src-tauri
+        run: cargo build --workspace
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --workspace
