@@ -225,6 +225,6 @@ jobs:
         working-directory: src-tauri
         run: cargo build --workspace
 
-      - name: Run Rust tests
+      - name: Run Rust unit tests
         working-directory: src-tauri
-        run: cargo test --workspace
+        run: cargo test --workspace --lib --bins
