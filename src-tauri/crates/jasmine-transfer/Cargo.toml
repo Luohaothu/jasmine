@@ -9,6 +9,7 @@ default = []
 tauri-channel = ["dep:tauri"]
 
 [dependencies]
+image.workspace = true
 fs4 = "0.8"
 hex = "0.4"
 jasmine-core.workspace = true
