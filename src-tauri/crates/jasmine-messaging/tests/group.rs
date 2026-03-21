@@ -378,6 +378,58 @@ async fn group_offline_member_is_skipped_without_blocking_online_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn group_reply_to_message_from_other_chat_does_not_leak_preview() {
+    let alpha = Node::new(123, "Alpha Node").await;
+    let beta = Node::new(124, "Beta Node").await;
+
+    let _alpha_to_beta = alpha.connect_to(&beta).await;
+
+    let group = alpha
+        .chat
+        .create_group("Review Room", vec![beta.identity.device_id.clone()])
+        .await
+        .expect("create group");
+
+    wait_for_group(beta.storage.as_ref(), &group.id).await;
+
+    let original = alpha
+        .chat
+        .send_message(&beta.identity.device_id, "Direct chat context")
+        .await
+        .expect("send direct message");
+
+    let reply = alpha
+        .chat
+        .send_to_group_with_reply(
+            &group.id,
+            "Group reply should not include direct preview",
+            Some(original.id.to_string()),
+        )
+        .await
+        .expect("send group reply");
+
+    assert_eq!(reply.reply_to_id, Some(original.id.to_string()));
+    assert_eq!(reply.reply_to_preview, None);
+
+    let alpha_group_messages = wait_for_messages(&alpha.chat, &group.id, 1).await;
+    let beta_group_messages = wait_for_messages(&beta.chat, &group.id, 1).await;
+
+    assert_eq!(
+        alpha_group_messages[0].reply_to_id,
+        Some(original.id.to_string())
+    );
+    assert_eq!(alpha_group_messages[0].reply_to_preview, None);
+    assert_eq!(
+        beta_group_messages[0].reply_to_id,
+        Some(original.id.to_string())
+    );
+    assert_eq!(beta_group_messages[0].reply_to_preview, None);
+
+    alpha.shutdown().await;
+    beta.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn group_removed_member_stops_receiving_new_messages() {
     let alpha = Node::new(130, "Alpha Node").await;
     let beta = Node::new(131, "Beta Node").await;

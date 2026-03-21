@@ -461,6 +461,92 @@ async fn storage_v2_methods_update_messages_and_thumbnail_paths() {
 }
 
 #[tokio::test]
+async fn message_upsert_preserves_newer_edit_delete_and_reply_snapshot() {
+    let (_temp_dir, db_path) = temp_db_path("message-upsert-snapshot");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let reply_to_id = Uuid::new_v4().to_string();
+    let newer_reply_to_id = Uuid::new_v4().to_string();
+
+    let mut newer = message(
+        chat_id.clone(),
+        2_000,
+        MessageStatus::Delivered,
+        "newer body",
+    );
+    newer.edit_version = 3;
+    newer.edited_at = Some(5_000);
+    newer.is_deleted = true;
+    newer.deleted_at = Some(6_000);
+    newer.reply_to_id = Some(newer_reply_to_id.clone());
+    newer.reply_to_preview = Some("newer preview".to_string());
+
+    let mut older = newer.clone();
+    older.content = "stale body".to_string();
+    older.edit_version = 1;
+    older.edited_at = Some(4_000);
+    older.is_deleted = false;
+    older.deleted_at = None;
+    older.reply_to_id = Some(reply_to_id);
+    older.reply_to_preview = Some("stale preview".to_string());
+
+    storage
+        .save_message(&newer)
+        .await
+        .expect("save newer snapshot");
+    storage
+        .save_message(&older)
+        .await
+        .expect("save stale snapshot");
+
+    let loaded = storage
+        .get_message(&newer.id.to_string())
+        .await
+        .expect("load message")
+        .expect("message exists");
+
+    assert_eq!(loaded.content, "newer body");
+    assert_eq!(loaded.edit_version, 3);
+    assert_eq!(loaded.edited_at, Some(5_000));
+    assert!(loaded.is_deleted);
+    assert_eq!(loaded.deleted_at, Some(6_000));
+    assert_eq!(loaded.reply_to_id, Some(newer_reply_to_id));
+    assert_eq!(loaded.reply_to_preview.as_deref(), Some("newer preview"));
+}
+
+#[tokio::test]
+async fn message_upsert_preserves_latest_delete_timestamp() {
+    let (_temp_dir, db_path) = temp_db_path("message-upsert-delete-timestamp");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+
+    let mut latest_delete = message(chat_id, 2_000, MessageStatus::Delivered, "body");
+    latest_delete.is_deleted = true;
+    latest_delete.deleted_at = Some(6_000);
+
+    let mut stale_delete = latest_delete.clone();
+    stale_delete.deleted_at = Some(5_000);
+
+    storage
+        .save_message(&latest_delete)
+        .await
+        .expect("save latest delete snapshot");
+    storage
+        .save_message(&stale_delete)
+        .await
+        .expect("save stale delete snapshot");
+
+    let loaded = storage
+        .get_message(&latest_delete.id.to_string())
+        .await
+        .expect("load message")
+        .expect("message exists");
+
+    assert!(loaded.is_deleted);
+    assert_eq!(loaded.deleted_at, Some(6_000));
+}
+
+#[tokio::test]
 async fn peer_upsert_updates_existing_row() {
     let (_temp_dir, db_path) = temp_db_path("peer-upsert");
     let storage = SqliteStorage::open(&db_path).expect("storage opens");

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use jasmine_core::{
-    AppSettings, ChatId, DeviceId, DeviceIdentity, DiscoveryService, IdentityStore, Message,
-    MessageStatus, PeerInfo, ProtocolMessage, SettingsService, StorageEngine, TransferRecord,
-    TransferStatus,
+    protocol::FolderManifestData, AppSettings, ChatId, DeviceId, DeviceIdentity, DiscoveryService,
+    IdentityStore, Message, MessageStatus, PeerInfo, ProtocolMessage, SettingsService,
+    StorageEngine, TransferRecord, TransferStatus,
 };
 use jasmine_discovery::{DiscoveryManager, MdnsDiscoveryConfig, UdpBroadcastConfig};
 use jasmine_messaging::{
@@ -403,19 +403,96 @@ impl FrontendEmitter for TauriEmitter {
 
 #[derive(Default)]
 struct FolderBridgeState {
-    pending_offers: Mutex<HashMap<String, DeviceId>>,
-    active_receive_senders: Mutex<HashMap<String, DeviceId>>,
+    pending_offers: Mutex<HashMap<String, PendingFolderRoute>>,
+    active_receives: Mutex<HashMap<String, ActiveFolderRoute>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFolderRoute {
+    sender_id: DeviceId,
+    expected_files: VecDeque<FolderFileRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveFolderRoute {
+    sender_id: DeviceId,
+    expected_files: VecDeque<FolderFileRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderFileRoute {
+    filename: String,
+    size: u64,
+    sha256: String,
+}
+
+impl FolderFileRoute {
+    fn from_manifest_path(path: &str, size: u64, sha256: &str) -> Option<Self> {
+        let filename = path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())?
+            .to_string();
+        Some(Self {
+            filename,
+            size,
+            sha256: sha256.to_string(),
+        })
+    }
+
+    fn from_message(message: &ProtocolMessage) -> Option<Self> {
+        let ProtocolMessage::FileOffer {
+            filename,
+            size,
+            sha256,
+            ..
+        } = message
+        else {
+            return None;
+        };
+
+        Some(Self {
+            filename: filename.clone(),
+            size: *size,
+            sha256: sha256.clone(),
+        })
+    }
+
+    fn matches_offer(&self, offer: &Self) -> bool {
+        self.filename == offer.filename
+            && self.size == offer.size
+            && self.sha256.eq_ignore_ascii_case(&offer.sha256)
+    }
+}
+
+fn folder_file_routes(manifest: &FolderManifestData) -> VecDeque<FolderFileRoute> {
+    manifest
+        .files
+        .iter()
+        .filter_map(|entry| {
+            FolderFileRoute::from_manifest_path(&entry.relative_path, entry.size, &entry.sha256)
+        })
+        .collect()
 }
 
 impl FolderBridgeState {
-    fn remember_pending_offer(&self, offer: &FolderOfferNotification) {
+    fn remember_pending_offer(
+        &self,
+        offer: &FolderOfferNotification,
+        manifest: &FolderManifestData,
+    ) {
         self.pending_offers
             .lock()
             .expect("lock pending folder offers")
-            .insert(offer.folder_transfer_id.clone(), offer.sender_id.clone());
+            .insert(
+                offer.folder_transfer_id.clone(),
+                PendingFolderRoute {
+                    sender_id: offer.sender_id.clone(),
+                    expected_files: folder_file_routes(manifest),
+                },
+            );
     }
 
-    fn take_pending_offer_sender(&self, folder_id: &str) -> Option<DeviceId> {
+    fn take_pending_offer(&self, folder_id: &str) -> Option<PendingFolderRoute> {
         self.pending_offers
             .lock()
             .expect("lock pending folder offers")
@@ -429,30 +506,51 @@ impl FolderBridgeState {
             .contains_key(folder_id)
     }
 
-    fn has_active_receive_for_sender(&self, sender_id: &DeviceId) -> bool {
-        self.active_receive_senders
+    fn activate_receive(&self, folder_id: String, pending_offer: PendingFolderRoute) {
+        self.active_receives
             .lock()
             .expect("lock active folder receives")
-            .values()
-            .any(|active_sender| active_sender == sender_id)
-    }
-
-    fn activate_receive(&self, folder_id: String, sender_id: DeviceId) {
-        self.active_receive_senders
-            .lock()
-            .expect("lock active folder receives")
-            .insert(folder_id, sender_id);
+            .insert(
+                folder_id,
+                ActiveFolderRoute {
+                    sender_id: pending_offer.sender_id,
+                    expected_files: pending_offer.expected_files,
+                },
+            );
     }
 
     fn deactivate_receive(&self, folder_id: &str) {
-        self.active_receive_senders
+        self.active_receives
             .lock()
             .expect("lock active folder receives")
             .remove(folder_id);
     }
 
-    fn routes_file_offer(&self, sender_id: &DeviceId) -> bool {
-        self.has_active_receive_for_sender(sender_id)
+    fn routes_file_offer(&self, sender_id: &DeviceId, message: &ProtocolMessage) -> bool {
+        let Some(offer) = FolderFileRoute::from_message(message) else {
+            return false;
+        };
+
+        let mut active_receives = self
+            .active_receives
+            .lock()
+            .expect("lock active folder receives");
+        let Some(active_receive) = active_receives
+            .values_mut()
+            .find(|active_receive| active_receive.sender_id == *sender_id)
+        else {
+            return false;
+        };
+
+        let Some(expected_offer) = active_receive.expected_files.front() else {
+            return false;
+        };
+        if !expected_offer.matches_offer(&offer) {
+            return false;
+        }
+
+        active_receive.expected_files.pop_front();
+        true
     }
 }
 
@@ -1356,6 +1454,10 @@ async fn handle_transfer_protocol_message(
 ) {
     match message {
         folder_manifest @ ProtocolMessage::FolderManifest { .. } => {
+            let ProtocolMessage::FolderManifest { ref manifest, .. } = folder_manifest else {
+                unreachable!();
+            };
+            let manifest = manifest.clone();
             if let Ok(Some(notification)) = context
                 .folder_receiver
                 .handle_signal_message(
@@ -1365,7 +1467,9 @@ async fn handle_transfer_protocol_message(
                 )
                 .await
             {
-                context.folder_bridge.remember_pending_offer(&notification);
+                context
+                    .folder_bridge
+                    .remember_pending_offer(&notification, &manifest);
                 let payload = FolderOfferPayload {
                     folder_transfer_id: notification.folder_transfer_id,
                     folder_name: notification.folder_name,
@@ -1381,7 +1485,10 @@ async fn handle_transfer_protocol_message(
             }
         }
         file_offer @ ProtocolMessage::FileOffer { .. } => {
-            if context.folder_bridge.routes_file_offer(&context.sender_id) {
+            if context
+                .folder_bridge
+                .routes_file_offer(&context.sender_id, &file_offer)
+            {
                 let _ = context
                     .folder_receiver
                     .handle_signal_message(context.sender_id, context.sender_address, file_offer)
@@ -1957,12 +2064,12 @@ impl TransferServiceHandle for RealTransferService {
         _folder_id: &str,
         _target_dir: &Path,
     ) -> Result<(), String> {
-        let sender_id = self
+        let pending_offer = self
             .folder_bridge
-            .take_pending_offer_sender(_folder_id)
+            .take_pending_offer(_folder_id)
             .ok_or_else(|| format!("unknown folder transfer {}", _folder_id))?;
         self.folder_bridge
-            .activate_receive(_folder_id.to_string(), sender_id);
+            .activate_receive(_folder_id.to_string(), pending_offer);
 
         let cancellation = CancellationToken::new();
         self.folder_cancellations
@@ -2001,7 +2108,7 @@ impl TransferServiceHandle for RealTransferService {
     }
 
     async fn reject_folder_transfer(&self, _folder_id: &str) -> Result<(), String> {
-        let _ = self.folder_bridge.take_pending_offer_sender(_folder_id);
+        let _ = self.folder_bridge.take_pending_offer(_folder_id);
         self.folder_receiver
             .reject_offer(_folder_id, None)
             .await
@@ -2021,7 +2128,7 @@ impl TransferServiceHandle for RealTransferService {
         }
 
         if self.folder_bridge.has_pending_offer(_folder_id) {
-            let _ = self.folder_bridge.take_pending_offer_sender(_folder_id);
+            let _ = self.folder_bridge.take_pending_offer(_folder_id);
         }
         self.folder_receiver
             .cancel_transfer(_folder_id)

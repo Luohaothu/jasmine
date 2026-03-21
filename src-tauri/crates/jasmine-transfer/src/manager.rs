@@ -8,6 +8,7 @@ use jasmine_core::{
     TransferStatus,
 };
 use thiserror::Error;
+use tokio::{runtime::Handle, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -16,6 +17,8 @@ use crate::{
     FileSender, FileSenderError, FileSenderSignal, TransferProgress, TransferProgressReporter,
 };
 use tracing::{debug, warn};
+
+const THUMBNAIL_TASK_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
@@ -214,6 +217,12 @@ where
                 receiver,
                 settings,
                 storage,
+                runtime: Handle::try_current().map_err(|error| {
+                    TransferManagerError::Worker(format!(
+                        "transfer manager requires an active tokio runtime: {error}"
+                    ))
+                })?,
+                thumbnail_tasks: Arc::new(Semaphore::new(THUMBNAIL_TASK_LIMIT)),
                 state: Mutex::new(TransferManagerState {
                     active_limit,
                     active_ids: VecDeque::new(),
@@ -429,6 +438,8 @@ where
     receiver: Arc<R>,
     settings: SettingsService,
     storage: Arc<St>,
+    runtime: Handle,
+    thumbnail_tasks: Arc<Semaphore>,
     state: Mutex<TransferManagerState>,
 }
 
@@ -889,17 +900,20 @@ where
         };
 
         let storage = Arc::clone(&self.storage);
+        let runtime = self.runtime.clone();
+        let blocking_runtime = runtime.clone();
+        let thumbnail_tasks = Arc::clone(&self.thumbnail_tasks);
         let thumbnail_dir = app_data_dir.join("thumbnails");
-        std::thread::spawn(move || {
+        runtime.spawn_blocking(move || {
+            let Ok(_permit) = blocking_runtime.block_on(thumbnail_tasks.acquire_owned()) else {
+                return;
+            };
+
             match generate_thumbnail(&local_path, &thumbnail_dir, &transfer_id) {
                 Ok(thumbnail_path) => {
                     let thumbnail_path = thumbnail_path.to_string_lossy().into_owned();
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build thumbnail storage runtime");
                     let transfer_id_for_save = transfer_id.clone();
-                    if let Err(error) = runtime.block_on(async move {
+                    if let Err(error) = blocking_runtime.block_on(async move {
                         storage
                             .save_thumbnail_path(&transfer_id_for_save, &thumbnail_path)
                             .await

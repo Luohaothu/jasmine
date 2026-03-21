@@ -1032,6 +1032,77 @@ async fn manager_receive_image_generates_thumbnail_and_persists_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_receive_multiple_images_persists_each_thumbnail_path() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_settings(&settings, 2);
+
+    let sender = Arc::new(MockSender::default());
+    let receiver = Arc::new(MockReceiver::new(temp.path().join("downloads")));
+    let storage = Arc::new(MockStorage::default());
+    let manager = TransferManager::new(
+        Arc::clone(&sender),
+        Arc::clone(&receiver),
+        settings,
+        Arc::clone(&storage),
+    )
+    .expect("create transfer manager");
+    let offers = [
+        (Uuid::new_v4().to_string(), "first.png"),
+        (Uuid::new_v4().to_string(), "second.png"),
+    ];
+    let payload = encode_image_bytes(ImageFormat::Png, 640, 480);
+
+    for (offer_id, filename) in &offers {
+        receiver.set_completed_payload(offer_id, payload.clone());
+        manager
+            .handle_signal_message(
+                device_id(),
+                SocketAddr::from(([127, 0, 0, 1], 9735)),
+                ProtocolMessage::FileOffer {
+                    id: offer_id.clone(),
+                    filename: (*filename).to_string(),
+                    size: payload.len() as u64,
+                    sha256: "ignored".to_string(),
+                    transfer_port: 4043,
+                },
+            )
+            .await
+            .expect("handle image offer");
+        manager
+            .accept_offer(offer_id, Some(chat_id()))
+            .await
+            .expect("accept image offer");
+    }
+
+    for (offer_id, _) in &offers {
+        receiver.wait_started(offer_id).await;
+    }
+    for (offer_id, _) in &offers {
+        receiver.complete(offer_id);
+    }
+    for (offer_id, _) in &offers {
+        wait_for_transfer_status(&manager, offer_id, TransferStatus::Completed).await;
+    }
+
+    for (offer_id, _) in &offers {
+        let transfer_uuid = Uuid::parse_str(offer_id).expect("offer uuid");
+        let thumbnail_path = wait_for_thumbnail_path(&storage, &transfer_uuid).await;
+        let stored = storage
+            .transfer(&transfer_uuid)
+            .expect("stored transfer exists");
+
+        assert_eq!(stored.status, TransferStatus::Completed);
+        assert_eq!(
+            stored.thumbnail_path.as_deref(),
+            Some(thumbnail_path.as_str())
+        );
+        assert!(thumbnail_path.ends_with(".webp"));
+        assert_webp_thumbnail(Path::new(&thumbnail_path));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_non_image_thumbnail_failure_does_not_block_receive_completion() {
     let temp = tempdir().expect("tempdir");
     let settings = SettingsService::new(temp.path().join("app-data"));

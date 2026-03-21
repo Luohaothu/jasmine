@@ -17,6 +17,10 @@ const BUSY_TIMEOUT_MS: u64 = 5_000;
 const TRANSFER_DIRECTION_SEND: &str = "send";
 const MESSAGE_SELECT_COLUMNS: &str =
     "id, chat_id, sender_id, content, timestamp, status, edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview";
+const MESSAGE_EDIT_WINNER_EXPR: &str =
+    "excluded.edit_version > messages.edit_version OR (excluded.edit_version = messages.edit_version AND COALESCE(excluded.edited_at, -1) > COALESCE(messages.edited_at, -1))";
+const MESSAGE_DELETE_WINNER_EXPR: &str =
+    "excluded.is_deleted > messages.is_deleted OR (excluded.is_deleted = messages.is_deleted AND excluded.is_deleted = 1 AND COALESCE(excluded.deleted_at, -1) > COALESCE(messages.deleted_at, -1))";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -288,26 +292,47 @@ impl StorageEngine for SqliteStorage {
         let edited_at = option_u64_to_db_i64(message.edited_at, "edited_at")?;
         let deleted_at = option_u64_to_db_i64(message.deleted_at, "deleted_at")?;
         let is_deleted = bool_to_db(message.is_deleted);
+        let upsert_sql = format!(
+            "INSERT INTO messages (
+                id, chat_id, sender_id, content, timestamp, status, created_at,
+                edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+                 chat_id = excluded.chat_id,
+                 sender_id = excluded.sender_id,
+                 content = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN excluded.content
+                     ELSE messages.content
+                 END,
+                 timestamp = excluded.timestamp,
+                 status = excluded.status,
+                 created_at = excluded.created_at,
+                 edit_version = MAX(messages.edit_version, excluded.edit_version),
+                 edited_at = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.edited_at, messages.edited_at)
+                     ELSE messages.edited_at
+                 END,
+                 is_deleted = CASE
+                     WHEN {MESSAGE_DELETE_WINNER_EXPR} THEN excluded.is_deleted
+                     ELSE messages.is_deleted
+                 END,
+                 deleted_at = CASE
+                     WHEN {MESSAGE_DELETE_WINNER_EXPR} THEN COALESCE(excluded.deleted_at, messages.deleted_at)
+                     ELSE messages.deleted_at
+                 END,
+                 reply_to_id = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.reply_to_id, messages.reply_to_id)
+                     ELSE messages.reply_to_id
+                 END,
+                 reply_to_preview = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.reply_to_preview, messages.reply_to_preview)
+                     ELSE messages.reply_to_preview
+                 END"
+        );
 
         self.with_connection("sqlite save message failed", move |conn| {
             conn.execute(
-                "INSERT INTO messages (
-                    id, chat_id, sender_id, content, timestamp, status, created_at,
-                    edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(id) DO UPDATE SET
-                     chat_id = excluded.chat_id,
-                     sender_id = excluded.sender_id,
-                     content = excluded.content,
-                     timestamp = excluded.timestamp,
-                     status = excluded.status,
-                     created_at = excluded.created_at,
-                     edit_version = MAX(messages.edit_version, excluded.edit_version),
-                     edited_at = COALESCE(excluded.edited_at, messages.edited_at),
-                     is_deleted = MAX(messages.is_deleted, excluded.is_deleted),
-                     deleted_at = COALESCE(excluded.deleted_at, messages.deleted_at),
-                     reply_to_id = COALESCE(excluded.reply_to_id, messages.reply_to_id),
-                     reply_to_preview = COALESCE(excluded.reply_to_preview, messages.reply_to_preview)",
+                &upsert_sql,
                 params![
                     message.id.to_string(),
                     message.chat_id.0.to_string(),

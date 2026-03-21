@@ -1413,3 +1413,103 @@ mod chat_bridge {
         );
     }
 }
+
+mod transfer_bridge {
+    use super::*;
+    use crate::commands::FolderBridgeState;
+    use jasmine_core::protocol::{FolderFileEntry, FolderManifestData, ProtocolMessage};
+    use jasmine_transfer::FolderOfferNotification;
+
+    fn folder_offer_notification(folder_id: &str, sender_id: DeviceId) -> FolderOfferNotification {
+        FolderOfferNotification {
+            folder_transfer_id: folder_id.to_string(),
+            sender_id,
+            folder_name: "project".to_string(),
+            file_count: 2,
+            total_size: 12,
+        }
+    }
+
+    fn folder_manifest() -> FolderManifestData {
+        FolderManifestData {
+            folder_name: "project".to_string(),
+            files: vec![
+                FolderFileEntry {
+                    relative_path: "docs/report.txt".to_string(),
+                    size: 8,
+                    sha256: "abc123".to_string(),
+                },
+                FolderFileEntry {
+                    relative_path: "images/icon.png".to_string(),
+                    size: 4,
+                    sha256: "def456".to_string(),
+                },
+            ],
+            total_size: 12,
+        }
+    }
+
+    fn file_offer(id: &str, filename: &str, size: u64, sha256: &str) -> ProtocolMessage {
+        ProtocolMessage::FileOffer {
+            id: id.to_string(),
+            filename: filename.to_string(),
+            size,
+            sha256: sha256.to_string(),
+            transfer_port: 4040,
+        }
+    }
+
+    #[test]
+    fn folder_bridge_routes_only_matching_manifest_files_for_active_receive() {
+        let bridge = FolderBridgeState::default();
+        let sender_id = device_id(88);
+        let folder_id = "folder-1";
+
+        bridge.remember_pending_offer(
+            &folder_offer_notification(folder_id, sender_id.clone()),
+            &folder_manifest(),
+        );
+        let pending_offer = bridge
+            .take_pending_offer(folder_id)
+            .expect("pending folder offer exists");
+        bridge.activate_receive(folder_id.to_string(), pending_offer);
+
+        assert!(!bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("standalone-1", "notes.txt", 8, "abc123")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-1a", "report.txt", 8, "abc123")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-1b", "icon.png", 4, "def456")
+        ));
+    }
+
+    #[test]
+    fn folder_bridge_does_not_consume_expected_folder_offer_when_standalone_offer_arrives() {
+        let bridge = FolderBridgeState::default();
+        let sender_id = device_id(89);
+        let folder_id = "folder-2";
+
+        bridge.remember_pending_offer(
+            &folder_offer_notification(folder_id, sender_id.clone()),
+            &folder_manifest(),
+        );
+        let pending_offer = bridge
+            .take_pending_offer(folder_id)
+            .expect("pending folder offer exists");
+        bridge.activate_receive(folder_id.to_string(), pending_offer);
+
+        assert!(!bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("standalone-2", "notes.txt", 9, "fff999")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-2a", "report.txt", 8, "ABC123")
+        ));
+    }
+}

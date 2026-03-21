@@ -347,7 +347,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
         let content = content.into();
         let reply_to_preview = self
             .inner
-            .load_reply_preview(reply_to_id.as_deref())
+            .load_reply_preview(&chat_id, reply_to_id.as_deref())
             .await?;
         let mut message = Message {
             id: Uuid::new_v4(),
@@ -542,7 +542,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
         let content = content.into();
         let reply_to_preview = self
             .inner
-            .load_reply_preview(reply_to_id.as_deref())
+            .load_reply_preview(&group.id, reply_to_id.as_deref())
             .await?;
         let mut message = Message {
             id: Uuid::new_v4(),
@@ -1523,7 +1523,11 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         .map_err(|error| MessagingError::Storage(error.to_string()))?
     }
 
-    async fn load_reply_preview(&self, reply_to_id: Option<&str>) -> Result<Option<String>> {
+    async fn load_reply_preview(
+        &self,
+        chat_id: &ChatId,
+        reply_to_id: Option<&str>,
+    ) -> Result<Option<String>> {
         let Some(reply_to_id) = reply_to_id else {
             return Ok(None);
         };
@@ -1531,6 +1535,7 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         Ok(self
             .load_message(reply_to_id.to_string())
             .await?
+            .filter(|message| message.chat_id == *chat_id)
             .map(|message| snapshot_reply_preview(&message.content)))
     }
 

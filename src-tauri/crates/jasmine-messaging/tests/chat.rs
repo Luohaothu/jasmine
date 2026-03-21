@@ -975,16 +975,50 @@ async fn chat_reply_to_missing_original_stores_none_preview() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_reply_to_message_from_another_direct_chat_does_not_leak_preview() {
+    let sender = Node::new(54, "Cross Chat Sender").await;
+    let original_peer_id = Uuid::from_u128(55).to_string();
+    let reply_peer_id = Uuid::from_u128(56).to_string();
+
+    let original = sender
+        .chat
+        .send_message(&original_peer_id, "Private message from another chat")
+        .await
+        .expect("store original direct message locally");
+    assert_eq!(original.status, MessageStatus::Failed);
+
+    let reply = sender
+        .chat
+        .send_message_with_reply(
+            &reply_peer_id,
+            "Reply should not leak preview",
+            Some(original.id.to_string()),
+        )
+        .await
+        .expect("send cross-chat reply");
+
+    assert_eq!(reply.status, MessageStatus::Failed);
+    assert_eq!(reply.reply_to_id, Some(original.id.to_string()));
+    assert_eq!(reply.reply_to_preview, None);
+
+    let stored_reply = wait_for_message(&sender._storage, reply.id).await;
+    assert_eq!(stored_reply.reply_to_id, Some(original.id.to_string()));
+    assert_eq!(stored_reply.reply_to_preview, None);
+    assert_eq!(stored_reply.content, "Reply should not leak preview");
+
+    sender.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chat_reply_preview_truncates_to_one_hundred_characters() {
     let sender = Node::new(47, "Truncation Sender").await;
-    let original_peer_id = Uuid::from_u128(48).to_string();
-    let reply_peer_id = Uuid::from_u128(49).to_string();
+    let peer_id = Uuid::from_u128(48).to_string();
     let original_content = "0123456789".repeat(11);
     let expected_preview = truncated_reply_preview(&original_content);
 
     let original = sender
         .chat
-        .send_message(&original_peer_id, original_content.clone())
+        .send_message(&peer_id, original_content.clone())
         .await
         .expect("store original message locally");
     assert_eq!(original.status, MessageStatus::Failed);
@@ -992,7 +1026,7 @@ async fn chat_reply_preview_truncates_to_one_hundred_characters() {
     let reply = sender
         .chat
         .send_message_with_reply(
-            &reply_peer_id,
+            &peer_id,
             "Reply with truncated preview",
             Some(original.id.to_string()),
         )
