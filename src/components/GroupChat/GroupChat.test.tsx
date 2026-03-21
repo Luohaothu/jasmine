@@ -77,4 +77,13 @@ describe("GroupChat", () => {
     // If it's closed, "Me" shouldn't be rendered anywhere unless there's an issue.
     expect(screen.queryByText("Me")).not.toBeInTheDocument();
   });
+
+  it("triggers reply state when reply action is clicked", () => {
+    render(<GroupChat groupName="Dev Team" members={mockMembers} messages={mockMessages} onSendMessage={vi.fn()} />);
+    
+    const replyButtons = screen.getAllByTestId('action-reply');
+    expect(replyButtons.length).toBe(2);
+    
+    fireEvent.click(replyButtons[0]);
+  });
 });

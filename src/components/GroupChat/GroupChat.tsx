@@ -4,6 +4,7 @@ import { MemberPanel } from "./MemberPanel";
 import { Peer } from "../../types/peer";
 import { MessageBubble } from "../ChatView/MessageBubble";
 import { MessageInput } from "../MessageInput/MessageInput";
+import { useChatStore } from "../../stores/chatStore";
 
 export interface GroupMessage {
   id: string;
@@ -13,6 +14,10 @@ export interface GroupMessage {
   timestamp: number;
   isOwn: boolean;
   status?: "sent" | "delivered" | "failed";
+  isDeleted?: boolean;
+  editedAt?: number;
+  replyToId?: string;
+  replyToPreview?: string;
 }
 
 export interface GroupChatProps {
@@ -20,7 +25,7 @@ export interface GroupChatProps {
   members: Peer[];
   messages: GroupMessage[];
   // eslint-disable-next-line no-unused-vars
-  onSendMessage: (content: string) => void;
+  onSendMessage: (content: string, replyToId?: string) => void;
 }
 
 export const GroupChat: React.FC<GroupChatProps> = ({
@@ -30,6 +35,7 @@ export const GroupChat: React.FC<GroupChatProps> = ({
   onSendMessage,
 }) => {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
+  const setReplyingTo = useChatStore((state) => state.setReplyingTo);
 
   return (
     <div className={styles.container}>
@@ -63,10 +69,17 @@ export const GroupChat: React.FC<GroupChatProps> = ({
                 )}
                 {/* Reusing MessageBubble but wrapping it to handle senderName above it */}
                 <MessageBubble
+                  id={msg.id}
                   content={msg.content}
                   timestamp={msg.timestamp}
                   isOwn={msg.isOwn}
                   status={msg.status}
+                  isDeleted={msg.isDeleted}
+                  editedAt={msg.editedAt}
+                  replyToId={msg.replyToId}
+                  replyToPreview={msg.replyToPreview}
+                  senderName={msg.senderName}
+                  onReply={(id, preview, senderName) => setReplyingTo({ id, preview, senderName })}
                 />
               </div>
             ))
