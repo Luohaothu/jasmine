@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jasmine_core::{
-    ChatId, DeviceId, Message, MessageStatus, PeerInfo, StorageEngine, TransferRecord,
+    ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, StorageEngine, TransferRecord,
     TransferStatus, UserId,
 };
 use jasmine_storage::{ChatRecord, ChatType, SqliteStorage};
@@ -12,8 +12,10 @@ use tempfile::TempDir;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+const V1_MIGRATION_SQL: &str = include_str!("../migrations/V1__initial.sql");
+
 #[test]
-fn migration_creates_database_and_records_v1() {
+fn migration_creates_database_and_records_v2_schema() {
     let (_temp_dir, db_path) = temp_db_path("create");
 
     let _storage = SqliteStorage::open(&db_path).expect("storage opens");
@@ -34,11 +36,29 @@ fn migration_creates_database_and_records_v1() {
     );
 
     let versions = applied_versions(&conn);
-    assert_eq!(versions, vec![1]);
+    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(user_version(&conn), 2);
+    assert_columns_exist(
+        &conn,
+        "messages",
+        &[
+            "edit_version",
+            "edited_at",
+            "is_deleted",
+            "deleted_at",
+            "reply_to_id",
+            "reply_to_preview",
+        ],
+    );
+    assert_columns_exist(
+        &conn,
+        "transfers",
+        &["thumbnail_path", "folder_id", "folder_relative_path"],
+    );
 }
 
 #[test]
-fn migration_upgrades_v0_database_to_v1() {
+fn migration_upgrades_v0_database_to_v2() {
     let (_temp_dir, db_path) = temp_db_path("upgrade");
     Connection::open(&db_path)
         .expect("create empty v0 db")
@@ -59,7 +79,111 @@ fn migration_upgrades_v0_database_to_v1() {
             "transfers",
         ],
     );
-    assert_eq!(applied_versions(&conn), vec![1]);
+    assert_eq!(applied_versions(&conn), vec![1, 2]);
+    assert_eq!(user_version(&conn), 2);
+}
+
+#[test]
+fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
+    let (_temp_dir, db_path) = temp_db_path("upgrade-v1-to-v2");
+    let message_id = Uuid::new_v4();
+    let chat_id = Uuid::new_v4();
+    let sender_id = Uuid::new_v4();
+    let transfer_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+
+    let conn = Connection::open(&db_path).expect("create v1 db");
+    conn.execute_batch(V1_MIGRATION_SQL)
+        .expect("apply v1 schema manually");
+    conn.execute(
+        "INSERT INTO messages (id, chat_id, sender_id, content, timestamp, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            message_id.to_string(),
+            chat_id.to_string(),
+            sender_id.to_string(),
+            "legacy message",
+            1_234_i64,
+            "sent",
+            1_234_i64
+        ],
+    )
+    .expect("insert legacy message");
+    conn.execute(
+        "INSERT INTO transfers (
+            id, peer_id, filename, size, direction, status, sha256, created_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            transfer_id.to_string(),
+            peer_id.to_string(),
+            "legacy.bin",
+            512_i64,
+            "send",
+            "pending",
+            Option::<String>::None,
+            2_000_i64,
+            Option::<i64>::None
+        ],
+    )
+    .expect("insert legacy transfer");
+    conn.execute(
+        "INSERT INTO transfer_context (id, chat_id, local_path) VALUES (?1, ?2, ?3)",
+        params![
+            transfer_id.to_string(),
+            Option::<String>::None,
+            "/tmp/legacy.bin"
+        ],
+    )
+    .expect("insert legacy transfer context");
+    conn.execute_batch("PRAGMA user_version = 1;")
+        .expect("mark db as v1");
+    drop(conn);
+
+    let storage = SqliteStorage::open(&db_path).expect("storage opens and migrates");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let loaded = runtime
+        .block_on(async { storage.get_message(&message_id.to_string()).await })
+        .expect("load migrated message")
+        .expect("migrated message exists");
+
+    assert_eq!(loaded.id, message_id);
+    assert_eq!(loaded.chat_id, ChatId(chat_id));
+    assert_eq!(loaded.sender_id, UserId(sender_id));
+    assert_eq!(loaded.content, "legacy message");
+    assert_eq!(loaded.status, MessageStatus::Sent);
+    assert_eq!(loaded.edit_version, 0);
+    assert_eq!(loaded.edited_at, None);
+    assert!(!loaded.is_deleted);
+    assert_eq!(loaded.deleted_at, None);
+    assert_eq!(loaded.reply_to_id, None);
+    assert_eq!(loaded.reply_to_preview, None);
+
+    let conn = Connection::open(&db_path).expect("open migrated db");
+    assert_eq!(applied_versions(&conn), vec![1, 2]);
+    assert_eq!(user_version(&conn), 2);
+
+    let transfer_row = conn
+        .query_row(
+            "SELECT filename, thumbnail_path, folder_id, folder_relative_path
+             FROM transfers WHERE id = ?1",
+            params![transfer_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .expect("query migrated transfer row");
+    assert_eq!(transfer_row.0, "legacy.bin");
+    assert_eq!(transfer_row.1, None);
+    assert_eq!(transfer_row.2, None);
+    assert_eq!(transfer_row.3, None);
 }
 
 #[test]
@@ -196,6 +320,144 @@ async fn message_status_update_transitions_sent_delivered_failed() {
         .await
         .expect("query failed message");
     assert_eq!(failed[0].status, MessageStatus::Failed);
+}
+
+#[tokio::test]
+async fn message_v2_fields_round_trip_through_storage() {
+    let (_temp_dir, db_path) = temp_db_path("message-v2-roundtrip");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let mut message = message(
+        chat_id.clone(),
+        3_000,
+        MessageStatus::Delivered,
+        "reply body",
+    );
+
+    message.edit_version = 4;
+    message.edited_at = Some(4_000);
+    message.is_deleted = true;
+    message.deleted_at = Some(4_500);
+    message.reply_to_id = Some(Uuid::new_v4().to_string());
+    message.reply_to_preview = Some("quoted preview".to_string());
+
+    storage
+        .save_message(&message)
+        .await
+        .expect("save v2 message");
+
+    let loaded = storage
+        .get_message(&message.id.to_string())
+        .await
+        .expect("get message")
+        .expect("message exists");
+    assert_eq!(loaded, message);
+
+    let messages = storage
+        .get_messages(&chat_id, 10, 0)
+        .await
+        .expect("list messages");
+    assert_eq!(messages, vec![message]);
+}
+
+#[tokio::test]
+async fn storage_v2_methods_update_messages_and_thumbnail_paths() {
+    let (temp_dir, db_path) = temp_db_path("storage-v2-methods");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let mut message = message(chat_id, 1_000, MessageStatus::Sent, "original");
+    let reply_to_id = Uuid::new_v4().to_string();
+
+    message.reply_to_id = Some(reply_to_id.clone());
+    message.reply_to_preview = Some("reply snapshot".to_string());
+    storage.save_message(&message).await.expect("save message");
+
+    let loaded = storage
+        .get_message(&message.id.to_string())
+        .await
+        .expect("get message")
+        .expect("message exists");
+    assert_eq!(loaded.edit_version, 0);
+    assert_eq!(loaded.edited_at, None);
+    assert!(!loaded.is_deleted);
+    assert_eq!(loaded.deleted_at, None);
+    assert_eq!(loaded.reply_to_id.as_deref(), Some(reply_to_id.as_str()));
+    assert_eq!(loaded.reply_to_preview.as_deref(), Some("reply snapshot"));
+
+    storage
+        .update_message_content(&message.id.to_string(), "updated", 1, 5_000)
+        .await
+        .expect("update message content");
+    let updated = storage
+        .get_message(&message.id.to_string())
+        .await
+        .expect("reload updated message")
+        .expect("updated message exists");
+    assert_eq!(updated.content, "updated");
+    assert_eq!(updated.edit_version, 1);
+    assert_eq!(updated.edited_at, Some(5_000));
+    assert!(!updated.is_deleted);
+    assert_eq!(updated.deleted_at, None);
+
+    storage
+        .mark_message_deleted(&message.id.to_string(), 6_000)
+        .await
+        .expect("mark message deleted");
+    let deleted = storage
+        .get_message(&message.id.to_string())
+        .await
+        .expect("reload deleted message")
+        .expect("deleted message exists");
+    assert_eq!(deleted.content, "updated");
+    assert!(deleted.is_deleted);
+    assert_eq!(deleted.deleted_at, Some(6_000));
+
+    let payload_path = write_transfer_file(temp_dir.path(), "thumb.png", 32);
+    let transfer = transfer_record(&payload_path, TransferStatus::Pending);
+    storage
+        .save_transfer(&transfer)
+        .await
+        .expect("save transfer");
+    assert_eq!(
+        storage
+            .get_thumbnail_path(&transfer.id.to_string())
+            .await
+            .expect("read empty thumbnail"),
+        None
+    );
+
+    storage
+        .save_thumbnail_path(&transfer.id.to_string(), "/tmp/thumb.webp")
+        .await
+        .expect("save thumbnail path");
+    assert_eq!(
+        storage
+            .get_thumbnail_path(&transfer.id.to_string())
+            .await
+            .expect("read thumbnail path"),
+        Some("/tmp/thumb.webp".to_string())
+    );
+
+    let stored_transfer = storage
+        .get_transfers(10, 0)
+        .await
+        .expect("load transfers")
+        .into_iter()
+        .find(|candidate| candidate.id == transfer.id)
+        .expect("transfer exists");
+    assert_eq!(
+        stored_transfer.thumbnail_path.as_deref(),
+        Some("/tmp/thumb.webp")
+    );
+
+    let missing_id = Uuid::new_v4().to_string();
+    let error = storage
+        .update_message_content(&missing_id, "missing", 1, 7_000)
+        .await
+        .expect_err("missing message should error");
+    assert!(
+        matches!(error, CoreError::Persistence(message) if message.contains("message not found"))
+    );
 }
 
 #[tokio::test]
@@ -420,6 +682,12 @@ fn message(chat_id: ChatId, timestamp_ms: i64, status: MessageStatus, content: &
         content: content.to_string(),
         timestamp_ms,
         status,
+        edit_version: 0,
+        edited_at: None,
+        is_deleted: false,
+        deleted_at: None,
+        reply_to_id: None,
+        reply_to_preview: None,
     }
 }
 
@@ -435,6 +703,9 @@ fn transfer_record(path: &Path, status: TransferStatus) -> TransferRecord {
             .to_string(),
         local_path: path.to_path_buf(),
         status,
+        thumbnail_path: None,
+        folder_id: None,
+        folder_relative_path: None,
     }
 }
 
@@ -453,6 +724,29 @@ fn applied_versions(conn: &Connection) -> Vec<i64> {
         .expect("query migrations")
         .map(|row| row.expect("read migration row"))
         .collect()
+}
+
+fn user_version(conn: &Connection) -> i64 {
+    conn.query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .expect("read user_version")
+}
+
+fn assert_columns_exist(conn: &Connection, table: &str, expected_columns: &[&str]) {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("prepare table info query");
+    let column_names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query table info")
+        .map(|row| row.expect("read column name"))
+        .collect::<Vec<_>>();
+
+    for expected in expected_columns {
+        assert!(
+            column_names.iter().any(|column| column == expected),
+            "expected column {expected} in table {table}, got {column_names:?}"
+        );
+    }
 }
 
 fn assert_tables_exist(conn: &Connection, tables: &[&str]) {

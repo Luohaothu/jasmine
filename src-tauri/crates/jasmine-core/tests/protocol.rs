@@ -1,4 +1,6 @@
-use jasmine_core::protocol::{AckStatus, ProtocolMessage, MAX_PROTOCOL_MESSAGE_BYTES};
+use jasmine_core::protocol::{
+    AckStatus, FolderFileEntry, FolderManifestData, ProtocolMessage, MAX_PROTOCOL_MESSAGE_BYTES,
+};
 
 fn protocol_roundtrip(message: ProtocolMessage) {
     let json = serde_json::to_string(&message).expect("serialize protocol message to json");
@@ -22,6 +24,8 @@ fn protocol_roundtrip_text_message() {
         sender_id: "user-001".to_string(),
         content: "Hello from protocol".to_string(),
         timestamp: 1_700_000_000_000,
+        reply_to_id: None,
+        reply_to_preview: None,
     });
 }
 
@@ -34,6 +38,98 @@ fn protocol_roundtrip_file_offer() {
         sha256: "deadbeef".to_string(),
         transfer_port: 9001,
     });
+}
+
+#[test]
+fn protocol_roundtrip_text_message_with_reply_fields() {
+    protocol_roundtrip(ProtocolMessage::TextMessage {
+        id: "msg-002".to_string(),
+        chat_id: "chat-002".to_string(),
+        sender_id: "user-002".to_string(),
+        content: "Reply with context".to_string(),
+        timestamp: 1_700_000_000_001,
+        reply_to_id: Some("msg-parent-001".to_string()),
+        reply_to_preview: Some("Parent preview text".to_string()),
+    });
+}
+
+#[test]
+fn protocol_roundtrip_message_edit() {
+    protocol_roundtrip(ProtocolMessage::MessageEdit {
+        message_id: "msg-parent-001".to_string(),
+        chat_id: "chat-002".to_string(),
+        sender_id: "user-002".to_string(),
+        new_content: "Updated content".to_string(),
+        edit_version: 2,
+        timestamp_ms: 1_700_000_100_002,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_message_delete() {
+    protocol_roundtrip(ProtocolMessage::MessageDelete {
+        message_id: "msg-parent-002".to_string(),
+        chat_id: "chat-002".to_string(),
+        sender_id: "user-002".to_string(),
+        timestamp_ms: 1_700_000_100_003,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_folder_accept_reject() {
+    protocol_roundtrip(ProtocolMessage::FolderAccept {
+        folder_transfer_id: "folder-transfer-001".to_string(),
+    });
+
+    protocol_roundtrip(ProtocolMessage::FolderReject {
+        folder_transfer_id: "folder-transfer-002".to_string(),
+        reason: "Declined by user".to_string(),
+    });
+}
+
+#[test]
+fn protocol_roundtrip_folder_manifest_with_200_entries() {
+    let files = (0..200)
+        .map(|index| FolderFileEntry {
+            relative_path: format!("notes/file-{index:03}.txt"),
+            size: 1_024 + index as u64,
+            sha256: format!("{:064x}", index),
+        })
+        .collect();
+
+    protocol_roundtrip(ProtocolMessage::FolderManifest {
+        folder_transfer_id: "folder-transfer-manifest".to_string(),
+        sender_id: "sender-001".to_string(),
+        manifest: FolderManifestData {
+            folder_name: "notes".to_string(),
+            total_size: (0..200).map(|index| 1_024 + index as u64).sum(),
+            files,
+        },
+    });
+}
+
+#[test]
+fn protocol_folder_manifest_200_entries_stays_under_protocol_limit() {
+    let files = (0..200)
+        .map(|index| FolderFileEntry {
+            relative_path: format!("files/deep/path/{index:03}/document.txt"),
+            size: 512 + index as u64,
+            sha256: format!("{:064x}", 0xabc + index),
+        })
+        .collect();
+
+    let message = ProtocolMessage::FolderManifest {
+        folder_transfer_id: "folder-transfer-size".to_string(),
+        sender_id: "sender-size".to_string(),
+        manifest: FolderManifestData {
+            folder_name: "project".to_string(),
+            total_size: (0..200).map(|index| 512 + index as u64).sum(),
+            files,
+        },
+    };
+
+    let payload = serde_json::to_string(&message).expect("serialize 200-entry folder manifest");
+    assert!(payload.len() <= MAX_PROTOCOL_MESSAGE_BYTES);
 }
 
 #[test]
@@ -111,6 +207,8 @@ fn protocol_max_size_rejects_oversized_text_messages() {
         sender_id: "user-oversize".to_string(),
         content: make_repeating_string(65 * 1024),
         timestamp: 1_700_000_000_000,
+        reply_to_id: None,
+        reply_to_preview: None,
     };
 
     let json = serde_json::to_string(&message).expect("serialize message for test");
@@ -125,6 +223,8 @@ fn protocol_max_size_accepts_within_limit() {
         sender_id: "user-small".to_string(),
         content: make_repeating_string(63 * 1024),
         timestamp: 1_700_000_000_000,
+        reply_to_id: None,
+        reply_to_preview: None,
     };
 
     let json = serde_json::to_string(&message).expect("serialize message for limit test");
@@ -157,6 +257,38 @@ fn protocol_unknown_fields_are_ignored_on_deserialize() {
             sender_id: "user-extra".to_string(),
             content: "hello".to_string(),
             timestamp: 1700000000000,
+            reply_to_id: None,
+            reply_to_preview: None,
+        }
+    );
+}
+
+#[test]
+fn protocol_backward_compatible_text_message_without_reply_fields() {
+    let raw_json = r#"
+        {
+            "type": "TextMessage",
+            "id": "msg-reply-backward",
+            "chat_id": "chat-backward",
+            "sender_id": "user-backward",
+            "content": "legacy",
+            "timestamp": 1700000000000
+        }
+    "#;
+
+    let message = serde_json::from_str::<ProtocolMessage>(raw_json)
+        .expect("deserialize backward-compatible text message");
+
+    assert_eq!(
+        message,
+        ProtocolMessage::TextMessage {
+            id: "msg-reply-backward".to_string(),
+            chat_id: "chat-backward".to_string(),
+            sender_id: "user-backward".to_string(),
+            content: "legacy".to_string(),
+            timestamp: 1700000000000,
+            reply_to_id: None,
+            reply_to_preview: None,
         }
     );
 }
@@ -169,6 +301,8 @@ fn protocol_timestamp_is_unix_epoch_milliseconds() {
         sender_id: "user-ts".to_string(),
         content: "timestamp test".to_string(),
         timestamp: 1_760_000_000_000,
+        reply_to_id: None,
+        reply_to_preview: None,
     };
 
     let payload = serde_json::to_value(&message).expect("convert to json value");

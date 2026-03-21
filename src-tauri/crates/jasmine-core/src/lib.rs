@@ -2,6 +2,7 @@
 
 pub mod identity;
 pub mod protocol;
+pub mod richtext;
 pub mod settings;
 
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 pub use identity::{DeviceIdentity, IdentityStore};
 pub use protocol::{AckStatus, ProtocolMessage};
+pub use richtext::{extract_urls, parse_mentions, MentionRef, UrlRef};
 pub use settings::{AppSettings, SettingsService};
 
 pub type Result<T> = std::result::Result<T, CoreError>;
@@ -73,6 +75,12 @@ pub struct Message {
     pub content: String,
     pub timestamp_ms: i64,
     pub status: MessageStatus,
+    pub edit_version: u32,
+    pub edited_at: Option<u64>,
+    pub is_deleted: bool,
+    pub deleted_at: Option<u64>,
+    pub reply_to_id: Option<String>,
+    pub reply_to_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +115,9 @@ pub struct TransferRecord {
     pub file_name: String,
     pub local_path: PathBuf,
     pub status: TransferStatus,
+    pub thumbnail_path: Option<String>,
+    pub folder_id: Option<String>,
+    pub folder_relative_path: Option<String>,
 }
 
 pub trait DiscoveryService: Send + Sync {
@@ -128,6 +139,7 @@ pub trait FileTransfer: Send + Sync {
 
 pub trait StorageEngine: Send + Sync {
     async fn save_message(&self, message: &Message) -> Result<()>;
+    async fn get_message(&self, message_id: &str) -> Result<Option<Message>>;
     async fn get_messages(
         &self,
         chat_id: &ChatId,
@@ -136,8 +148,18 @@ pub trait StorageEngine: Send + Sync {
     ) -> Result<Vec<Message>>;
     async fn save_peer(&self, peer: &PeerInfo) -> Result<()>;
     async fn update_message_status(&self, msg_id: &Uuid, status: MessageStatus) -> Result<()>;
+    async fn update_message_content(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        edit_version: u32,
+        edited_at_ms: u64,
+    ) -> Result<()>;
+    async fn mark_message_deleted(&self, message_id: &str, deleted_at_ms: u64) -> Result<()>;
     async fn save_transfer(&self, transfer: &TransferRecord) -> Result<()>;
     async fn get_transfers(&self, limit: usize, offset: usize) -> Result<Vec<TransferRecord>>;
+    async fn save_thumbnail_path(&self, transfer_id: &str, thumbnail_path: &str) -> Result<()>;
+    async fn get_thumbnail_path(&self, transfer_id: &str) -> Result<Option<String>>;
     async fn update_transfer_status(
         &self,
         transfer_id: &Uuid,
