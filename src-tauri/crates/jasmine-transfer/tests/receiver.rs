@@ -215,7 +215,7 @@ impl MockTcpSender {
         self.connected.load(Ordering::SeqCst)
     }
 
-    async fn wait_for_first_chunk(&self) {
+async fn wait_for_first_chunk(&self) {
         let receiver = self
             .first_chunk_written
             .as_ref()
@@ -228,6 +228,20 @@ impl MockTcpSender {
             .await
             .expect("wait for first chunk timeout")
             .expect("first chunk signal should arrive");
+    }
+
+    async fn wait_for_path(path: &Path) {
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                if path.exists() {
+                    return;
+                }
+
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("wait for path timeout");
     }
 
     fn release(&self) {
@@ -459,6 +473,7 @@ async fn receiver_integrity_accepts_writes_partial_verifies_hash_and_reports_pro
     sender.wait_for_first_chunk().await;
     let partial_path = download_dir.join("archive.bin.jasmine-partial");
     let final_path = download_dir.join("archive.bin");
+    MockTcpSender::wait_for_path(&partial_path).await;
     assert!(
         partial_path.exists(),
         "transfer must write into partial file first"
