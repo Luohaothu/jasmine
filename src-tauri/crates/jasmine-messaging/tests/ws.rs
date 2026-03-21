@@ -139,6 +139,8 @@ async fn ws_roundtrip_json_messages_between_server_and_client() {
         sender_id: "client-101".to_string(),
         content: "hello over websocket".to_string(),
         timestamp: 1_700_000_000_000,
+        reply_to_id: None,
+        reply_to_preview: None,
     };
 
     client
@@ -273,6 +275,8 @@ async fn ws_multi_client_supports_message_isolation_and_reconnect() {
                 sender_id: format!("client-{index:03}"),
                 content: format!("payload-{index}"),
                 timestamp: 1_700_000_000_000 + index as i64,
+                reply_to_id: None,
+                reply_to_preview: None,
             })
             .await
             .expect("send isolated client message");
@@ -324,6 +328,8 @@ async fn ws_multi_client_supports_message_isolation_and_reconnect() {
             sender_id: "client-000".to_string(),
             content: "reconnected payload".to_string(),
             timestamp: 1_700_000_000_100,
+            reply_to_id: None,
+            reply_to_preview: None,
         })
         .await
         .expect("send reconnect message");

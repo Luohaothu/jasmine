@@ -5,19 +5,23 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use jasmine_core::{
     AppSettings, ChatId, DeviceId, DeviceIdentity, GroupInfo, Message, MessageStatus, PeerInfo,
-    UserId,
+    TransferRecord, TransferStatus, UserId,
 };
+use jasmine_transfer::{ManagedTransfer, TransferDirection, TransferProgress};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use super::{
-    accept_file_impl, cancel_transfer_impl, create_group_impl, get_identity_impl,
-    get_messages_impl, get_peers_impl, get_settings_impl, get_transfers_impl, reject_file_impl,
-    send_file_impl, send_group_message_impl, send_message_impl, setup_app_state_with_factory,
-    start_discovery_impl, stop_discovery_impl, update_avatar_impl, update_display_name_impl,
-    update_settings_impl, AppSetupFactory, AppState, ChatMessagePayload, DiscoveryServiceHandle,
-    FrontendEmitter, IdentityServiceHandle, MessagingServiceHandle, PeerPayload,
-    SettingsServiceHandle, SetupContext, TransferPayload, TransferServiceHandle,
+    accept_file_impl, accept_folder_transfer_impl, cancel_folder_transfer_impl,
+    cancel_transfer_impl, create_group_impl, delete_message_impl, edit_message_impl,
+    get_identity_impl, get_messages_impl, get_peers_impl, get_settings_impl, get_transfers_impl,
+    reject_file_impl, reject_folder_transfer_impl, send_file_impl, send_folder_impl,
+    send_group_message_impl, send_message_impl, setup_app_state_with_factory, start_discovery_impl,
+    stop_discovery_impl, transfer_payload_from_managed, transfer_payload_from_record,
+    update_avatar_impl, update_display_name_impl, update_settings_impl, AppSetupFactory, AppState,
+    ChatMessagePayload, DiscoveryServiceHandle, FrontendEmitter, IdentityServiceHandle,
+    MessagingServiceHandle, PeerPayload, SettingsServiceHandle, SetupContext, TransferPayload,
+    TransferServiceHandle,
 };
 
 fn device_id(seed: u128) -> DeviceId {
@@ -56,6 +60,12 @@ fn message(
         content: content.to_string(),
         timestamp_ms: 1_234,
         status,
+        edit_version: 0,
+        edited_at: None,
+        is_deleted: false,
+        deleted_at: None,
+        reply_to_id: None,
+        reply_to_preview: None,
     }
 }
 
@@ -84,6 +94,11 @@ fn transfer(id: &str, state: &str) -> TransferPayload {
         speed: 512,
         state: state.to_string(),
         sender_id: Some(Uuid::from_u128(9).to_string()),
+        local_path: Some(format!("/tmp/{id}.bin")),
+        thumbnail_path: None,
+        direction: None,
+        folder_id: None,
+        folder_relative_path: None,
     }
 }
 
@@ -132,6 +147,8 @@ struct MockMessagingService {
     sent_messages: Mutex<Vec<(String, String)>>,
     group_creations: Mutex<Vec<(String, Vec<String>)>>,
     group_messages: Mutex<Vec<(String, String)>>,
+    edit_calls: Mutex<Vec<(String, String, String)>>,
+    delete_calls: Mutex<Vec<(String, String)>>,
     messages: Mutex<Vec<Message>>,
     send_error: Mutex<Option<String>>,
 }
@@ -150,7 +167,12 @@ impl MockMessagingService {
 
 #[async_trait]
 impl MessagingServiceHandle for MockMessagingService {
-    async fn send_message(&self, peer_id: &str, content: &str) -> Result<Message, String> {
+    async fn send_message(
+        &self,
+        peer_id: &str,
+        content: &str,
+        _reply_to_id: Option<&str>,
+    ) -> Result<Message, String> {
         self.sent_messages
             .lock()
             .expect("lock sent messages")
@@ -185,13 +207,40 @@ impl MessagingServiceHandle for MockMessagingService {
         })
     }
 
-    async fn send_group_message(&self, group_id: &str, content: &str) -> Result<Message, String> {
+    async fn send_group_message(
+        &self,
+        group_id: &str,
+        content: &str,
+        _reply_to_id: Option<&str>,
+    ) -> Result<Message, String> {
         self.group_messages
             .lock()
             .expect("lock group messages")
             .push((group_id.to_string(), content.to_string()));
 
         Ok(message(12, 77, 1, content, MessageStatus::Delivered))
+    }
+
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        sender_id: &str,
+    ) -> Result<(), String> {
+        self.edit_calls.lock().expect("lock edit calls").push((
+            message_id.to_string(),
+            new_content.to_string(),
+            sender_id.to_string(),
+        ));
+        Ok(())
+    }
+
+    async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<(), String> {
+        self.delete_calls
+            .lock()
+            .expect("lock delete calls")
+            .push((message_id.to_string(), sender_id.to_string()));
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), String> {
@@ -202,9 +251,13 @@ impl MessagingServiceHandle for MockMessagingService {
 #[derive(Default)]
 struct MockTransferService {
     sent_files: Mutex<Vec<(String, PathBuf)>>,
+    sent_folders: Mutex<Vec<(String, PathBuf)>>,
     accepted_offers: Mutex<Vec<String>>,
+    accepted_folders: Mutex<Vec<(String, PathBuf)>>,
     rejected_offers: Mutex<Vec<(String, Option<String>)>>,
+    rejected_folders: Mutex<Vec<String>>,
     cancelled_transfers: Mutex<Vec<String>>,
+    cancelled_folders: Mutex<Vec<String>>,
     transfers: Mutex<Vec<TransferPayload>>,
     reject_error: Mutex<Option<String>>,
 }
@@ -229,6 +282,14 @@ impl TransferServiceHandle for MockTransferService {
             .expect("lock sent files")
             .push((peer_id.to_string(), file_path.to_path_buf()));
         Ok("transfer-123".to_string())
+    }
+
+    async fn send_folder(&self, peer_id: &str, folder_path: &Path) -> Result<String, String> {
+        self.sent_folders
+            .lock()
+            .expect("lock sent folders")
+            .push((peer_id.to_string(), folder_path.to_path_buf()));
+        Ok("folder-transfer-123".to_string())
     }
 
     async fn accept_file(&self, offer_id: &str) -> Result<String, String> {
@@ -257,6 +318,34 @@ impl TransferServiceHandle for MockTransferService {
             .lock()
             .expect("lock cancelled transfers")
             .push(transfer_id.to_string());
+        Ok(())
+    }
+
+    async fn accept_folder_transfer(
+        &self,
+        _folder_id: &str,
+        _target_dir: &Path,
+    ) -> Result<(), String> {
+        self.accepted_folders
+            .lock()
+            .expect("lock accepted folders")
+            .push((_folder_id.to_string(), _target_dir.to_path_buf()));
+        Ok(())
+    }
+
+    async fn reject_folder_transfer(&self, _folder_id: &str) -> Result<(), String> {
+        self.rejected_folders
+            .lock()
+            .expect("lock rejected folders")
+            .push(_folder_id.to_string());
+        Ok(())
+    }
+
+    async fn cancel_folder_transfer(&self, _folder_id: &str) -> Result<(), String> {
+        self.cancelled_folders
+            .lock()
+            .expect("lock cancelled folders")
+            .push(_folder_id.to_string());
         Ok(())
     }
 
@@ -430,10 +519,14 @@ mod commands {
             Arc::new(MockSettingsService::default()),
         );
 
-        let message_id =
-            send_message_impl(&state, Uuid::from_u128(2).to_string(), "hello".to_string())
-                .await
-                .expect("send message command");
+        let message_id = send_message_impl(
+            &state,
+            Uuid::from_u128(2).to_string(),
+            "hello".to_string(),
+            None,
+        )
+        .await
+        .expect("send message command");
 
         assert_eq!(message_id, Uuid::from_u128(11).to_string());
         assert_eq!(
@@ -462,6 +555,12 @@ mod commands {
                     content: "from local".to_string(),
                     timestamp_ms: 1_000,
                     status: MessageStatus::Sent,
+                    edit_version: 0,
+                    edited_at: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    reply_to_id: None,
+                    reply_to_preview: None,
                 },
                 Message {
                     id: Uuid::from_u128(11),
@@ -470,6 +569,12 @@ mod commands {
                     content: "from peer".to_string(),
                     timestamp_ms: 2_000,
                     status: MessageStatus::Delivered,
+                    edit_version: 0,
+                    edited_at: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    reply_to_id: None,
+                    reply_to_preview: None,
                 },
             ])),
             Arc::new(MockTransferService::default()),
@@ -491,6 +596,12 @@ mod commands {
                     content: "from local".to_string(),
                     timestamp: 1_000,
                     status: "sent".to_string(),
+                    edit_version: 0,
+                    edited_at: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    reply_to_id: None,
+                    reply_to_preview: None,
                 },
                 ChatMessagePayload {
                     id: Uuid::from_u128(11).to_string(),
@@ -499,6 +610,12 @@ mod commands {
                     content: "from peer".to_string(),
                     timestamp: 2_000,
                     status: "delivered".to_string(),
+                    edit_version: 0,
+                    edited_at: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    reply_to_id: None,
+                    reply_to_preview: None,
                 },
             ]
         );
@@ -552,6 +669,7 @@ mod commands {
             &state,
             Uuid::from_u128(77).to_string(),
             "hello group".to_string(),
+            None,
         )
         .await
         .expect("send group message command");
@@ -564,6 +682,60 @@ mod commands {
                 .expect("lock group messages")
                 .clone(),
             vec![(Uuid::from_u128(77).to_string(), "hello group".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_message_dispatches_to_messaging_service() {
+        let messaging = Arc::new(MockMessagingService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            messaging.clone(),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        edit_message_impl(&state, "msg-1".to_string(), "updated".to_string())
+            .await
+            .expect("edit message command");
+
+        assert_eq!(
+            messaging
+                .edit_calls
+                .lock()
+                .expect("lock edit calls")
+                .clone(),
+            vec![(
+                "msg-1".to_string(),
+                "updated".to_string(),
+                identity().device_id
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_message_dispatches_to_messaging_service() {
+        let messaging = Arc::new(MockMessagingService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            messaging.clone(),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        delete_message_impl(&state, "msg-1".to_string())
+            .await
+            .expect("delete message command");
+
+        assert_eq!(
+            messaging
+                .delete_calls
+                .lock()
+                .expect("lock delete calls")
+                .clone(),
+            vec![("msg-1".to_string(), identity().device_id)]
         );
     }
 
@@ -597,6 +769,36 @@ mod commands {
                 Uuid::from_u128(2).to_string(),
                 PathBuf::from("/tmp/file.txt")
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_folder_returns_transfer_id() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let transfer_id = send_folder_impl(
+            &state,
+            Uuid::from_u128(2).to_string(),
+            "/tmp/folder".to_string(),
+        )
+        .await
+        .expect("send folder command");
+
+        assert_eq!(transfer_id, "folder-transfer-123");
+        assert_eq!(
+            transfers
+                .sent_folders
+                .lock()
+                .expect("lock sent folders")
+                .clone(),
+            vec![(Uuid::from_u128(2).to_string(), PathBuf::from("/tmp/folder"))]
         );
     }
 
@@ -676,6 +878,81 @@ mod commands {
     }
 
     #[tokio::test]
+    async fn accept_folder_transfer_dispatches_to_transfer_service() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        accept_folder_transfer_impl(&state, "folder-1".to_string(), "/tmp/downloads".to_string())
+            .await
+            .expect("accept folder transfer command");
+
+        assert_eq!(
+            transfers
+                .accepted_folders
+                .lock()
+                .expect("lock accepted folders")
+                .clone(),
+            vec![("folder-1".to_string(), PathBuf::from("/tmp/downloads"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_folder_transfer_dispatches_to_transfer_service() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        reject_folder_transfer_impl(&state, "folder-1".to_string())
+            .await
+            .expect("reject folder transfer command");
+
+        assert_eq!(
+            transfers
+                .rejected_folders
+                .lock()
+                .expect("lock rejected folders")
+                .clone(),
+            vec!["folder-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_folder_transfer_dispatches_to_transfer_service() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        cancel_folder_transfer_impl(&state, "folder-1".to_string())
+            .await
+            .expect("cancel folder transfer command");
+
+        assert_eq!(
+            transfers
+                .cancelled_folders
+                .lock()
+                .expect("lock cancelled folders")
+                .clone(),
+            vec!["folder-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn get_transfers_returns_payloads() {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
@@ -693,6 +970,68 @@ mod commands {
             .expect("get transfers command");
 
         assert_eq!(transfers, vec![transfer("transfer-1", "active")]);
+    }
+
+    #[test]
+    fn transfer_payload_from_managed_includes_folder_linkage_metadata() {
+        let transfer = ManagedTransfer {
+            id: "transfer-1".to_string(),
+            peer_id: device_id(9),
+            chat_id: None,
+            file_name: "report.txt".to_string(),
+            local_path: PathBuf::from("/tmp/report.txt"),
+            direction: TransferDirection::Send,
+            status: TransferStatus::Active,
+            total_bytes: 200,
+            progress: Some(TransferProgress {
+                transfer_id: "transfer-1".to_string(),
+                bytes_sent: 50,
+                total_bytes: 200,
+                speed_bps: 25,
+            }),
+            folder_id: Some("folder-1".to_string()),
+            folder_relative_path: Some("docs/report.txt".to_string()),
+        };
+
+        let payload = transfer_payload_from_managed(&transfer);
+
+        assert_eq!(payload.folder_id.as_deref(), Some("folder-1"));
+        assert_eq!(
+            payload.folder_relative_path.as_deref(),
+            Some("docs/report.txt")
+        );
+        assert_eq!(payload.direction.as_deref(), Some("send"));
+        assert_eq!(payload.progress, 0.25);
+        assert_eq!(payload.speed, 25);
+    }
+
+    #[test]
+    fn transfer_payload_from_record_includes_persisted_folder_linkage_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let local_path = temp.path().join("report.txt");
+        std::fs::write(&local_path, vec![0_u8; 64]).expect("write persisted transfer file");
+
+        let record = TransferRecord {
+            id: Uuid::from_u128(55),
+            peer_id: device_id(9),
+            chat_id: None,
+            file_name: "report.txt".to_string(),
+            local_path,
+            status: TransferStatus::Completed,
+            thumbnail_path: None,
+            folder_id: Some("folder-1".to_string()),
+            folder_relative_path: Some("docs/report.txt".to_string()),
+        };
+
+        let payload = transfer_payload_from_record(&record);
+
+        assert_eq!(payload.folder_id.as_deref(), Some("folder-1"));
+        assert_eq!(
+            payload.folder_relative_path.as_deref(),
+            Some("docs/report.txt")
+        );
+        assert_eq!(payload.progress, 1.0);
+        assert_eq!(payload.size, 64);
     }
 
     #[test]
@@ -819,9 +1158,14 @@ mod commands_error {
             Arc::new(MockSettingsService::default()),
         );
 
-        let error = send_message_impl(&state, Uuid::from_u128(2).to_string(), "hello".to_string())
-            .await
-            .expect_err("send message should fail");
+        let error = send_message_impl(
+            &state,
+            Uuid::from_u128(2).to_string(),
+            "hello".to_string(),
+            None,
+        )
+        .await
+        .expect_err("send message should fail");
 
         assert!(error.contains("peer offline"));
     }
@@ -956,5 +1300,216 @@ mod setup_init {
             .expect("setup app state");
 
         assert!(factory.started_discovery.load(Ordering::SeqCst));
+    }
+}
+
+mod chat_bridge {
+    use super::*;
+    use crate::commands::emit_chat_service_event;
+    use jasmine_core::StorageEngine;
+    use jasmine_messaging::ChatServiceEvent;
+    use jasmine_storage::SqliteStorage;
+    use serde_json::json;
+
+    struct RecordingEmitter {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingEmitter {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<(String, serde_json::Value)> {
+            self.events.lock().expect("lock emitted events").clone()
+        }
+    }
+
+    impl FrontendEmitter for RecordingEmitter {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("lock emitted events")
+                .push((event.to_string(), payload));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_chat_service_event_bridges_edit_delete_and_mention_payloads() {
+        let dir = tempdir().expect("create temp dir");
+        let storage =
+            SqliteStorage::open(dir.path().join("commands.db")).expect("open sqlite storage");
+        let emitter = RecordingEmitter::new();
+        let mut stored_message = message(10, 2, 2, "before", MessageStatus::Delivered);
+        stored_message.edit_version = 2;
+        stored_message.edited_at = Some(7_654);
+        storage
+            .save_message(&stored_message)
+            .await
+            .expect("save bridge test message");
+
+        emit_chat_service_event(
+            ChatServiceEvent::MessageEdited {
+                message_id: stored_message.id,
+                new_content: "after".to_string(),
+                edit_version: 2,
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::MessageDeleted {
+                message_id: stored_message.id,
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::MentionReceived {
+                message_id: stored_message.id,
+                mentioned_user_id: "user-1".to_string(),
+                sender_name: "Alice".to_string(),
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+
+        assert_eq!(
+            emitter.snapshot(),
+            vec![
+                (
+                    "message-edited".to_string(),
+                    json!({
+                        "messageId": stored_message.id.to_string(),
+                        "newContent": "after",
+                        "editVersion": 2,
+                        "editedAt": 7654
+                    })
+                ),
+                (
+                    "message-deleted".to_string(),
+                    json!({
+                        "messageId": stored_message.id.to_string()
+                    })
+                ),
+                (
+                    "mention-received".to_string(),
+                    json!({
+                        "messageId": stored_message.id.to_string(),
+                        "mentionedUserId": "user-1",
+                        "senderName": "Alice"
+                    })
+                )
+            ]
+        );
+    }
+}
+
+mod transfer_bridge {
+    use super::*;
+    use crate::commands::FolderBridgeState;
+    use jasmine_core::protocol::{FolderFileEntry, FolderManifestData, ProtocolMessage};
+    use jasmine_transfer::FolderOfferNotification;
+
+    fn folder_offer_notification(folder_id: &str, sender_id: DeviceId) -> FolderOfferNotification {
+        FolderOfferNotification {
+            folder_transfer_id: folder_id.to_string(),
+            sender_id,
+            folder_name: "project".to_string(),
+            file_count: 2,
+            total_size: 12,
+        }
+    }
+
+    fn folder_manifest() -> FolderManifestData {
+        FolderManifestData {
+            folder_name: "project".to_string(),
+            files: vec![
+                FolderFileEntry {
+                    relative_path: "docs/report.txt".to_string(),
+                    size: 8,
+                    sha256: "abc123".to_string(),
+                },
+                FolderFileEntry {
+                    relative_path: "images/icon.png".to_string(),
+                    size: 4,
+                    sha256: "def456".to_string(),
+                },
+            ],
+            total_size: 12,
+        }
+    }
+
+    fn file_offer(id: &str, filename: &str, size: u64, sha256: &str) -> ProtocolMessage {
+        ProtocolMessage::FileOffer {
+            id: id.to_string(),
+            filename: filename.to_string(),
+            size,
+            sha256: sha256.to_string(),
+            transfer_port: 4040,
+        }
+    }
+
+    #[test]
+    fn folder_bridge_routes_only_matching_manifest_files_for_active_receive() {
+        let bridge = FolderBridgeState::default();
+        let sender_id = device_id(88);
+        let folder_id = "folder-1";
+
+        bridge.remember_pending_offer(
+            &folder_offer_notification(folder_id, sender_id.clone()),
+            &folder_manifest(),
+        );
+        let pending_offer = bridge
+            .take_pending_offer(folder_id)
+            .expect("pending folder offer exists");
+        bridge.activate_receive(folder_id.to_string(), pending_offer);
+
+        assert!(!bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("standalone-1", "notes.txt", 8, "abc123")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-1a", "report.txt", 8, "abc123")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-1b", "icon.png", 4, "def456")
+        ));
+    }
+
+    #[test]
+    fn folder_bridge_does_not_consume_expected_folder_offer_when_standalone_offer_arrives() {
+        let bridge = FolderBridgeState::default();
+        let sender_id = device_id(89);
+        let folder_id = "folder-2";
+
+        bridge.remember_pending_offer(
+            &folder_offer_notification(folder_id, sender_id.clone()),
+            &folder_manifest(),
+        );
+        let pending_offer = bridge
+            .take_pending_offer(folder_id)
+            .expect("pending folder offer exists");
+        bridge.activate_receive(folder_id.to_string(), pending_offer);
+
+        assert!(!bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("standalone-2", "notes.txt", 9, "fff999")
+        ));
+        assert!(bridge.routes_file_offer(
+            &sender_id,
+            &file_offer("folder-2a", "report.txt", 8, "ABC123")
+        ));
     }
 }

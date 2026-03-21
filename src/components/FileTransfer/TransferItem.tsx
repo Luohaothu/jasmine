@@ -27,8 +27,7 @@ export function TransferItem({ transfer }: TransferItemProps) {
     }
   };
 
-  const isComplete = transfer.state === "completed";
-  const isFailed = transfer.state === "failed";
+  const isTerminal = ["completed", "failed", "partially-failed", "cancelled", "rejected"].includes(transfer.state);
   const isActive = transfer.state === "active";
 
   return (
@@ -49,7 +48,7 @@ export function TransferItem({ transfer }: TransferItemProps) {
       <div className={styles.itemFooter}>
         <span>{formatBytes(transfer.size)}</span>
         {isActive && <span className={styles.speed}>{formatSpeed(transfer.speed)}</span>}
-        {!isComplete && !isFailed && (
+        {!isTerminal && (
           <button className={styles.cancelBtn} onClick={handleCancel} aria-label="Cancel transfer">
             Cancel
           </button>

@@ -56,7 +56,7 @@ pub enum FileReceiverError {
     #[error("receiver config is invalid: {0}")]
     InvalidConfig(&'static str),
     #[error("unexpected signalling message: {0:?}")]
-    UnexpectedMessage(ProtocolMessage),
+    UnexpectedMessage(Box<ProtocolMessage>),
     #[error("file offer is not pending: {0}")]
     UnknownOffer(String),
     #[error("could not resolve the default download directory")]
@@ -150,6 +150,46 @@ where
         sender_address: SocketAddr,
         message: ProtocolMessage,
     ) -> Result<FileOfferNotification, FileReceiverError> {
+        let download_dir = resolve_download_dir(&self.settings.load()?.download_dir)?;
+        self.receive_offer_with_target(
+            sender_id,
+            sender_address,
+            message,
+            PendingSaveTarget::Directory(download_dir.clone()),
+            download_dir,
+        )
+        .await
+    }
+
+    pub(crate) async fn receive_offer_to_path(
+        &self,
+        sender_id: DeviceId,
+        sender_address: SocketAddr,
+        message: ProtocolMessage,
+        final_path: PathBuf,
+    ) -> Result<FileOfferNotification, FileReceiverError> {
+        let download_dir = final_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.receive_offer_with_target(
+            sender_id,
+            sender_address,
+            message,
+            PendingSaveTarget::ExactPath(final_path),
+            download_dir,
+        )
+        .await
+    }
+
+    async fn receive_offer_with_target(
+        &self,
+        sender_id: DeviceId,
+        sender_address: SocketAddr,
+        message: ProtocolMessage,
+        target: PendingSaveTarget,
+        download_dir: PathBuf,
+    ) -> Result<FileOfferNotification, FileReceiverError> {
         let (offer_id, filename, size, sha256, transfer_port) = match message {
             ProtocolMessage::FileOffer {
                 id,
@@ -164,10 +204,8 @@ where
                 sha256,
                 transfer_port,
             ),
-            other => return Err(FileReceiverError::UnexpectedMessage(other)),
+            other => return Err(FileReceiverError::UnexpectedMessage(Box::new(other))),
         };
-
-        let download_dir = resolve_download_dir(&self.settings.load()?.download_dir)?;
         let (available_space_bytes, required_space_bytes) =
             self.query_disk_space(&download_dir, size)?;
         let notification = FileOfferNotification {
@@ -194,7 +232,7 @@ where
                     size,
                     sha256,
                     transfer_port,
-                    download_dir,
+                    target,
                 },
             );
 
@@ -228,7 +266,7 @@ where
 
         let pending = self.take_pending_offer(offer_id)?;
         let (available_space_bytes, required_space_bytes) =
-            self.query_disk_space(&pending.download_dir, pending.size)?;
+            self.query_disk_space(&pending.target.parent_dir()?, pending.size)?;
 
         if available_space_bytes < required_space_bytes {
             self.signal
@@ -304,9 +342,9 @@ where
     ) -> Result<PathBuf, FileReceiverError> {
         tokio::select! {
             _ = cancellation.cancelled() => return Err(FileReceiverError::Cancelled),
-            create_dir_outcome = fs::create_dir_all(&pending.download_dir) => create_dir_outcome?,
+            create_dir_outcome = fs::create_dir_all(pending.target.parent_dir()?) => create_dir_outcome?,
         }
-        let final_path = resolve_target_path(&pending.download_dir, &pending.filename)?;
+        let final_path = pending.target.resolve_final_path(&pending.filename)?;
         let partial_path = partial_path_for(&final_path)?;
         let endpoint = SocketAddr::new(pending.sender_address.ip(), pending.transfer_port);
         let mut stream = tokio::select! {
@@ -416,7 +454,32 @@ struct PendingOffer {
     size: u64,
     sha256: String,
     transfer_port: u16,
-    download_dir: PathBuf,
+    target: PendingSaveTarget,
+}
+
+enum PendingSaveTarget {
+    Directory(PathBuf),
+    ExactPath(PathBuf),
+}
+
+impl PendingSaveTarget {
+    fn parent_dir(&self) -> Result<PathBuf, FileReceiverError> {
+        match self {
+            Self::Directory(path) => Ok(path.clone()),
+            Self::ExactPath(path) => Ok(path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))),
+        }
+    }
+
+    fn resolve_final_path(&self, filename: &str) -> Result<PathBuf, FileReceiverError> {
+        match self {
+            Self::Directory(download_dir) => resolve_target_path(download_dir, filename),
+            Self::ExactPath(path) => Ok(path.clone()),
+        }
+    }
 }
 
 struct SystemDiskSpaceChecker;
@@ -427,7 +490,7 @@ impl DiskSpaceChecker for SystemDiskSpaceChecker {
     }
 }
 
-fn sanitize_filename(filename: &str) -> Result<String, FileReceiverError> {
+pub(crate) fn sanitize_filename(filename: &str) -> Result<String, FileReceiverError> {
     Path::new(filename)
         .file_name()
         .and_then(|value| value.to_str())

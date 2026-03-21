@@ -1,10 +1,12 @@
 import React, { useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useParams, useNavigate } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import { useChatStore, ChatMessage } from "../../stores/chatStore";
 import { usePeerStore } from "../../stores/peerStore";
 import { ChatHeader } from "./ChatHeader";
 import { MessageBubble } from "./MessageBubble";
+import { MessageInput } from "../MessageInput/MessageInput";
 import styles from "./ChatView.module.css";
 
 const EMPTY_ARRAY: ChatMessage[] = [];
@@ -50,7 +52,7 @@ export const ChatView: React.FC = () => {
 
     return () => {
       promise.then((unlisten) => unlisten()).catch((error) => {
-        void error;
+        console.error("Failed to unlisten message-received:", error);
       });
     };
   }, [peerId, addMessage]);
@@ -75,15 +77,35 @@ export const ChatView: React.FC = () => {
           messages.map((msg) => (
             <MessageBubble
               key={msg.id}
+              id={msg.id}
               content={msg.content}
               timestamp={msg.timestamp}
               isOwn={msg.senderId === "local"}
+              senderName={msg.senderId === "local" ? "You" : peer?.name}
               status={msg.status}
+              isDeleted={msg.isDeleted}
+              editedAt={msg.editedAt}
+              replyToId={msg.replyToId}
+              replyToPreview={msg.replyToPreview}
+              type={msg.type}
+              metadata={msg.metadata}
+              onEdit={(id, newContent) => {
+                invoke("edit_message", { messageId: id, newContent }).catch((error) => {
+                  console.error("Failed to edit message:", error);
+                });
+              }}
+              onDelete={(id) => {
+                invoke("delete_message", { messageId: id }).catch((error) => {
+                  console.error("Failed to delete message:", error);
+                });
+              }}
+              onReply={(id, preview, senderName) => useChatStore.getState().setReplyingTo({ id, preview, senderName })}
             />
           ))
         )}
         <div ref={messagesEndRef} />
       </div>
+      <MessageInput peerId={peerId} />
     </div>
   );
 };

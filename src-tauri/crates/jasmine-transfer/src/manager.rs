@@ -8,13 +8,17 @@ use jasmine_core::{
     TransferStatus,
 };
 use thiserror::Error;
+use tokio::{runtime::Handle, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    FileOfferNotification, FileReceiver, FileReceiverError, FileReceiverSignal, FileSender,
-    FileSenderError, FileSenderSignal, TransferProgress, TransferProgressReporter,
+    generate_thumbnail, FileOfferNotification, FileReceiver, FileReceiverError, FileReceiverSignal,
+    FileSender, FileSenderError, FileSenderSignal, TransferProgress, TransferProgressReporter,
 };
+use tracing::{debug, warn};
+
+const THUMBNAIL_TASK_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
@@ -33,6 +37,8 @@ pub struct ManagedTransfer {
     pub status: TransferStatus,
     pub total_bytes: u64,
     pub progress: Option<TransferProgress>,
+    pub folder_id: Option<String>,
+    pub folder_relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -211,6 +217,12 @@ where
                 receiver,
                 settings,
                 storage,
+                runtime: Handle::try_current().map_err(|error| {
+                    TransferManagerError::Worker(format!(
+                        "transfer manager requires an active tokio runtime: {error}"
+                    ))
+                })?,
+                thumbnail_tasks: Arc::new(Semaphore::new(THUMBNAIL_TASK_LIMIT)),
                 state: Mutex::new(TransferManagerState {
                     active_limit,
                     active_ids: VecDeque::new(),
@@ -228,14 +240,39 @@ where
         file_path: PathBuf,
         chat_id: Option<ChatId>,
     ) -> Result<String, TransferManagerError> {
-        let transfer_id = Uuid::new_v4();
+        self.send_file_with_id_and_context(
+            Uuid::new_v4().to_string(),
+            peer_id,
+            file_path,
+            chat_id,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_file_with_id_and_context(
+        &self,
+        transfer_id: String,
+        peer_id: DeviceId,
+        file_path: PathBuf,
+        chat_id: Option<ChatId>,
+        folder_link: Option<FolderTransferLink>,
+        progress_reporter: Option<Arc<dyn TransferProgressReporter>>,
+    ) -> Result<String, TransferManagerError> {
+        let record_id = Uuid::parse_str(&transfer_id)
+            .map_err(|_| TransferManagerError::InvalidTransferId(transfer_id.clone()))?;
         let file_name = file_name_from_path(&file_path)?;
         let total_bytes = std::fs::metadata(&file_path)
             .map_err(|error| TransferManagerError::Worker(error.to_string()))?
             .len();
+        let folder_id = folder_link.as_ref().map(|link| link.folder_id.clone());
+        let folder_relative_path = folder_link
+            .as_ref()
+            .map(|link| link.folder_relative_path.clone());
 
         let transfer = ManagedTransfer {
-            id: transfer_id.to_string(),
+            id: transfer_id.clone(),
             peer_id: peer_id.clone(),
             chat_id,
             file_name,
@@ -244,21 +281,21 @@ where
             status: TransferStatus::Pending,
             total_bytes,
             progress: None,
+            folder_id,
+            folder_relative_path,
         };
-        let transfer_id_string = transfer.id.clone();
 
         self.inner.enqueue_transfer(ManagedTransferEntry {
-            record_id: transfer_id,
+            record_id,
             transfer,
             source: TransferSource::Send { peer_id, file_path },
             cancellation: CancellationToken::new(),
+            progress_reporter,
         });
-        self.inner
-            .persist_transfer_async(&transfer_id_string)
-            .await?;
+        self.inner.persist_transfer_async(&transfer_id).await?;
         self.inner.start_ready_transfers_async().await?;
 
-        Ok(transfer_id_string)
+        Ok(transfer_id)
     }
 
     pub async fn handle_signal_message(
@@ -315,6 +352,8 @@ where
             status: TransferStatus::Pending,
             total_bytes: pending_offer.notification.size,
             progress: None,
+            folder_id: None,
+            folder_relative_path: None,
         };
 
         self.inner.enqueue_transfer(ManagedTransferEntry {
@@ -324,6 +363,7 @@ where
                 offer_id: offer_id.to_string(),
             },
             cancellation: CancellationToken::new(),
+            progress_reporter: None,
         });
         self.inner.persist_transfer_async(offer_id).await?;
         self.inner.start_ready_transfers_async().await?;
@@ -398,6 +438,8 @@ where
     receiver: Arc<R>,
     settings: SettingsService,
     storage: Arc<St>,
+    runtime: Handle,
+    thumbnail_tasks: Arc<Semaphore>,
     state: Mutex<TransferManagerState>,
 }
 
@@ -414,6 +456,7 @@ struct ManagedTransferEntry {
     transfer: ManagedTransfer,
     source: TransferSource,
     cancellation: CancellationToken,
+    progress_reporter: Option<Arc<dyn TransferProgressReporter>>,
 }
 
 #[derive(Clone)]
@@ -425,6 +468,12 @@ enum TransferSource {
     Receive {
         offer_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FolderTransferLink {
+    pub folder_id: String,
+    pub folder_relative_path: String,
 }
 
 struct PendingOfferEntry {
@@ -577,14 +626,17 @@ where
     }
 
     fn record_progress(&self, transfer_id: &str, progress: TransferProgress) {
-        if let Some(entry) = self
-            .state
-            .lock()
-            .expect("lock transfer manager state")
-            .transfers
-            .get_mut(transfer_id)
-        {
-            entry.transfer.progress = Some(progress);
+        let reporter = {
+            let mut state = self.state.lock().expect("lock transfer manager state");
+            let Some(entry) = state.transfers.get_mut(transfer_id) else {
+                return;
+            };
+            entry.transfer.progress = Some(progress.clone());
+            entry.progress_reporter.clone()
+        };
+
+        if let Some(reporter) = reporter {
+            reporter.report(progress);
         }
     }
 
@@ -666,14 +718,7 @@ where
         let state = self.state.lock().expect("lock transfer manager state");
         let entry = state.transfers.get(transfer_id)?;
 
-        Some(TransferRecord {
-            id: entry.record_id,
-            peer_id: entry.transfer.peer_id.clone(),
-            chat_id: entry.transfer.chat_id.clone(),
-            file_name: entry.transfer.file_name.clone(),
-            local_path: entry.transfer.local_path.clone(),
-            status: entry.transfer.status.clone(),
-        })
+        Some(build_transfer_record(entry, &entry.transfer))
     }
 
     async fn start_ready_transfers_async(self: &Arc<Self>) -> Result<(), TransferManagerError> {
@@ -793,31 +838,111 @@ where
 
                 Some(PersistedTransferRecord {
                     transfer_id: transfer_id.to_string(),
-                    record: TransferRecord {
-                        id: entry.record_id,
-                        peer_id: updated_transfer.peer_id.clone(),
-                        chat_id: updated_transfer.chat_id.clone(),
-                        file_name: updated_transfer.file_name.clone(),
-                        local_path: updated_transfer.local_path.clone(),
-                        status: updated_transfer.status.clone(),
-                    },
+                    record: build_transfer_record(entry, &updated_transfer),
                     updated_transfer,
                 })
             }
         };
 
         if let Some(persisted) = persisted {
+            let thumbnail_job = (
+                persisted.transfer_id.clone(),
+                persisted.updated_transfer.direction,
+                persisted.updated_transfer.status.clone(),
+                persisted.updated_transfer.local_path.clone(),
+            );
             self.persist_record_blocking(persisted.record);
 
             let mut state = self.state.lock().expect("lock transfer manager state");
             if let Some(entry) = state.transfers.get_mut(&persisted.transfer_id) {
                 if entry.transfer.status != TransferStatus::Cancelled {
-                    entry.transfer = persisted.updated_transfer;
+                    entry.transfer = persisted.updated_transfer.clone();
                 }
             }
+
+            drop(state);
+            self.spawn_thumbnail_generation(
+                thumbnail_job.0,
+                thumbnail_job.1,
+                thumbnail_job.2,
+                thumbnail_job.3,
+            );
         }
 
         self.start_ready_transfers_blocking();
+    }
+
+    fn spawn_thumbnail_generation(
+        self: &Arc<Self>,
+        transfer_id: String,
+        direction: TransferDirection,
+        status: TransferStatus,
+        local_path: PathBuf,
+    ) {
+        if direction != TransferDirection::Receive
+            || status != TransferStatus::Completed
+            || !local_path.is_file()
+        {
+            return;
+        }
+
+        let Some(app_data_dir) = self
+            .settings
+            .settings_path()
+            .parent()
+            .map(Path::to_path_buf)
+        else {
+            warn!(
+                transfer_id = %transfer_id,
+                "skipping thumbnail generation because app data directory is unavailable"
+            );
+            return;
+        };
+
+        let storage = Arc::clone(&self.storage);
+        let runtime = self.runtime.clone();
+        let blocking_runtime = runtime.clone();
+        let thumbnail_tasks = Arc::clone(&self.thumbnail_tasks);
+        let thumbnail_dir = app_data_dir.join("thumbnails");
+        runtime.spawn_blocking(move || {
+            let Ok(_permit) = blocking_runtime.block_on(thumbnail_tasks.acquire_owned()) else {
+                return;
+            };
+
+            match generate_thumbnail(&local_path, &thumbnail_dir, &transfer_id) {
+                Ok(thumbnail_path) => {
+                    let thumbnail_path = thumbnail_path.to_string_lossy().into_owned();
+                    let transfer_id_for_save = transfer_id.clone();
+                    if let Err(error) = blocking_runtime.block_on(async move {
+                        storage
+                            .save_thumbnail_path(&transfer_id_for_save, &thumbnail_path)
+                            .await
+                    }) {
+                        warn!(
+                            transfer_id = %transfer_id,
+                            path = %local_path.display(),
+                            error = %error,
+                            "failed to persist transfer thumbnail path"
+                        );
+                    }
+                }
+                Err(crate::ThumbnailError::UnsupportedFormat) => {
+                    debug!(
+                        transfer_id = %transfer_id,
+                        path = %local_path.display(),
+                        "skipping thumbnail generation for unsupported file"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        transfer_id = %transfer_id,
+                        path = %local_path.display(),
+                        error = %error,
+                        "thumbnail generation failed"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -833,6 +958,23 @@ fn file_name_from_path(path: &Path) -> Result<String, TransferManagerError> {
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
         .ok_or(TransferManagerError::InvalidFileName)
+}
+
+fn build_transfer_record(
+    entry: &ManagedTransferEntry,
+    transfer: &ManagedTransfer,
+) -> TransferRecord {
+    TransferRecord {
+        id: entry.record_id,
+        peer_id: transfer.peer_id.clone(),
+        chat_id: transfer.chat_id.clone(),
+        file_name: transfer.file_name.clone(),
+        local_path: transfer.local_path.clone(),
+        status: transfer.status.clone(),
+        thumbnail_path: None,
+        folder_id: transfer.folder_id.clone(),
+        folder_relative_path: transfer.folder_relative_path.clone(),
+    }
 }
 
 impl From<FileSenderError> for TransferManagerError {

@@ -17,23 +17,36 @@ export const GroupChatWrapper: React.FC = () => {
     return <div className="placeholder-view">Group not found</div>;
   }
 
-  const handleSendMessage = async (content: string) => {
+  const handleSendMessage = async (content: string, replyToId?: string) => {
     try {
-      await invoke("send_group_message", {
+      const messageId = await invoke<string>("send_group_message", {
         groupId,
         content,
+        replyToId: replyToId || null,
       });
-      // Optimistic update for UI feel, in reality you'd listen for an event
+
+      let replyToPreview: string | undefined;
+      if (replyToId) {
+        const repliedMsg = group.messages.find(m => m.id === replyToId);
+        if (repliedMsg) {
+          replyToPreview = repliedMsg.content.length > 80 
+            ? repliedMsg.content.slice(0, 80) + '…' 
+            : repliedMsg.content;
+        }
+      }
+
       addGroupMessage(groupId, {
-        id: Date.now().toString(),
+        id: messageId,
         senderId: "me",
         senderName: "Me",
         content,
         timestamp: Date.now(),
         isOwn: true,
+        replyToId,
+        replyToPreview,
       });
-    } catch {
-      // Ignored intentionally for now
+    } catch (error) {
+      console.error("Failed to send group message:", error);
     }
   };
 

@@ -15,11 +15,23 @@ use uuid::Uuid;
 const POOL_SIZE: u32 = 4;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const TRANSFER_DIRECTION_SEND: &str = "send";
+const MESSAGE_SELECT_COLUMNS: &str =
+    "id, chat_id, sender_id, content, timestamp, status, edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview";
+const MESSAGE_EDIT_WINNER_EXPR: &str =
+    "excluded.edit_version > messages.edit_version OR (excluded.edit_version = messages.edit_version AND COALESCE(excluded.edited_at, -1) > COALESCE(messages.edited_at, -1))";
+const MESSAGE_DELETE_WINNER_EXPR: &str =
+    "excluded.is_deleted > messages.is_deleted OR (excluded.is_deleted = messages.is_deleted AND excluded.is_deleted = 1 AND COALESCE(excluded.deleted_at, -1) > COALESCE(messages.deleted_at, -1))";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/V1__initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/V1__initial.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/V2__edit_delete_richtext.sql"),
+    },
+];
 
 struct Migration {
     version: i64,
@@ -255,23 +267,72 @@ impl SqliteStorage {
         .await
         .map_err(|_| CoreError::NotImplemented("sqlite task join failed"))?
     }
+
+    async fn with_connection_result<T, F>(&self, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let pool = self.pool.clone();
+
+        task::spawn_blocking(move || {
+            let mut conn = pool
+                .get()
+                .map_err(|_| CoreError::NotImplemented("sqlite pool acquisition failed"))?;
+            op(&mut conn)
+        })
+        .await
+        .map_err(|_| CoreError::NotImplemented("sqlite task join failed"))?
+    }
 }
 
 impl StorageEngine for SqliteStorage {
     async fn save_message(&self, message: &Message) -> Result<()> {
         let message = message.clone();
+        let edited_at = option_u64_to_db_i64(message.edited_at, "edited_at")?;
+        let deleted_at = option_u64_to_db_i64(message.deleted_at, "deleted_at")?;
+        let is_deleted = bool_to_db(message.is_deleted);
+        let upsert_sql = format!(
+            "INSERT INTO messages (
+                id, chat_id, sender_id, content, timestamp, status, created_at,
+                edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+                 chat_id = excluded.chat_id,
+                 sender_id = excluded.sender_id,
+                 content = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN excluded.content
+                     ELSE messages.content
+                 END,
+                 timestamp = excluded.timestamp,
+                 status = excluded.status,
+                 created_at = excluded.created_at,
+                 edit_version = MAX(messages.edit_version, excluded.edit_version),
+                 edited_at = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.edited_at, messages.edited_at)
+                     ELSE messages.edited_at
+                 END,
+                 is_deleted = CASE
+                     WHEN {MESSAGE_DELETE_WINNER_EXPR} THEN excluded.is_deleted
+                     ELSE messages.is_deleted
+                 END,
+                 deleted_at = CASE
+                     WHEN {MESSAGE_DELETE_WINNER_EXPR} THEN COALESCE(excluded.deleted_at, messages.deleted_at)
+                     ELSE messages.deleted_at
+                 END,
+                 reply_to_id = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.reply_to_id, messages.reply_to_id)
+                     ELSE messages.reply_to_id
+                 END,
+                 reply_to_preview = CASE
+                     WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.reply_to_preview, messages.reply_to_preview)
+                     ELSE messages.reply_to_preview
+                 END"
+        );
 
         self.with_connection("sqlite save message failed", move |conn| {
             conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, timestamp, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                     chat_id = excluded.chat_id,
-                     sender_id = excluded.sender_id,
-                     content = excluded.content,
-                     timestamp = excluded.timestamp,
-                     status = excluded.status,
-                     created_at = excluded.created_at",
+                &upsert_sql,
                 params![
                     message.id.to_string(),
                     message.chat_id.0.to_string(),
@@ -279,10 +340,31 @@ impl StorageEngine for SqliteStorage {
                     message.content,
                     message.timestamp_ms,
                     message_status_to_db(&message.status),
-                    message.timestamp_ms
+                    message.timestamp_ms,
+                    i64::from(message.edit_version),
+                    edited_at,
+                    is_deleted,
+                    deleted_at,
+                    message.reply_to_id,
+                    message.reply_to_preview
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_message(&self, message_id: &str) -> Result<Option<Message>> {
+        let message_id = parse_uuid_arg(message_id, "message_id")?.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                &format!("SELECT {MESSAGE_SELECT_COLUMNS} FROM messages WHERE id = ?1"),
+                params![message_id],
+                map_message_row,
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get message failed", error))
         })
         .await
     }
@@ -296,13 +378,13 @@ impl StorageEngine for SqliteStorage {
         let chat_id = chat_id.clone();
 
         self.with_connection("sqlite get messages failed", move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT id, chat_id, sender_id, content, timestamp, status
+            let mut statement = conn.prepare(&format!(
+                "SELECT {MESSAGE_SELECT_COLUMNS}
                  FROM messages
                  WHERE chat_id = ?1
                  ORDER BY timestamp DESC, created_at DESC, id DESC
-                 LIMIT ?2 OFFSET ?3",
-            )?;
+                 LIMIT ?2 OFFSET ?3"
+            ))?;
             let rows = statement.query_map(
                 params![chat_id.0.to_string(), limit as i64, offset as i64],
                 map_message_row,
@@ -355,6 +437,64 @@ impl StorageEngine for SqliteStorage {
         .await
     }
 
+    async fn update_message_content(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        edit_version: u32,
+        edited_at_ms: u64,
+    ) -> Result<()> {
+        let message_id = parse_uuid_arg(message_id, "message_id")?.to_string();
+        let new_content = new_content.to_string();
+        let edited_at_ms = u64_to_db_i64(edited_at_ms, "edited_at_ms")?;
+
+        self.with_connection_result(move |conn| {
+            let rows_updated = conn
+                .execute(
+                    "UPDATE messages
+                     SET content = ?2, edit_version = ?3, edited_at = ?4
+                     WHERE id = ?1",
+                    params![
+                        message_id.clone(),
+                        new_content,
+                        i64::from(edit_version),
+                        edited_at_ms
+                    ],
+                )
+                .map_err(|error| {
+                    sqlite_persistence("sqlite update message content failed", error)
+                })?;
+            if rows_updated == 0 {
+                return Err(not_found_error("message", &message_id));
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn mark_message_deleted(&self, message_id: &str, deleted_at_ms: u64) -> Result<()> {
+        let message_id = parse_uuid_arg(message_id, "message_id")?.to_string();
+        let deleted_at_ms = u64_to_db_i64(deleted_at_ms, "deleted_at_ms")?;
+
+        self.with_connection_result(move |conn| {
+            let rows_updated = conn
+                .execute(
+                    "UPDATE messages
+                     SET is_deleted = 1, deleted_at = ?2
+                     WHERE id = ?1",
+                    params![message_id.clone(), deleted_at_ms],
+                )
+                .map_err(|error| sqlite_persistence("sqlite mark message deleted failed", error))?;
+            if rows_updated == 0 {
+                return Err(not_found_error("message", &message_id));
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
     async fn save_transfer(&self, transfer: &TransferRecord) -> Result<()> {
         let transfer = transfer.clone();
         let size = match fs::metadata(&transfer.local_path) {
@@ -376,8 +516,9 @@ impl StorageEngine for SqliteStorage {
             let transaction = conn.transaction()?;
             transaction.execute(
                 "INSERT INTO transfers (
-                    id, peer_id, filename, size, direction, status, sha256, created_at, completed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)
+                    id, peer_id, filename, size, direction, status, sha256, created_at, completed_at,
+                    thumbnail_path, folder_id, folder_relative_path
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(id) DO UPDATE SET
                      peer_id = excluded.peer_id,
                      filename = excluded.filename,
@@ -386,7 +527,10 @@ impl StorageEngine for SqliteStorage {
                      status = excluded.status,
                      sha256 = excluded.sha256,
                      created_at = excluded.created_at,
-                     completed_at = excluded.completed_at",
+                     completed_at = excluded.completed_at,
+                     thumbnail_path = COALESCE(excluded.thumbnail_path, transfers.thumbnail_path),
+                     folder_id = COALESCE(excluded.folder_id, transfers.folder_id),
+                     folder_relative_path = COALESCE(excluded.folder_relative_path, transfers.folder_relative_path)",
                 params![
                     transfer.id.to_string(),
                     transfer.peer_id.0.to_string(),
@@ -395,7 +539,10 @@ impl StorageEngine for SqliteStorage {
                     TRANSFER_DIRECTION_SEND,
                     transfer_status_to_db(&transfer.status),
                     created_at,
-                    completed_at
+                    completed_at,
+                    transfer.thumbnail_path,
+                    transfer.folder_id,
+                    transfer.folder_relative_path
                 ],
             )?;
             transaction.execute(
@@ -428,7 +575,10 @@ impl StorageEngine for SqliteStorage {
                     tc.chat_id,
                     t.filename,
                     tc.local_path,
-                    t.status
+                    t.status,
+                    t.thumbnail_path,
+                    t.folder_id,
+                    t.folder_relative_path
                  FROM transfers t
                  LEFT JOIN transfer_context tc ON tc.id = t.id
                  ORDER BY t.created_at DESC, t.id DESC
@@ -441,6 +591,9 @@ impl StorageEngine for SqliteStorage {
                 let file_name: String = row.get(3)?;
                 let local_path: Option<String> = row.get(4)?;
                 let status: String = row.get(5)?;
+                let thumbnail_path: Option<String> = row.get(6)?;
+                let folder_id: Option<String> = row.get(7)?;
+                let folder_relative_path: Option<String> = row.get(8)?;
 
                 Ok(TransferRecord {
                     id: parse_uuid(&transfer_id)?,
@@ -451,6 +604,9 @@ impl StorageEngine for SqliteStorage {
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(file_name)),
                     status: transfer_status_from_db(&status)?,
+                    thumbnail_path,
+                    folder_id,
+                    folder_relative_path,
                 })
             })?;
 
@@ -485,6 +641,42 @@ impl StorageEngine for SqliteStorage {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn save_thumbnail_path(&self, transfer_id: &str, thumbnail_path: &str) -> Result<()> {
+        let transfer_id = parse_uuid_arg(transfer_id, "transfer_id")?.to_string();
+        let thumbnail_path = thumbnail_path.to_string();
+
+        self.with_connection_result(move |conn| {
+            let rows_updated = conn
+                .execute(
+                    "UPDATE transfers SET thumbnail_path = ?2 WHERE id = ?1",
+                    params![transfer_id.clone(), thumbnail_path],
+                )
+                .map_err(|error| sqlite_persistence("sqlite save thumbnail path failed", error))?;
+            if rows_updated == 0 {
+                return Err(not_found_error("transfer", &transfer_id));
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_thumbnail_path(&self, transfer_id: &str) -> Result<Option<String>> {
+        let transfer_id = parse_uuid_arg(transfer_id, "transfer_id")?.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT thumbnail_path FROM transfers WHERE id = ?1",
+                params![transfer_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|error| sqlite_persistence("sqlite get thumbnail path failed", error))
         })
         .await
     }
@@ -541,8 +733,23 @@ fn run_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     drop(statement);
 
+    let mut current_user_version = read_user_version(conn)?;
+    let mut target_user_version = applied_versions
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(current_user_version);
+
     for migration in MIGRATIONS {
         if applied_versions.contains(&migration.version) {
+            target_user_version = target_user_version.max(migration.version);
+            continue;
+        }
+
+        if current_user_version >= migration.version {
+            record_applied_migration(conn, migration.version)?;
+            applied_versions.push(migration.version);
+            target_user_version = target_user_version.max(migration.version);
             continue;
         }
 
@@ -554,9 +761,30 @@ fn run_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
             params![migration.version],
         )?;
         transaction.commit()?;
+
+        applied_versions.push(migration.version);
+        current_user_version = read_user_version(conn)?.max(migration.version);
+        target_user_version = target_user_version.max(migration.version);
+    }
+
+    if read_user_version(conn)? < target_user_version {
+        conn.execute_batch(&format!("PRAGMA user_version = {target_user_version};"))?;
     }
 
     Ok(())
+}
+
+fn record_applied_migration(conn: &Connection, version: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO _migrations (version, applied_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![version],
+    )?;
+    Ok(())
+}
+
+fn read_user_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version;", [], |row| row.get(0))
 }
 
 fn map_chat_row(row: &Row<'_>) -> rusqlite::Result<ChatRecord> {
@@ -576,6 +804,10 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
     let chat_id: String = row.get(1)?;
     let sender_id: String = row.get(2)?;
     let status: String = row.get(5)?;
+    let edit_version: i64 = row.get(6)?;
+    let edited_at: Option<i64> = row.get(7)?;
+    let is_deleted: i64 = row.get(8)?;
+    let deleted_at: Option<i64> = row.get(9)?;
 
     Ok(Message {
         id: parse_uuid(&message_id)?,
@@ -584,6 +816,12 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
         content: row.get(3)?,
         timestamp_ms: row.get(4)?,
         status: message_status_from_db(&status)?,
+        edit_version: db_i64_to_u32(edit_version, 6)?,
+        edited_at: option_db_i64_to_u64(edited_at, 7)?,
+        is_deleted: db_to_bool(is_deleted),
+        deleted_at: option_db_i64_to_u64(deleted_at, 9)?,
+        reply_to_id: row.get(10)?,
+        reply_to_preview: row.get(11)?,
     })
 }
 
@@ -635,4 +873,53 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn parse_uuid_arg(raw: &str, field: &str) -> Result<Uuid> {
+    Uuid::parse_str(raw).map_err(|_| CoreError::Validation(format!("invalid {field}: {raw}")))
+}
+
+fn sqlite_persistence(operation: &str, error: rusqlite::Error) -> CoreError {
+    CoreError::Persistence(format!("{operation}: {error}"))
+}
+
+fn not_found_error(kind: &str, id: &str) -> CoreError {
+    CoreError::Persistence(format!("{kind} not found: {id}"))
+}
+
+fn bool_to_db(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn db_to_bool(value: i64) -> bool {
+    value != 0
+}
+
+fn u64_to_db_i64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| CoreError::Validation(format!("{field} exceeds sqlite integer range")))
+}
+
+fn option_u64_to_db_i64(value: Option<u64>, field: &str) -> Result<Option<i64>> {
+    value.map(|value| u64_to_db_i64(value, field)).transpose()
+}
+
+fn db_i64_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
+fn db_i64_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
+fn option_db_i64_to_u64(value: Option<i64>, column: usize) -> rusqlite::Result<Option<u64>> {
+    value.map(|value| db_i64_to_u64(value, column)).transpose()
 }

@@ -34,6 +34,33 @@
   border-bottom-left-radius: 4px;
 }
 
+.quoteBubble {
+  background-color: rgba(0, 0, 0, 0.05);
+  border-left: 3px solid rgba(0, 0, 0, 0.2);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  opacity: 0.9;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.quoteBubble:hover {
+  opacity: 1;
+}
+
+.ownBubble .quoteBubble {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-left-color: rgba(255, 255, 255, 0.5);
+  color: rgba(255, 255, 255, 0.9);
+}
+
 .content {
   font-size: 0.95rem;
   line-height: 1.4;
@@ -63,4 +90,107 @@
   align-items: center;
   justify-content: center;
   height: 12px;
+}
+
+.tombstone {
+  background-color: var(--bg-tertiary, #f0f0f0);
+  color: var(--text-tertiary, #999);
+  font-style: italic;
+  border: 1px dashed var(--border-color, #ccc);
+  box-shadow: none;
+}
+.own .tombstone {
+  border-bottom-right-radius: 4px;
+}
+.peer .tombstone {
+  border-bottom-left-radius: 4px;
+}
+
+@keyframes flashHighlight {
+  0% { opacity: 1; filter: brightness(1); }
+  50% { filter: brightness(1.5); }
+  100% { opacity: 1; filter: brightness(1); }
+}
+
+.highlight {
+  animation: flashHighlight 1.5s ease-out;
+}
+
+.editedMark {
+  font-size: 0.65rem;
+  opacity: 0.7;
+}
+
+.actions {
+  display: none;
+  position: absolute;
+  top: -24px;
+  right: 0;
+  gap: 4px;
+  background: var(--bg-primary, #ffffff);
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 4px;
+  padding: 2px 4px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.bubble:hover .actions {
+  display: flex;
+}
+
+.actionButton {
+  background: none;
+  border: none;
+  font-size: 0.75rem;
+  color: var(--text-secondary, #666);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.actionButton:hover {
+  color: var(--accent, #007bff);
+}
+
+.editContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 200px;
+}
+
+.editInput {
+  width: 100%;
+  min-height: 40px;
+  background: var(--bg-primary, #ffffff);
+  color: var(--text-primary, #333);
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 4px;
+  padding: 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  resize: vertical;
+}
+
+.editActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.saveButton, .cancelButton {
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.saveButton {
+  background-color: var(--accent, #007bff);
+  color: white;
+}
+
+.cancelButton {
+  background-color: transparent;
+  color: var(--text-secondary, #666);
+  border: 1px solid var(--border-color, #ccc);
 }

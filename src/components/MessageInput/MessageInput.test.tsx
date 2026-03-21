@@ -3,9 +3,15 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageInput } from './MessageInput';
+import { usePeerStore } from '../../stores/peerStore';
+import { useChatStore } from '../../stores/chatStore';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../stores/peerStore', () => ({
+  usePeerStore: vi.fn(),
 }));
 
 describe('MessageInput', () => {
@@ -13,6 +19,12 @@ describe('MessageInput', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    (usePeerStore as any).mockReturnValue({
+      peers: [
+        { id: 'uuid-1', name: 'Alice', status: 'online' },
+        { id: 'uuid-2', name: 'Bob', status: 'offline' },
+      ],
+    });
   });
 
   it('renders textarea and send button', () => {
@@ -49,6 +61,7 @@ describe('MessageInput', () => {
       expect(invoke).toHaveBeenCalledWith('send_message', {
         peerId,
         content: 'Hello world!',
+        replyToId: null,
       });
       expect(input).toHaveValue('');
     });
@@ -62,6 +75,7 @@ describe('MessageInput', () => {
       expect(invoke).toHaveBeenCalledWith('send_message', {
         peerId,
         content: 'Test Enter',
+        replyToId: null,
       });
       expect(input).toHaveValue('');
 
@@ -69,6 +83,7 @@ describe('MessageInput', () => {
       expect(invoke).toHaveBeenCalledWith('send_message', {
         peerId,
         content: 'Test Ctrl Enter',
+        replyToId: null,
       });
       expect(input).toHaveValue('');
     });
@@ -126,6 +141,49 @@ describe('MessageInput', () => {
     });
   });
 
+  describe('Quote Reply', () => {
+    beforeEach(() => {
+      useChatStore.setState({
+        replyingTo: { id: 'msg-123', preview: 'This is a preview text' }
+      });
+    });
+
+    afterEach(() => {
+      useChatStore.setState({ replyingTo: null });
+    });
+
+    it('renders reply preview bar when replyingTo is set', () => {
+      render(<MessageInput peerId={peerId} />);
+      expect(screen.getByTestId('reply-preview-bar')).toBeInTheDocument();
+      expect(screen.getByText('This is a preview text')).toBeInTheDocument();
+    });
+
+    it('cancels reply when cancel button is clicked', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const cancelButton = screen.getByTestId('cancel-reply-button');
+      await user.click(cancelButton);
+      expect(useChatStore.getState().replyingTo).toBeNull();
+    });
+
+    it('sends message with replyToId and clears replyingTo', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+      const button = screen.getByRole('button', { name: /send/i });
+
+      await user.type(input, 'Replying to you');
+      await user.click(button);
+
+      expect(invoke).toHaveBeenCalledWith('send_message', {
+        peerId,
+        content: 'Replying to you',
+        replyToId: 'msg-123',
+      });
+      expect(useChatStore.getState().replyingTo).toBeNull();
+    });
+  });
+
   describe('Character limit', () => {
     it('prevents typing beyond 10000 characters', () => {
       render(<MessageInput peerId={peerId} />);
@@ -165,6 +223,80 @@ describe('MessageInput', () => {
       vi.advanceTimersByTime(500);
 
       expect(invoke).toHaveBeenCalledWith('send_typing_indicator', { peerId });
+    });
+  });
+
+  describe('Mentions', () => {
+    beforeEach(() => {
+      (usePeerStore as any).mockImplementation((selector: any) => 
+        selector({
+          peers: [
+            { id: 'uuid-1', name: 'Alice', status: 'online' },
+            { id: 'uuid-2', name: 'Bob', status: 'offline' },
+          ],
+        })
+      );
+    });
+
+    it('opens autocomplete when @ is typed', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+
+      await user.type(input, 'Hello @');
+      expect(screen.getByTestId('mention-autocomplete')).toBeInTheDocument();
+      expect(screen.getByText('Alice')).toBeInTheDocument();
+      expect(screen.getByText('Bob')).toBeInTheDocument();
+    });
+
+    it('filters peers when typing after @', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+
+      await user.type(input, 'Hello @Al');
+      expect(screen.getByTestId('mention-autocomplete')).toBeInTheDocument();
+      expect(screen.getByText('Alice')).toBeInTheDocument();
+      expect(screen.queryByText('Bob')).not.toBeInTheDocument();
+    });
+
+    it('closes on Escape and remembers dismissal', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+
+      await user.type(input, '@');
+      expect(screen.getByTestId('mention-autocomplete')).toBeInTheDocument();
+
+      await user.type(input, '{Escape}');
+      expect(screen.queryByTestId('mention-autocomplete')).not.toBeInTheDocument();
+
+      await user.type(input, 'A');
+      expect(screen.queryByTestId('mention-autocomplete')).not.toBeInTheDocument();
+    });
+
+    it('inserts mention on Enter and closes autocomplete', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+
+      await user.type(input, '@Al');
+      expect(screen.getByTestId('mention-autocomplete')).toBeInTheDocument();
+
+      await user.type(input, '{Enter}');
+      expect(screen.queryByTestId('mention-autocomplete')).not.toBeInTheDocument();
+      expect(input).toHaveValue('@[Alice](user:uuid-1) ');
+    });
+
+    it('navigates with arrow keys', async () => {
+      const user = userEvent.setup();
+      render(<MessageInput peerId={peerId} />);
+      const input = screen.getByPlaceholderText(/type a message/i);
+
+      await user.type(input, '@');
+      await user.type(input, '{ArrowDown}{Enter}');
+      
+      expect(input).toHaveValue('@[Bob](user:uuid-2) ');
     });
   });
 });

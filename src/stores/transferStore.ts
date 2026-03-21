@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 
-export type TransferState = "queued" | "active" | "completed" | "failed";
+export type TransferState = "queued" | "active" | "completed" | "failed" | "cancelled" | "rejected" | "partially-failed";
 
 export interface Transfer {
   id: string;
