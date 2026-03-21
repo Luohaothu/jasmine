@@ -31,8 +31,7 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
     }
   };
 
-  const isComplete = transfer.state === "completed";
-  const isFailed = transfer.state === "failed" || transfer.state === "partially-failed";
+  const isTerminal = ["completed", "failed", "partially-failed", "cancelled", "rejected"].includes(transfer.state);
   const isActive = transfer.state === "active";
   const progressPct = transfer.totalSize > 0
     ? (transfer.transferredBytes / transfer.totalSize) * 100
@@ -57,7 +56,7 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
       <div className={styles.itemFooter}>
         <span>{formatBytes(transfer.transferredBytes)} / {formatBytes(transfer.totalSize)}</span>
         {isActive && <span className={styles.speed}>{formatSpeed(transfer.speed)}</span>}
-        {!isComplete && !isFailed && (
+        {!isTerminal && (
           <button className={styles.cancelBtn} onClick={(e) => { e.stopPropagation(); handleCancel(); }} aria-label="Cancel transfer">
             Cancel
           </button>

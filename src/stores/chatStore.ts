@@ -131,7 +131,7 @@ export const useChatStore = create<ChatStore>((set) => ({
         Object.entries(state.messages).map(([peerId, peerMessages]) => [
           peerId,
           peerMessages.map((msg) =>
-            msg.id === messageId && !msg.isDeleted
+            msg.id === messageId && !msg.isDeleted && editVersion > (msg.editVersion || 0)
               ? { ...msg, content: newContent, editedAt, editVersion }
               : msg
           ),

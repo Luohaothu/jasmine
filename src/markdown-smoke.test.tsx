@@ -12,7 +12,8 @@ describe("ReactMarkdown", () => {
       </ReactMarkdown>,
     );
 
-    expect(screen.getByText("bold")).toBeInTheDocument();
-    expect(screen.getByRole("strong")).toBeInTheDocument();
+    const boldElement = screen.getByText("bold");
+    expect(boldElement).toBeInTheDocument();
+    expect(boldElement.tagName).toBe("STRONG");
   });
 });

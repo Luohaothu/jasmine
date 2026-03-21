@@ -59,11 +59,24 @@ export const ImageThumbnail: React.FC<ImageThumbnailProps> = ({
     );
   }
 
+  if (filePath) {
+    return (
+      <button 
+        type="button"
+        className={`${styles.container} ${styles.interactiveButton}`} 
+        onClick={handleOpen}
+        title="Click to open in system viewer"
+        data-testid="image-thumbnail-ready"
+        aria-label={`Open ${fileName || "image"}`}
+      >
+        <img src={imgSrc} alt={alt || fileName || "Image thumbnail"} className={styles.image} />
+      </button>
+    );
+  }
+
   return (
     <div 
       className={styles.container} 
-      onClick={handleOpen}
-      title={filePath ? "Click to open in system viewer" : undefined}
       data-testid="image-thumbnail-ready"
     >
       <img src={imgSrc} alt={alt || fileName || "Image thumbnail"} className={styles.image} />

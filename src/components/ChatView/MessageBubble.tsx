@@ -123,8 +123,15 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             className={styles.quoteBubble} 
             data-testid="quote-bubble"
             onClick={handleQuoteClick}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleQuoteClick();
+              }
+            }}
             role="button"
             tabIndex={0}
+            aria-label={`Jump to replied message: ${replyToPreview}`}
           >
             <span className={styles.quotePreview}>{replyToPreview}</span>
           </div>
@@ -175,11 +182,11 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         {!isEditing && (
           <div className={styles.actions} data-testid="message-actions">
             <button className={styles.actionButton} onClick={handleReply} data-testid="action-reply">Reply</button>
-            {isOwn && (
-              <>
-                <button className={styles.actionButton} onClick={() => setIsEditing(true)} data-testid="action-edit">Edit</button>
-                <button className={styles.actionButton} onClick={handleDelete} data-testid="action-delete">Delete</button>
-              </>
+            {isOwn && onEdit && (
+              <button className={styles.actionButton} onClick={() => setIsEditing(true)} data-testid="action-edit">Edit</button>
+            )}
+            {isOwn && onDelete && (
+              <button className={styles.actionButton} onClick={handleDelete} data-testid="action-delete">Delete</button>
             )}
           </div>
         )}

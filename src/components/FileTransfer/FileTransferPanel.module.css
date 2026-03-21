@@ -130,6 +130,9 @@
 .status-queued { color: var(--text-secondary, #888888); }
 .status-completed { color: var(--success-color, #009900); }
 .status-failed { color: var(--error-color, #cc0000); }
+.status-partially-failed { color: var(--warning-color, #ff9800); }
+.status-cancelled { color: var(--text-secondary, #888888); }
+.status-rejected { color: var(--error-color, #cc0000); }
 
 .progressContainer {
   height: 6px;
@@ -148,6 +151,9 @@
 .progress-queued { background: var(--text-secondary, #888888); width: 0 !important; }
 .progress-completed { background: var(--success-color, #009900); width: 100% !important; }
 .progress-failed { background: var(--error-color, #cc0000); }
+.progress-partially-failed { background: var(--warning-color, #ff9800); }
+.progress-cancelled { background: var(--text-secondary, #888888); }
+.progress-rejected { background: var(--error-color, #cc0000); }
 
 .itemFooter {
   display: flex;

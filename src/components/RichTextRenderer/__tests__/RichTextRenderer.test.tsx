@@ -69,7 +69,7 @@ describe("RichTextRenderer", () => {
           const mentionEl = screen.getByText(`@${mention.display_name}`);
           expect(mentionEl).toBeInTheDocument();
           expect(mentionEl.tagName).toBe("SPAN");
-          expect(mentionEl).toHaveClass(/mention/);
+          expect(mentionEl.className).toMatch(/mention/);
           expect(mentionEl).toHaveAttribute("data-mention", `user:${mention.user_id}`);
         });
 
