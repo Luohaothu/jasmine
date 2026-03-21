@@ -16,7 +16,7 @@ export const DeviceList = () => {
     setupListeners().then((cleanup) => {
       unlisten = cleanup;
     }).catch((error) => {
-      void error;
+      console.error("Failed to setup peer listeners:", error);
     });
 
     return () => {

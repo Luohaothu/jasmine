@@ -24,7 +24,7 @@ export function FileReceiveDialog() {
     try {
       await invoke("accept_file", { offer_id: offer.id });
     } catch (e) {
-      void e;
+      console.error("Failed to accept file:", e);
     } finally {
       removeOffer(offer.id);
     }
@@ -34,7 +34,7 @@ export function FileReceiveDialog() {
     try {
       await invoke("reject_file", { offer_id: offer.id });
     } catch (e) {
-      void e;
+      console.error("Failed to reject file:", e);
     } finally {
       removeOffer(offer.id);
     }
