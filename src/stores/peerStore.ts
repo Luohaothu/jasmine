@@ -22,7 +22,7 @@ export const usePeerStore = create<PeerStore>((set) => ({
 
     const unlistenLost = await listen<{ id: string }>("peer-lost", (event) => {
       set((state) => ({
-        peers: state.peers.filter((p) => p.id !== event.payload.id),
+        peers: state.peers.map((p) => p.id === event.payload.id ? { ...p, status: "offline" as const } : p),
       }));
     });
 
