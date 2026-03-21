@@ -423,7 +423,7 @@ async fn test_message_roundtrip() {
         let beta_cursor = beta.emitter.mark();
         let message_id = alpha
             .state
-            .send_message(beta_id.clone(), "Hello from A".to_string())
+            .send_message(beta_id.clone(), "Hello from A".to_string(), None)
             .await
             .expect("send direct message");
 
@@ -537,7 +537,7 @@ async fn test_group_fanout() {
         let gamma_cursor = gamma.emitter.mark();
         let message_id = alpha
             .state
-            .send_group_message(group_id.clone(), "Hello group".to_string())
+            .send_group_message(group_id.clone(), "Hello group".to_string(), None)
             .await
             .expect("send group message");
 
@@ -705,7 +705,7 @@ async fn test_offline_message() {
 
         let message_id = alpha
             .state
-            .send_message(beta_id.clone(), "Offline delivery".to_string())
+            .send_message(beta_id.clone(), "Offline delivery".to_string(), None)
             .await
             .expect("queue offline message");
 
@@ -769,7 +769,7 @@ async fn edge_cases() {
         let beta_message_cursor = beta.emitter.mark();
         let large_message_id = alpha
             .state
-            .send_message(beta_id.clone(), large_message.clone())
+            .send_message(beta_id.clone(), large_message.clone(), None)
             .await
             .expect("send 10k message");
 
@@ -818,7 +818,7 @@ async fn edge_cases() {
         time::sleep(Duration::from_millis(2)).await;
         let second_message_id = alpha
             .state
-            .send_message(beta_id.clone(), "Edge case follow-up 1".to_string())
+            .send_message(beta_id.clone(), "Edge case follow-up 1".to_string(), None)
             .await
             .expect("send second edge message");
         let sender_second = wait_for_message_status(
@@ -832,7 +832,7 @@ async fn edge_cases() {
         time::sleep(Duration::from_millis(2)).await;
         let third_message_id = alpha
             .state
-            .send_message(beta_id.clone(), "Edge case follow-up 2".to_string())
+            .send_message(beta_id.clone(), "Edge case follow-up 2".to_string(), None)
             .await
             .expect("send third edge message");
         let sender_third = wait_for_message_status(
@@ -940,7 +940,7 @@ async fn edge_cases() {
 
         let offline_message_id = alpha
             .state
-            .send_message(beta_id.clone(), "Offline edge case".to_string())
+            .send_message(beta_id.clone(), "Offline edge case".to_string(), None)
             .await
             .expect("send offline edge message");
         let failed =
