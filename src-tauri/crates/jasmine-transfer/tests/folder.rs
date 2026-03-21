@@ -24,12 +24,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn symlink_path(target: &Path, link: &Path, is_dir: bool) {
-    let result = if is_dir {
-        std::os::unix::fs::symlink(target, link)
-    } else {
-        std::os::unix::fs::symlink(target, link)
-    };
+fn symlink_path(target: &Path, link: &Path, _is_dir: bool) {
+    let result = std::os::unix::fs::symlink(target, link);
     result.expect("create unix symlink");
 }
 
