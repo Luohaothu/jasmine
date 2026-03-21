@@ -32,6 +32,7 @@
 }
 
 .inputWrapper {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 12px;
@@ -113,4 +114,50 @@
 .icon {
   width: 18px;
   height: 18px;
+}
+
+.replyPreviewBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background-color: var(--bg-tertiary, #f0f0f0);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px 4px 0 0;
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+}
+
+.replyPreviewContent {
+  display: flex;
+  gap: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.replyPreviewLabel {
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.replyPreviewText {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cancelReplyButton {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.cancelReplyButton:hover {
+  color: var(--text-primary);
 }
