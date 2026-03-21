@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jasmine_core::{
-    AckStatus, ChatId, CoreError, GroupInfo, Message, MessageStatus, ProtocolMessage,
-    StorageEngine, UserId,
+    parse_mentions, AckStatus, ChatId, CoreError, GroupInfo, Message, MessageStatus,
+    ProtocolMessage, StorageEngine, UserId,
 };
 use jasmine_storage::{ChatRecord, ChatType, SqliteStorage};
 use tokio::sync::{broadcast, oneshot};
@@ -18,6 +18,9 @@ use crate::{
 };
 
 pub const DEFAULT_CHAT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MESSAGE_EDIT_BUFFER_TTL: Duration = Duration::from_secs(30 * 60);
+const MESSAGE_DELETE_BUFFER_TTL: Duration = Duration::from_secs(30 * 60);
+const REPLY_TO_PREVIEW_CHAR_LIMIT: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct ChatServiceConfig {
@@ -37,6 +40,19 @@ pub enum ChatServiceEvent {
     MessageReceived {
         peer_id: String,
         message: Message,
+    },
+    MessageEdited {
+        message_id: Uuid,
+        new_content: String,
+        edit_version: u32,
+    },
+    MessageDeleted {
+        message_id: Uuid,
+    },
+    MentionReceived {
+        message_id: Uuid,
+        mentioned_user_id: String,
+        sender_name: String,
     },
     MessageStatusUpdated {
         peer_id: String,
@@ -130,6 +146,66 @@ struct IncomingTextMessage {
     sender_id: String,
     content: String,
     timestamp: i64,
+    reply_to_id: Option<String>,
+    reply_to_preview: Option<String>,
+}
+
+struct IncomingMessageEdit {
+    message_id: String,
+    chat_id: String,
+    sender_id: String,
+    new_content: String,
+    edit_version: u32,
+    timestamp_ms: u64,
+}
+
+struct IncomingMessageDelete {
+    message_id: String,
+    chat_id: String,
+    sender_id: String,
+    timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingEdit {
+    chat_id: String,
+    sender_id: String,
+    new_content: String,
+    edit_version: u32,
+    timestamp_ms: u64,
+    expires_at_ms: u64,
+}
+
+impl PendingEdit {
+    fn into_incoming(self, message_id: String) -> IncomingMessageEdit {
+        IncomingMessageEdit {
+            message_id,
+            chat_id: self.chat_id,
+            sender_id: self.sender_id,
+            new_content: self.new_content,
+            edit_version: self.edit_version,
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingDelete {
+    chat_id: String,
+    sender_id: String,
+    timestamp_ms: u64,
+    expires_at_ms: u64,
+}
+
+impl PendingDelete {
+    fn into_incoming(self, message_id: String) -> IncomingMessageDelete {
+        IncomingMessageDelete {
+            message_id,
+            chat_id: self.chat_id,
+            sender_id: self.sender_id,
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
 }
 
 impl ReplyRoute {
@@ -151,6 +227,8 @@ struct ChatServiceInner<S: ChatStorage + 'static> {
     client_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
     pending_acks: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    pending_edits: Mutex<HashMap<String, Vec<PendingEdit>>>,
+    pending_deletes: Mutex<HashMap<String, PendingDelete>>,
 }
 
 pub struct ChatService<S: ChatStorage + 'static> {
@@ -187,6 +265,8 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             client_tasks: Mutex::new(HashMap::new()),
             background_tasks: Mutex::new(Vec::new()),
             pending_acks: Mutex::new(HashMap::new()),
+            pending_edits: Mutex::new(HashMap::new()),
+            pending_deletes: Mutex::new(HashMap::new()),
         });
 
         let mut server_events = inner.server.subscribe();
@@ -253,18 +333,39 @@ impl<S: ChatStorage + 'static> ChatService<S> {
     }
 
     pub async fn send_message(&self, peer_id: &str, content: impl Into<String>) -> Result<Message> {
+        self.send_message_with_reply(peer_id, content, None).await
+    }
+
+    pub async fn send_message_with_reply(
+        &self,
+        peer_id: &str,
+        content: impl Into<String>,
+        reply_to_id: Option<String>,
+    ) -> Result<Message> {
         let chat_id = Self::direct_chat_id(peer_id)?;
         let sender_id = user_id_from_peer_id(&self.inner.local_peer.device_id)?;
+        let content = content.into();
+        let reply_to_preview = self
+            .inner
+            .load_reply_preview(reply_to_id.as_deref())
+            .await?;
         let mut message = Message {
             id: Uuid::new_v4(),
             chat_id,
             sender_id,
-            content: content.into(),
+            content,
             timestamp_ms: now_ms(),
             status: MessageStatus::Sent,
+            edit_version: 0,
+            edited_at: None,
+            is_deleted: false,
+            deleted_at: None,
+            reply_to_id,
+            reply_to_preview,
         };
 
         self.inner.save_message(message.clone()).await?;
+        parse_mentions(&message.content);
         self.inner
             .emit_status(peer_id.to_string(), message.id, MessageStatus::Sent);
 
@@ -274,6 +375,8 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             sender_id: self.inner.local_peer.device_id.clone(),
             content: message.content.clone(),
             timestamp: message.timestamp_ms,
+            reply_to_id: message.reply_to_id.clone(),
+            reply_to_preview: message.reply_to_preview.clone(),
         };
 
         Arc::clone(&self.inner).arm_ack_timeout(peer_id.to_string(), message.id);
@@ -288,6 +391,106 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             return Ok(message);
         }
         Ok(message)
+    }
+
+    pub async fn edit_message(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        sender_id: &str,
+    ) -> Result<()> {
+        if sender_id != self.inner.local_peer.device_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized edit sender {sender_id} for local peer {}",
+                self.inner.local_peer.device_id
+            )));
+        }
+
+        let stored_message = self
+            .inner
+            .load_message(message_id.to_string())
+            .await?
+            .ok_or_else(|| MessagingError::Validation(format!("message {message_id} not found")))?;
+        let editor_id = user_id_from_peer_id(sender_id)?;
+
+        if stored_message.sender_id != editor_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized edit for message {message_id} by sender {sender_id}"
+            )));
+        }
+
+        let edit_version = stored_message.edit_version.saturating_add(1);
+        let timestamp_ms = now_ms_u64();
+        let message_uuid = stored_message.id;
+        let protocol_message = ProtocolMessage::MessageEdit {
+            message_id: message_id.to_string(),
+            chat_id: stored_message.chat_id.0.to_string(),
+            sender_id: sender_id.to_string(),
+            new_content: new_content.to_string(),
+            edit_version,
+            timestamp_ms,
+        };
+
+        self.inner
+            .update_message_content(
+                message_id.to_string(),
+                new_content.to_string(),
+                edit_version,
+                timestamp_ms,
+            )
+            .await?;
+        self.inner
+            .fanout_message_edit(&stored_message, protocol_message)
+            .await?;
+        self.inner
+            .emit_message_edited(message_uuid, new_content.to_string(), edit_version);
+
+        Ok(())
+    }
+
+    pub async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<()> {
+        if sender_id != self.inner.local_peer.device_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized delete sender {sender_id} for local peer {}",
+                self.inner.local_peer.device_id
+            )));
+        }
+
+        let stored_message = self
+            .inner
+            .load_message(message_id.to_string())
+            .await?
+            .ok_or_else(|| MessagingError::Validation(format!("message {message_id} not found")))?;
+        let deleter_id = user_id_from_peer_id(sender_id)?;
+
+        if stored_message.sender_id != deleter_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized delete for message {message_id} by sender {sender_id}"
+            )));
+        }
+
+        if stored_message.is_deleted {
+            return Ok(());
+        }
+
+        let timestamp_ms = now_ms_u64();
+        let message_uuid = stored_message.id;
+        let protocol_message = ProtocolMessage::MessageDelete {
+            message_id: message_id.to_string(),
+            chat_id: stored_message.chat_id.0.to_string(),
+            sender_id: sender_id.to_string(),
+            timestamp_ms,
+        };
+
+        self.inner
+            .mark_message_deleted(message_id.to_string(), timestamp_ms)
+            .await?;
+        self.inner
+            .fanout_message_delete(&stored_message, protocol_message)
+            .await?;
+        self.inner.emit_message_deleted(message_uuid);
+
+        Ok(())
     }
 
     pub async fn create_group(
@@ -318,6 +521,15 @@ impl<S: ChatStorage + 'static> ChatService<S> {
         group_id: &ChatId,
         content: impl Into<String>,
     ) -> Result<Message> {
+        self.send_to_group_with_reply(group_id, content, None).await
+    }
+
+    pub async fn send_to_group_with_reply(
+        &self,
+        group_id: &ChatId,
+        content: impl Into<String>,
+        reply_to_id: Option<String>,
+    ) -> Result<Message> {
         let group = self
             .inner
             .load_group(group_id.clone())
@@ -327,16 +539,28 @@ impl<S: ChatStorage + 'static> ChatService<S> {
 
         let recipients = other_group_member_peer_ids(&group, &self.inner.local_peer.device_id);
         let sender_id = user_id_from_peer_id(&self.inner.local_peer.device_id)?;
+        let content = content.into();
+        let reply_to_preview = self
+            .inner
+            .load_reply_preview(reply_to_id.as_deref())
+            .await?;
         let mut message = Message {
             id: Uuid::new_v4(),
             chat_id: group.id.clone(),
             sender_id,
-            content: content.into(),
+            content,
             timestamp_ms: now_ms(),
             status: MessageStatus::Sent,
+            edit_version: 0,
+            edited_at: None,
+            is_deleted: false,
+            deleted_at: None,
+            reply_to_id,
+            reply_to_preview,
         };
 
         self.inner.save_message(message.clone()).await?;
+        parse_mentions(&message.content);
 
         let mut delivered_to_any = recipients.is_empty();
         for peer_id in recipients {
@@ -346,6 +570,8 @@ impl<S: ChatStorage + 'static> ChatService<S> {
                 sender_id: self.inner.local_peer.device_id.clone(),
                 content: message.content.clone(),
                 timestamp: message.timestamp_ms,
+                reply_to_id: message.reply_to_id.clone(),
+                reply_to_preview: message.reply_to_preview.clone(),
             };
 
             match self.inner.send_to_peer(&peer_id, protocol_message).await {
@@ -575,6 +801,8 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 sender_id,
                 content,
                 timestamp,
+                reply_to_id,
+                reply_to_preview,
             } => {
                 self.handle_incoming_text_message(
                     peer_id,
@@ -585,6 +813,8 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                         sender_id,
                         content,
                         timestamp,
+                        reply_to_id,
+                        reply_to_preview,
                     },
                 )
                 .await
@@ -613,6 +843,44 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 }
 
                 Ok(())
+            }
+            ProtocolMessage::MessageEdit {
+                message_id,
+                chat_id,
+                sender_id,
+                new_content,
+                edit_version,
+                timestamp_ms,
+            } => {
+                self.handle_incoming_message_edit(
+                    peer_id,
+                    IncomingMessageEdit {
+                        message_id,
+                        chat_id,
+                        sender_id,
+                        new_content,
+                        edit_version,
+                        timestamp_ms,
+                    },
+                )
+                .await
+            }
+            ProtocolMessage::MessageDelete {
+                message_id,
+                chat_id,
+                sender_id,
+                timestamp_ms,
+            } => {
+                self.handle_incoming_message_delete(
+                    peer_id,
+                    IncomingMessageDelete {
+                        message_id,
+                        chat_id,
+                        sender_id,
+                        timestamp_ms,
+                    },
+                )
+                .await
             }
             _ => Ok(()),
         }
@@ -651,6 +919,7 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
 
             group_chat_id
         };
+        let mentioned_user_id = local_mention_user_id(&text.content, &self.local_peer.device_id);
 
         let stored_message = Message {
             id: message_id,
@@ -659,6 +928,12 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
             content: text.content,
             timestamp_ms: text.timestamp,
             status: MessageStatus::Delivered,
+            edit_version: 0,
+            edited_at: None,
+            is_deleted: false,
+            deleted_at: None,
+            reply_to_id: text.reply_to_id,
+            reply_to_preview: text.reply_to_preview,
         };
 
         self.save_message(stored_message.clone()).await?;
@@ -666,6 +941,24 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
             peer_id: peer_id.clone(),
             message: stored_message,
         });
+        if let Some(mentioned_user_id) = mentioned_user_id {
+            self.emit_mention_received(
+                message_id,
+                mentioned_user_id,
+                self.peer_display_name(&peer_id),
+            );
+        }
+        let pending_delete = self.take_pending_delete(&text.id);
+        let delete_timestamp_ms = pending_delete.as_ref().map(|delete| delete.timestamp_ms);
+        self.apply_buffered_message_edits(&text.id, delete_timestamp_ms)
+            .await;
+        if let Some(delete) = pending_delete {
+            self.handle_incoming_message_delete(
+                delete.sender_id.clone(),
+                delete.into_incoming(text.id.clone()),
+            )
+            .await?;
+        }
 
         reply_route
             .send(
@@ -676,6 +969,134 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 },
             )
             .await
+    }
+
+    async fn handle_incoming_message_edit(
+        &self,
+        peer_id: String,
+        edit: IncomingMessageEdit,
+    ) -> Result<()> {
+        if edit.sender_id != peer_id {
+            return Err(MessagingError::Validation(format!(
+                "incoming edit sender_id {} does not match connected peer {peer_id}",
+                edit.sender_id
+            )));
+        }
+
+        let Some(stored_message) = self.load_message(edit.message_id.clone()).await? else {
+            self.buffer_pending_edit(
+                edit.message_id,
+                PendingEdit {
+                    chat_id: edit.chat_id,
+                    sender_id: edit.sender_id,
+                    new_content: edit.new_content,
+                    edit_version: edit.edit_version,
+                    timestamp_ms: edit.timestamp_ms,
+                    expires_at_ms: now_ms_u64()
+                        .saturating_add(MESSAGE_EDIT_BUFFER_TTL.as_millis() as u64),
+                },
+            );
+            return Ok(());
+        };
+
+        if stored_message.is_deleted {
+            return Ok(());
+        }
+
+        let expected_sender_id = user_id_from_peer_id(&edit.sender_id)?;
+        if stored_message.sender_id != expected_sender_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized incoming edit for message {} by sender {}",
+                edit.message_id, edit.sender_id
+            )));
+        }
+
+        if !incoming_message_matches_message_chat(
+            &stored_message,
+            &peer_id,
+            &self.local_peer.device_id,
+            &edit.chat_id,
+        ) {
+            return Err(MessagingError::Validation(format!(
+                "incoming edit chat_id {} does not match stored message {}",
+                edit.chat_id, edit.message_id
+            )));
+        }
+
+        if !should_apply_message_edit(&stored_message, edit.edit_version, edit.timestamp_ms) {
+            return Ok(());
+        }
+
+        let message_id = edit.message_id.clone();
+        let new_content = edit.new_content.clone();
+
+        self.update_message_content(
+            message_id,
+            new_content.clone(),
+            edit.edit_version,
+            edit.timestamp_ms,
+        )
+        .await?;
+        self.emit_message_edited(stored_message.id, new_content, edit.edit_version);
+
+        Ok(())
+    }
+
+    async fn handle_incoming_message_delete(
+        &self,
+        peer_id: String,
+        delete: IncomingMessageDelete,
+    ) -> Result<()> {
+        if delete.sender_id != peer_id {
+            return Err(MessagingError::Validation(format!(
+                "incoming delete sender_id {} does not match connected peer {peer_id}",
+                delete.sender_id
+            )));
+        }
+
+        let Some(stored_message) = self.load_message(delete.message_id.clone()).await? else {
+            self.buffer_pending_delete(
+                delete.message_id,
+                PendingDelete {
+                    chat_id: delete.chat_id,
+                    sender_id: delete.sender_id,
+                    timestamp_ms: delete.timestamp_ms,
+                    expires_at_ms: now_ms_u64()
+                        .saturating_add(MESSAGE_DELETE_BUFFER_TTL.as_millis() as u64),
+                },
+            );
+            return Ok(());
+        };
+
+        if stored_message.is_deleted {
+            return Ok(());
+        }
+
+        let expected_sender_id = user_id_from_peer_id(&delete.sender_id)?;
+        if stored_message.sender_id != expected_sender_id {
+            return Err(MessagingError::Validation(format!(
+                "unauthorized incoming delete for message {} by sender {}",
+                delete.message_id, delete.sender_id
+            )));
+        }
+
+        if !incoming_message_matches_message_chat(
+            &stored_message,
+            &peer_id,
+            &self.local_peer.device_id,
+            &delete.chat_id,
+        ) {
+            return Err(MessagingError::Validation(format!(
+                "incoming delete chat_id {} does not match stored message {}",
+                delete.chat_id, delete.message_id
+            )));
+        }
+
+        self.mark_message_deleted(delete.message_id, delete.timestamp_ms)
+            .await?;
+        self.emit_message_deleted(stored_message.id);
+
+        Ok(())
     }
 
     async fn handle_group_create(
@@ -833,6 +1254,178 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         }
     }
 
+    async fn fanout_message_edit(
+        &self,
+        message: &Message,
+        protocol_message: ProtocolMessage,
+    ) -> Result<()> {
+        if let Some(group) = self.load_group(message.chat_id.clone()).await? {
+            for peer_id in other_group_member_peer_ids(&group, &self.local_peer.device_id) {
+                match self.send_to_peer(&peer_id, protocol_message.clone()).await {
+                    Ok(()) | Err(MessagingError::PeerNotConnected(_)) => {}
+                    Err(error) => {
+                        warn!(peer_id, message_id = %message.id, error = %error, "message edit send failed");
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
+        let peer_id = message.chat_id.0.to_string();
+        match self.send_to_peer(&peer_id, protocol_message).await {
+            Ok(()) | Err(MessagingError::PeerNotConnected(_)) => Ok(()),
+            Err(error) => {
+                warn!(peer_id, message_id = %message.id, error = %error, "message edit send failed");
+                Ok(())
+            }
+        }
+    }
+
+    async fn fanout_message_delete(
+        &self,
+        message: &Message,
+        protocol_message: ProtocolMessage,
+    ) -> Result<()> {
+        if let Some(group) = self.load_group(message.chat_id.clone()).await? {
+            for peer_id in other_group_member_peer_ids(&group, &self.local_peer.device_id) {
+                match self.send_to_peer(&peer_id, protocol_message.clone()).await {
+                    Ok(()) | Err(MessagingError::PeerNotConnected(_)) => {}
+                    Err(error) => {
+                        warn!(peer_id, message_id = %message.id, error = %error, "message delete send failed");
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
+        let peer_id = message.chat_id.0.to_string();
+        match self.send_to_peer(&peer_id, protocol_message).await {
+            Ok(()) | Err(MessagingError::PeerNotConnected(_)) => Ok(()),
+            Err(error) => {
+                warn!(peer_id, message_id = %message.id, error = %error, "message delete send failed");
+                Ok(())
+            }
+        }
+    }
+
+    fn emit_message_edited(&self, message_id: Uuid, new_content: String, edit_version: u32) {
+        let _ = self.events.send(ChatServiceEvent::MessageEdited {
+            message_id,
+            new_content,
+            edit_version,
+        });
+    }
+
+    fn emit_message_deleted(&self, message_id: Uuid) {
+        let _ = self
+            .events
+            .send(ChatServiceEvent::MessageDeleted { message_id });
+    }
+
+    fn emit_mention_received(
+        &self,
+        message_id: Uuid,
+        mentioned_user_id: String,
+        sender_name: String,
+    ) {
+        let _ = self.events.send(ChatServiceEvent::MentionReceived {
+            message_id,
+            mentioned_user_id,
+            sender_name,
+        });
+    }
+
+    fn peer_display_name(&self, peer_id: &str) -> String {
+        if let Some(display_name) = self
+            .clients
+            .lock()
+            .expect("lock chat clients")
+            .get(peer_id)
+            .and_then(|client| client.remote_peer())
+            .map(|peer| peer.identity.display_name)
+        {
+            return display_name;
+        }
+
+        self.server
+            .connected_peers()
+            .into_iter()
+            .find(|peer| peer.identity.device_id == peer_id)
+            .map(|peer| peer.identity.display_name)
+            .unwrap_or_else(|| peer_id.to_string())
+    }
+
+    fn buffer_pending_edit(&self, message_id: String, edit: PendingEdit) {
+        let mut pending_edits = self
+            .pending_edits
+            .lock()
+            .expect("lock pending message edits");
+        prune_expired_pending_edits(&mut pending_edits, now_ms_u64());
+        pending_edits.entry(message_id).or_default().push(edit);
+    }
+
+    fn take_pending_edits(&self, message_id: &str) -> Vec<PendingEdit> {
+        let mut pending_edits = self
+            .pending_edits
+            .lock()
+            .expect("lock pending message edits");
+        prune_expired_pending_edits(&mut pending_edits, now_ms_u64());
+        pending_edits.remove(message_id).unwrap_or_default()
+    }
+
+    fn buffer_pending_delete(&self, message_id: String, delete: PendingDelete) {
+        let mut pending_deletes = self
+            .pending_deletes
+            .lock()
+            .expect("lock pending message deletes");
+        prune_expired_pending_deletes(&mut pending_deletes, now_ms_u64());
+
+        match pending_deletes.get_mut(&message_id) {
+            Some(existing) if existing.timestamp_ms <= delete.timestamp_ms => {}
+            Some(existing) => *existing = delete,
+            None => {
+                pending_deletes.insert(message_id, delete);
+            }
+        }
+    }
+
+    fn take_pending_delete(&self, message_id: &str) -> Option<PendingDelete> {
+        let mut pending_deletes = self
+            .pending_deletes
+            .lock()
+            .expect("lock pending message deletes");
+        prune_expired_pending_deletes(&mut pending_deletes, now_ms_u64());
+        pending_deletes.remove(message_id)
+    }
+
+    async fn apply_buffered_message_edits(
+        &self,
+        message_id: &str,
+        delete_timestamp_ms: Option<u64>,
+    ) {
+        for edit in self
+            .take_pending_edits(message_id)
+            .into_iter()
+            .filter(|edit| {
+                delete_timestamp_ms
+                    .map(|delete_timestamp_ms| edit.timestamp_ms < delete_timestamp_ms)
+                    .unwrap_or(true)
+            })
+        {
+            if let Err(error) = self
+                .handle_incoming_message_edit(
+                    edit.sender_id.clone(),
+                    edit.into_incoming(message_id.to_string()),
+                )
+                .await
+            {
+                warn!(message_id, error = %error, "applying buffered message edit failed");
+            }
+        }
+    }
+
     async fn save_message(&self, message: Message) -> Result<()> {
         let storage = Arc::clone(&self.storage);
 
@@ -913,6 +1506,34 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         .map_err(|error| MessagingError::Storage(error.to_string()))?
     }
 
+    async fn load_message(&self, message_id: String) -> Result<Option<Message>> {
+        let storage = Arc::clone(&self.storage);
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move { storage.get_message(&message_id).await })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn load_reply_preview(&self, reply_to_id: Option<&str>) -> Result<Option<String>> {
+        let Some(reply_to_id) = reply_to_id else {
+            return Ok(None);
+        };
+
+        Ok(self
+            .load_message(reply_to_id.to_string())
+            .await?
+            .map(|message| snapshot_reply_preview(&message.content)))
+    }
+
     async fn update_message_status(&self, message_id: Uuid, status: MessageStatus) -> Result<()> {
         let storage = Arc::clone(&self.storage);
 
@@ -924,6 +1545,59 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
 
             runtime
                 .block_on(async move { storage.update_message_status(&message_id, status).await })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn update_message_content(
+        &self,
+        message_id: String,
+        new_content: String,
+        edit_version: u32,
+        edited_at_ms: u64,
+    ) -> Result<()> {
+        let storage = Arc::clone(&self.storage);
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move {
+                    storage
+                        .update_message_content(
+                            &message_id,
+                            &new_content,
+                            edit_version,
+                            edited_at_ms,
+                        )
+                        .await
+                })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn mark_message_deleted(&self, message_id: String, deleted_at_ms: u64) -> Result<()> {
+        let storage = Arc::clone(&self.storage);
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move {
+                    storage
+                        .mark_message_deleted(&message_id, deleted_at_ms)
+                        .await
+                })
                 .map_err(MessagingError::from)
         })
         .await
@@ -1031,9 +1705,180 @@ fn other_group_member_peer_ids(group: &GroupState, local_peer_id: &str) -> Vec<S
         .collect()
 }
 
+fn incoming_message_matches_message_chat(
+    message: &Message,
+    peer_id: &str,
+    local_peer_id: &str,
+    incoming_chat_id: &str,
+) -> bool {
+    let stored_chat_id = message.chat_id.0.to_string();
+
+    stored_chat_id == incoming_chat_id
+        || (stored_chat_id == peer_id && incoming_chat_id == local_peer_id)
+}
+
+fn should_apply_message_edit(message: &Message, edit_version: u32, timestamp_ms: u64) -> bool {
+    if edit_version > message.edit_version {
+        return true;
+    }
+
+    if edit_version < message.edit_version {
+        return false;
+    }
+
+    matches!(message.edited_at, Some(current_timestamp_ms) if timestamp_ms > current_timestamp_ms)
+}
+
+fn local_mention_user_id(content: &str, local_peer_id: &str) -> Option<String> {
+    parse_mentions(content)
+        .into_iter()
+        .find(|mention| mention.user_id == local_peer_id)
+        .map(|mention| mention.user_id)
+}
+
+fn snapshot_reply_preview(content: &str) -> String {
+    let mut chars = content.chars();
+    let preview: String = chars.by_ref().take(REPLY_TO_PREVIEW_CHAR_LIMIT).collect();
+
+    if chars.next().is_some() {
+        let mut truncated = preview;
+        truncated.push('…');
+        truncated
+    } else {
+        preview
+    }
+}
+
+fn prune_expired_pending_edits(pending_edits: &mut HashMap<String, Vec<PendingEdit>>, now_ms: u64) {
+    pending_edits.retain(|_, edits| {
+        edits.retain(|edit| edit.expires_at_ms > now_ms);
+        !edits.is_empty()
+    });
+}
+
+fn prune_expired_pending_deletes(
+    pending_deletes: &mut HashMap<String, PendingDelete>,
+    now_ms: u64,
+) {
+    pending_deletes.retain(|_, delete| delete.expires_at_ms > now_ms);
+}
+
 fn now_ms() -> i64 {
+    now_ms_u64() as i64
+}
+
+fn now_ms_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        prune_expired_pending_deletes, prune_expired_pending_edits, should_apply_message_edit,
+        snapshot_reply_preview, PendingDelete, PendingEdit,
+    };
+    use jasmine_core::{ChatId, Message, MessageStatus, UserId};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn pending_edit_buffer_discards_expired_entries() {
+        let message_id = Uuid::new_v4().to_string();
+        let mut pending_edits = HashMap::from([(
+            message_id,
+            vec![
+                PendingEdit {
+                    chat_id: "chat-1".to_string(),
+                    sender_id: "sender-1".to_string(),
+                    new_content: "expired".to_string(),
+                    edit_version: 1,
+                    timestamp_ms: 10,
+                    expires_at_ms: 99,
+                },
+                PendingEdit {
+                    chat_id: "chat-1".to_string(),
+                    sender_id: "sender-1".to_string(),
+                    new_content: "fresh".to_string(),
+                    edit_version: 2,
+                    timestamp_ms: 20,
+                    expires_at_ms: 101,
+                },
+            ],
+        )]);
+
+        prune_expired_pending_edits(&mut pending_edits, 100);
+
+        let retained = pending_edits.values().next().expect("pending edit remains");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].new_content, "fresh");
+    }
+
+    #[test]
+    fn pending_delete_buffer_discards_expired_entries() {
+        let retained_message_id = Uuid::new_v4().to_string();
+        let expired_message_id = Uuid::new_v4().to_string();
+        let mut pending_deletes = HashMap::from([
+            (
+                retained_message_id.clone(),
+                PendingDelete {
+                    chat_id: "chat-1".to_string(),
+                    sender_id: "sender-1".to_string(),
+                    timestamp_ms: 20,
+                    expires_at_ms: 101,
+                },
+            ),
+            (
+                expired_message_id,
+                PendingDelete {
+                    chat_id: "chat-2".to_string(),
+                    sender_id: "sender-2".to_string(),
+                    timestamp_ms: 10,
+                    expires_at_ms: 99,
+                },
+            ),
+        ]);
+
+        prune_expired_pending_deletes(&mut pending_deletes, 100);
+
+        assert_eq!(pending_deletes.len(), 1);
+        assert!(pending_deletes.contains_key(&retained_message_id));
+    }
+
+    #[test]
+    fn same_version_requires_newer_timestamp() {
+        let message = Message {
+            id: Uuid::new_v4(),
+            chat_id: ChatId(Uuid::new_v4()),
+            sender_id: UserId(Uuid::new_v4()),
+            content: "edited".to_string(),
+            timestamp_ms: 1,
+            status: MessageStatus::Delivered,
+            edit_version: 2,
+            edited_at: Some(200),
+            is_deleted: false,
+            deleted_at: None,
+            reply_to_id: None,
+            reply_to_preview: None,
+        };
+
+        assert!(!should_apply_message_edit(&message, 1, 300));
+        assert!(!should_apply_message_edit(&message, 2, 200));
+        assert!(should_apply_message_edit(&message, 2, 201));
+        assert!(should_apply_message_edit(&message, 3, 100));
+    }
+
+    #[test]
+    fn reply_preview_snapshot_truncates_after_one_hundred_characters() {
+        let short = "short preview";
+        let long = "0123456789".repeat(11);
+
+        assert_eq!(snapshot_reply_preview(short), short);
+        assert_eq!(
+            snapshot_reply_preview(&long),
+            format!("{}…", "0123456789".repeat(10))
+        );
+    }
 }
