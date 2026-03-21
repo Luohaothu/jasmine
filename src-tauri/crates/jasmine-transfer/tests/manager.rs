@@ -46,12 +46,7 @@ fn write_file(path: &Path, size: usize) -> PathBuf {
 
 fn encode_image_bytes(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
     let image = RgbaImage::from_fn(width, height, |x, y| {
-        Rgba([
-            (x % 255) as u8,
-            (y % 255) as u8,
-            ((x + y) % 255) as u8,
-            255,
-        ])
+        Rgba([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8, 255])
     });
     let image = DynamicImage::ImageRgba8(image);
     let mut cursor = Cursor::new(Vec::new());
@@ -142,7 +137,10 @@ impl FileSenderSignal for MockFolderSignal {
         Ok(())
     }
 
-    async fn wait_for_response(&self, response_id: &str) -> Result<ProtocolMessage, FileSenderError> {
+    async fn wait_for_response(
+        &self,
+        response_id: &str,
+    ) -> Result<ProtocolMessage, FileSenderError> {
         let receiver = self
             .response_receivers
             .lock()
@@ -926,7 +924,10 @@ async fn folder_send_persists_parent_child_linkage_in_transfer_records() {
         .expect("folder send task joins")
         .expect("folder send succeeds");
     assert_eq!(outcome.folder_transfer_id, folder_transfer_id);
-    assert_eq!(outcome.progress.status, jasmine_transfer::FolderTransferStatus::Completed);
+    assert_eq!(
+        outcome.progress.status,
+        jasmine_transfer::FolderTransferStatus::Completed
+    );
 
     let mut stored = storage
         .get_transfers(10, 0)
@@ -944,7 +945,11 @@ async fn folder_send_persists_parent_child_linkage_in_transfer_records() {
             .map(|transfer| {
                 (
                     transfer.folder_relative_path.clone(),
-                    transfer.local_path.strip_prefix(&folder_root).ok().map(PathBuf::from),
+                    transfer
+                        .local_path
+                        .strip_prefix(&folder_root)
+                        .ok()
+                        .map(PathBuf::from),
                     transfer.status.clone(),
                 )
             })
@@ -1014,7 +1019,10 @@ async fn manager_receive_image_generates_thumbnail_and_persists_path() {
         .expect("stored transfer exists");
 
     assert_eq!(stored.status, TransferStatus::Completed);
-    assert_eq!(stored.thumbnail_path.as_deref(), Some(thumbnail_path.as_str()));
+    assert_eq!(
+        stored.thumbnail_path.as_deref(),
+        Some(thumbnail_path.as_str())
+    );
     assert!(thumbnail_path.ends_with(".webp"));
     assert!(
         thumbnail_path.contains("app-data/thumbnails"),

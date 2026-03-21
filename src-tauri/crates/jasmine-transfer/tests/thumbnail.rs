@@ -7,12 +7,7 @@ use tempfile::tempdir;
 
 fn encode_image_bytes(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
     let image = RgbaImage::from_fn(width, height, |x, y| {
-        Rgba([
-            (x % 255) as u8,
-            (y % 255) as u8,
-            ((x + y) % 255) as u8,
-            255,
-        ])
+        Rgba([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8, 255])
     });
     let image = DynamicImage::ImageRgba8(image);
     let mut cursor = Cursor::new(Vec::new());
@@ -124,7 +119,6 @@ fn thumbnail_rejects_corrupt_image_bytes() {
     let input_path = write_input(&temp.path().join("broken.jpg"), &corrupt);
     let output_dir = temp.path().join("thumbs");
 
-    generate_thumbnail(&input_path, &output_dir, "broken")
-        .expect_err("corrupt image should fail");
+    generate_thumbnail(&input_path, &output_dir, "broken").expect_err("corrupt image should fail");
     assert!(!output_dir.join("broken.webp").exists());
 }

@@ -17,13 +17,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::receiver::{
-    sanitize_filename, DiskSpaceChecker, FileReceiver, FileReceiverConfig, FileReceiverError,
-    FileReceiverSignal,
-};
 use crate::manager::{
     FolderTransferLink, ManagedTransferReceiver, ManagedTransferSender, TransferManager,
     TransferManagerError,
+};
+use crate::receiver::{
+    sanitize_filename, DiskSpaceChecker, FileReceiver, FileReceiverConfig, FileReceiverError,
+    FileReceiverSignal,
 };
 use crate::sender::{
     FileSender, FileSenderConfig, FileSenderError, FileSenderSignal, TransferProgress,
@@ -189,8 +189,15 @@ where
         cancellation: CancellationToken,
         progress: Option<Arc<dyn TransferProgressReporter>>,
     ) -> Result<(), FileSenderError> {
-        FileSender::send_file_with_id(self, transfer_id, peer_id, file_path, cancellation, progress)
-            .await
+        FileSender::send_file_with_id(
+            self,
+            transfer_id,
+            peer_id,
+            file_path,
+            cancellation,
+            progress,
+        )
+        .await
     }
 }
 
@@ -308,7 +315,10 @@ where
     Sender: FolderFileTransferSender,
 {
     pub fn new(signal: Sig, file_sender: Sender) -> Self {
-        Self { signal, file_sender }
+        Self {
+            signal,
+            file_sender,
+        }
     }
 
     pub async fn send_folder<P>(
@@ -363,7 +373,12 @@ where
         emit_folder_progress(progress.as_ref(), &progress_snapshot(&progress_state));
 
         if cancellation.is_cancelled() {
-            return Ok(cancelled_outcome(&manifest, &folder_transfer_id, &progress_state, progress.as_ref()));
+            return Ok(cancelled_outcome(
+                &manifest,
+                &folder_transfer_id,
+                &progress_state,
+                progress.as_ref(),
+            ));
         }
 
         self.signal
@@ -385,9 +400,9 @@ where
         };
 
         match response {
-            ProtocolMessage::FolderAccept { folder_transfer_id: accepted_id }
-                if accepted_id == folder_transfer_id =>
-            {
+            ProtocolMessage::FolderAccept {
+                folder_transfer_id: accepted_id,
+            } if accepted_id == folder_transfer_id => {
                 update_folder_status(
                     &progress_state,
                     FolderTransferStatus::Sending,
@@ -431,13 +446,12 @@ where
             let relative_path = sanitize_manifest_path(&entry.relative_path)?;
             let file_path = manifest_entry_path(folder_path, &relative_path);
             let transfer_id = Uuid::new_v4().to_string();
-            let progress_proxy: Arc<dyn TransferProgressReporter> = Arc::new(
-                FolderAggregateProgressReporter {
+            let progress_proxy: Arc<dyn TransferProgressReporter> =
+                Arc::new(FolderAggregateProgressReporter {
                     state: Arc::clone(&progress_state),
                     file_total_bytes: entry.size,
                     reporter: progress.clone(),
-                },
-            );
+                });
 
             let send_result = self
                 .file_sender
@@ -566,8 +580,13 @@ where
         disk_space_checker: Arc<dyn DiskSpaceChecker>,
         offer_notifier: Option<Arc<dyn FolderOfferNotifier>>,
     ) -> Self {
-        let file_receiver =
-            FileReceiver::with_dependencies(signal.clone(), settings, config, disk_space_checker, None);
+        let file_receiver = FileReceiver::with_dependencies(
+            signal.clone(),
+            settings,
+            config,
+            disk_space_checker,
+            None,
+        );
         Self::with_parts(signal, file_receiver, offer_notifier)
     }
 
@@ -723,7 +742,9 @@ where
                 }
                 offer = file_offer_rx.recv() => offer,
             }
-            .ok_or_else(|| FolderReceiverError::OfferChannelClosed(folder_transfer_id.to_string()))?;
+            .ok_or_else(|| {
+                FolderReceiverError::OfferChannelClosed(folder_transfer_id.to_string())
+            })?;
 
             let file_result = self
                 .receive_manifest_file(
@@ -788,14 +809,18 @@ where
                 &pending.sender_id,
                 ProtocolMessage::FolderReject {
                     folder_transfer_id: folder_transfer_id.to_string(),
-                    reason: reason.unwrap_or_else(|| "receiver rejected folder transfer".to_string()),
+                    reason: reason
+                        .unwrap_or_else(|| "receiver rejected folder transfer".to_string()),
                 },
             )
             .await?;
         Ok(())
     }
 
-    pub async fn cancel_transfer(&self, folder_transfer_id: &str) -> Result<(), FolderReceiverError> {
+    pub async fn cancel_transfer(
+        &self,
+        folder_transfer_id: &str,
+    ) -> Result<(), FolderReceiverError> {
         if self
             .state
             .lock()
@@ -824,7 +849,13 @@ where
         &self,
         folder_transfer_id: &str,
         cancellation: CancellationToken,
-    ) -> Result<(PendingFolderOffer, mpsc::UnboundedReceiver<QueuedFolderFileOffer>), FolderReceiverError> {
+    ) -> Result<
+        (
+            PendingFolderOffer,
+            mpsc::UnboundedReceiver<QueuedFolderFileOffer>,
+        ),
+        FolderReceiverError,
+    > {
         let mut state = self.state.lock().expect("lock folder receiver state");
         let pending = state
             .pending_offers
@@ -980,11 +1011,12 @@ where
         }
 
         let final_path = manifest_entry_path(root_dir, &relative_path);
-        let progress_proxy: Arc<dyn TransferProgressReporter> = Arc::new(FolderAggregateProgressReporter {
-            state: Arc::clone(progress_state),
-            file_total_bytes: entry.size,
-            reporter: progress.cloned(),
-        });
+        let progress_proxy: Arc<dyn TransferProgressReporter> =
+            Arc::new(FolderAggregateProgressReporter {
+                state: Arc::clone(progress_state),
+                file_total_bytes: entry.size,
+                reporter: progress.cloned(),
+            });
         let receive_result = match self
             .file_receiver
             .receive_offer_to_path(
@@ -1156,11 +1188,14 @@ where
     S: FileReceiverSignal + Clone,
 {
     fn drop(&mut self) {
-        self.receiver.remove_active_receive(&self.folder_transfer_id);
+        self.receiver
+            .remove_active_receive(&self.folder_transfer_id);
     }
 }
 
-fn parse_folder_file_offer(message: ProtocolMessage) -> Result<ParsedFolderFileOffer, FolderReceiverError> {
+fn parse_folder_file_offer(
+    message: ProtocolMessage,
+) -> Result<ParsedFolderFileOffer, FolderReceiverError> {
     match message {
         ProtocolMessage::FileOffer {
             id,
@@ -1389,7 +1424,9 @@ fn hash_file(path: &Path) -> Result<String, FolderManifestError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn ensure_manifest_within_protocol_limit(manifest: &FolderManifest) -> Result<(), FolderManifestError> {
+fn ensure_manifest_within_protocol_limit(
+    manifest: &FolderManifest,
+) -> Result<(), FolderManifestError> {
     let message = ProtocolMessage::FolderManifest {
         folder_transfer_id: Uuid::nil().to_string(),
         manifest: manifest.clone(),
@@ -1489,7 +1526,11 @@ fn settle_active_file_progress(
     let snapshot = {
         let mut state = state.lock().expect("lock folder progress state");
         let attempted_bytes = state.active_file_bytes_sent.min(file_size);
-        let settled_bytes = if completed { file_size } else { attempted_bytes };
+        let settled_bytes = if completed {
+            file_size
+        } else {
+            attempted_bytes
+        };
         state.settled_bytes_sent += settled_bytes;
         state.active_file_bytes_sent = 0;
         state.progress.sent_bytes = state.settled_bytes_sent;
@@ -1508,13 +1549,7 @@ fn cancelled_outcome(
     state: &Arc<Mutex<FolderProgressState>>,
     reporter: Option<&Arc<dyn FolderProgressReporter>>,
 ) -> FolderTransferOutcome {
-    cancelled_outcome_with_files(
-        manifest,
-        folder_transfer_id,
-        state,
-        reporter,
-        Vec::new(),
-    )
+    cancelled_outcome_with_files(manifest, folder_transfer_id, state, reporter, Vec::new())
 }
 
 fn cancelled_outcome_with_files(

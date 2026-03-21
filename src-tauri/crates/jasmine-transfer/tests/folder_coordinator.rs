@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use jasmine_core::{DeviceId, ProtocolMessage, TransferStatus};
 use jasmine_transfer::{
-    FolderFileTransferSender, FolderProgress, FolderProgressReporter, FolderTransferCoordinator,
-    FolderTransferStatus, FileSenderError, FileSenderSignal, TransferProgress,
+    FileSenderError, FileSenderSignal, FolderFileTransferSender, FolderProgress,
+    FolderProgressReporter, FolderTransferCoordinator, FolderTransferStatus, TransferProgress,
     TransferProgressReporter,
 };
 use tempfile::tempdir;
@@ -106,7 +106,10 @@ impl FileSenderSignal for MockFolderSignal {
         Ok(())
     }
 
-    async fn wait_for_response(&self, response_id: &str) -> Result<ProtocolMessage, FileSenderError> {
+    async fn wait_for_response(
+        &self,
+        response_id: &str,
+    ) -> Result<ProtocolMessage, FileSenderError> {
         let receiver = self
             .response_receivers
             .lock()
@@ -119,9 +122,16 @@ impl FileSenderSignal for MockFolderSignal {
 
 #[derive(Debug, Clone)]
 enum MockFileBehavior {
-    Complete { progress_points: Vec<u64> },
-    Fail { progress_points: Vec<u64>, message: String },
-    WaitForCancellation { progress_point: u64 },
+    Complete {
+        progress_points: Vec<u64>,
+    },
+    Fail {
+        progress_points: Vec<u64>,
+        message: String,
+    },
+    WaitForCancellation {
+        progress_point: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -184,21 +194,39 @@ impl FolderFileTransferSender for MockFolderFileSender {
 
         match behavior {
             MockFileBehavior::Complete { progress_points } => {
-                report_points(progress.as_ref(), &transfer_id, total_bytes, &progress_points).await;
+                report_points(
+                    progress.as_ref(),
+                    &transfer_id,
+                    total_bytes,
+                    &progress_points,
+                )
+                .await;
                 Ok(())
             }
             MockFileBehavior::Fail {
                 progress_points,
                 message,
             } => {
-                report_points(progress.as_ref(), &transfer_id, total_bytes, &progress_points).await;
+                report_points(
+                    progress.as_ref(),
+                    &transfer_id,
+                    total_bytes,
+                    &progress_points,
+                )
+                .await;
                 Err(FileSenderError::Signal(message))
             }
             MockFileBehavior::WaitForCancellation { progress_point } => {
-                report_points(progress.as_ref(), &transfer_id, total_bytes, &[progress_point]).await;
+                report_points(
+                    progress.as_ref(),
+                    &transfer_id,
+                    total_bytes,
+                    &[progress_point],
+                )
+                .await;
                 time::timeout(Duration::from_secs(2), cancellation.cancelled())
                     .await
-                    .expect("folder cancellation should arrive") ;
+                    .expect("folder cancellation should arrive");
                 Err(FileSenderError::Cancelled)
             }
         }
@@ -231,7 +259,10 @@ struct FolderProgressCollector {
 
 impl FolderProgressCollector {
     fn snapshot(&self) -> Vec<FolderProgress> {
-        self.events.lock().expect("lock folder progress events").clone()
+        self.events
+            .lock()
+            .expect("lock folder progress events")
+            .clone()
     }
 }
 
@@ -260,7 +291,10 @@ impl CancelOnProgress {
     }
 
     fn snapshot(&self) -> Vec<FolderProgress> {
-        self.events.lock().expect("lock cancel progress events").clone()
+        self.events
+            .lock()
+            .expect("lock cancel progress events")
+            .clone()
     }
 }
 
@@ -271,7 +305,8 @@ impl FolderProgressReporter for CancelOnProgress {
             .expect("lock cancel progress events")
             .push(progress.clone());
 
-        if progress.status == FolderTransferStatus::Sending && progress.sent_bytes >= self.threshold {
+        if progress.status == FolderTransferStatus::Sending && progress.sent_bytes >= self.threshold
+        {
             self.cancellation.cancel();
         }
     }
@@ -351,12 +386,10 @@ async fn folder_coordinator_sends_manifest_before_queueing_files_in_manifest_ord
     assert_eq!(outcome.progress.status, FolderTransferStatus::Completed);
     assert_eq!(outcome.progress.completed_files, 3);
     assert!(outcome.rejection_reason.is_none());
-    assert!(
-        outcome
-            .file_results
-            .iter()
-            .all(|result| result.status == TransferStatus::Completed)
-    );
+    assert!(outcome
+        .file_results
+        .iter()
+        .all(|result| result.status == TransferStatus::Completed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -424,7 +457,10 @@ async fn folder_coordinator_aggregates_progress_across_completed_files_and_bytes
     assert_eq!(outcome.progress.status, FolderTransferStatus::Completed);
     assert_eq!(outcome.progress.sent_bytes, 10);
     assert_eq!(outcome.progress.completed_files, 2);
-    assert_eq!(events.first().expect("pending progress").status, FolderTransferStatus::Pending);
+    assert_eq!(
+        events.first().expect("pending progress").status,
+        FolderTransferStatus::Pending
+    );
     assert!(events.iter().any(|event| {
         event.status == FolderTransferStatus::Sending
             && event.sent_bytes == 2
@@ -491,7 +527,10 @@ async fn folder_coordinator_returns_rejected_without_queueing_any_files() {
         .expect("folder rejection should be an outcome");
 
     assert_eq!(outcome.progress.status, FolderTransferStatus::Rejected);
-    assert_eq!(outcome.rejection_reason.as_deref(), Some("receiver declined"));
+    assert_eq!(
+        outcome.rejection_reason.as_deref(),
+        Some("receiver declined")
+    );
     assert!(file_sender.started_paths().is_empty());
     assert!(outcome.file_results.is_empty());
 }
@@ -558,13 +597,20 @@ async fn folder_coordinator_continues_after_a_single_file_failure() {
         .expect("join folder send task")
         .expect("send folder successfully with partial failures");
 
-    assert_eq!(outcome.progress.status, FolderTransferStatus::PartiallyFailed);
+    assert_eq!(
+        outcome.progress.status,
+        FolderTransferStatus::PartiallyFailed
+    );
     assert_eq!(outcome.progress.completed_files, 2);
     assert_eq!(outcome.progress.total_files, 3);
     assert_eq!(outcome.progress.sent_bytes, 4);
     assert_eq!(
         file_sender.started_paths(),
-        vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()]
+        vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "c.txt".to_string()
+        ]
     );
     assert_eq!(
         outcome

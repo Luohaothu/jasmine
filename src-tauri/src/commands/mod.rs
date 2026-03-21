@@ -20,8 +20,8 @@ use jasmine_storage::SqliteStorage;
 use jasmine_transfer::{
     FileReceiver, FileReceiverError, FileReceiverSignal, FileSender, FileSenderError,
     FileSenderSignal, FolderOfferNotification, FolderProgress, FolderProgressReporter,
-    FolderReceiver, FolderTransferCoordinator, FolderTransferOutcome,
-    FolderTransferStatus, TransferDirection, TransferManager,
+    FolderReceiver, FolderTransferCoordinator, FolderTransferOutcome, FolderTransferStatus,
+    TransferDirection, TransferManager,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -54,7 +54,8 @@ type DefaultTransferManager = TransferManager<
     FileReceiver<TransferSignalBridge>,
     SqliteStorage,
 >;
-type DefaultFolderCoordinator = FolderTransferCoordinator<TransferSignalBridge, Arc<DefaultTransferManager>>;
+type DefaultFolderCoordinator =
+    FolderTransferCoordinator<TransferSignalBridge, Arc<DefaultTransferManager>>;
 type DefaultFolderReceiver = FolderReceiver<TransferSignalBridge>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -300,7 +301,11 @@ impl AppState {
         send_file_impl(self, peer_id, file_path).await
     }
 
-    pub async fn send_folder(&self, peer_id: String, folder_path: String) -> Result<String, String> {
+    pub async fn send_folder(
+        &self,
+        peer_id: String,
+        folder_path: String,
+    ) -> Result<String, String> {
         send_folder_impl(self, peer_id, folder_path).await
     }
 
@@ -503,7 +508,12 @@ pub trait MessagingServiceHandle: Send + Sync {
         content: &str,
         reply_to_id: Option<&str>,
     ) -> Result<Message, String>;
-    async fn edit_message(&self, message_id: &str, new_content: &str, sender_id: &str) -> Result<(), String>;
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        sender_id: &str,
+    ) -> Result<(), String>;
     async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<(), String>;
     async fn shutdown(&self) -> Result<(), String>;
 }
@@ -515,7 +525,11 @@ pub trait TransferServiceHandle: Send + Sync {
     async fn accept_file(&self, offer_id: &str) -> Result<String, String>;
     async fn reject_file(&self, offer_id: &str, reason: Option<String>) -> Result<(), String>;
     async fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String>;
-    async fn accept_folder_transfer(&self, folder_id: &str, target_dir: &Path) -> Result<(), String>;
+    async fn accept_folder_transfer(
+        &self,
+        folder_id: &str,
+        target_dir: &Path,
+    ) -> Result<(), String>;
     async fn reject_folder_transfer(&self, folder_id: &str) -> Result<(), String>;
     async fn cancel_folder_transfer(&self, folder_id: &str) -> Result<(), String>;
     async fn get_transfers(&self) -> Result<Vec<TransferPayload>, String>;
@@ -793,7 +807,10 @@ pub(crate) async fn edit_message_impl(
         .await
 }
 
-pub(crate) async fn delete_message_impl(state: &AppState, message_id: String) -> Result<(), String> {
+pub(crate) async fn delete_message_impl(
+    state: &AppState,
+    message_id: String,
+) -> Result<(), String> {
     state
         .messaging
         .delete_message(&message_id, &state.local_device_id())
@@ -1125,7 +1142,13 @@ fn spawn_chat_event_bridge(
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    emit_chat_service_event(event, storage.as_ref(), emitter.as_ref(), &local_device_id).await;
+                    emit_chat_service_event(
+                        event,
+                        storage.as_ref(),
+                        emitter.as_ref(),
+                        &local_device_id,
+                    )
+                    .await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1327,12 +1350,19 @@ struct TransferProtocolContext {
     emitter: Arc<dyn FrontendEmitter>,
 }
 
-async fn handle_transfer_protocol_message(message: ProtocolMessage, context: TransferProtocolContext) {
+async fn handle_transfer_protocol_message(
+    message: ProtocolMessage,
+    context: TransferProtocolContext,
+) {
     match message {
         folder_manifest @ ProtocolMessage::FolderManifest { .. } => {
             if let Ok(Some(notification)) = context
                 .folder_receiver
-                .handle_signal_message(context.sender_id.clone(), context.sender_address, folder_manifest)
+                .handle_signal_message(
+                    context.sender_id.clone(),
+                    context.sender_address,
+                    folder_manifest,
+                )
                 .await
             {
                 context.folder_bridge.remember_pending_offer(&notification);
@@ -1343,7 +1373,11 @@ async fn handle_transfer_protocol_message(message: ProtocolMessage, context: Tra
                     total_size: notification.total_size,
                     sender_name: context.sender_name,
                 };
-                let _ = emit_payload(context.emitter.as_ref(), EVENT_FOLDER_OFFER_RECEIVED, &payload);
+                let _ = emit_payload(
+                    context.emitter.as_ref(),
+                    EVENT_FOLDER_OFFER_RECEIVED,
+                    &payload,
+                );
             }
         }
         file_offer @ ProtocolMessage::FileOffer { .. } => {
@@ -1367,7 +1401,11 @@ async fn handle_transfer_protocol_message(message: ProtocolMessage, context: Tra
                         size: notification.size,
                         sender_id: notification.sender_id.0.to_string(),
                     };
-                    let _ = emit_payload(context.emitter.as_ref(), EVENT_FILE_OFFER_RECEIVED, &payload);
+                    let _ = emit_payload(
+                        context.emitter.as_ref(),
+                        EVENT_FILE_OFFER_RECEIVED,
+                        &payload,
+                    );
                 }
             }
         }
@@ -1751,7 +1789,11 @@ impl MessagingServiceHandle for RealMessagingService {
     ) -> Result<Message, String> {
         let _ = self.connector.ensure_connected(peer_id).await;
         self.chat
-            .send_message_with_reply(peer_id, content.to_string(), reply_to_id.map(str::to_string))
+            .send_message_with_reply(
+                peer_id,
+                content.to_string(),
+                reply_to_id.map(str::to_string),
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -1792,12 +1834,21 @@ impl MessagingServiceHandle for RealMessagingService {
     ) -> Result<Message, String> {
         let group_id = ChatId(parse_uuid(group_id, "group_id")?);
         self.chat
-            .send_to_group_with_reply(&group_id, content.to_string(), reply_to_id.map(str::to_string))
+            .send_to_group_with_reply(
+                &group_id,
+                content.to_string(),
+                reply_to_id.map(str::to_string),
+            )
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn edit_message(&self, message_id: &str, new_content: &str, sender_id: &str) -> Result<(), String> {
+    async fn edit_message(
+        &self,
+        message_id: &str,
+        new_content: &str,
+        sender_id: &str,
+    ) -> Result<(), String> {
         self.chat
             .edit_message(message_id, new_content, sender_id)
             .await
@@ -1901,7 +1952,11 @@ impl TransferServiceHandle for RealTransferService {
             .map_err(|error| error.to_string())
     }
 
-    async fn accept_folder_transfer(&self, _folder_id: &str, _target_dir: &Path) -> Result<(), String> {
+    async fn accept_folder_transfer(
+        &self,
+        _folder_id: &str,
+        _target_dir: &Path,
+    ) -> Result<(), String> {
         let sender_id = self
             .folder_bridge
             .take_pending_offer_sender(_folder_id)
@@ -2259,7 +2314,9 @@ fn bridge_thumbnail_event(
     let started_at = pending_thumbnail_failures
         .entry(transfer.id.clone())
         .or_insert_with(Instant::now);
-    if started_at.elapsed() >= THUMBNAIL_WATCH_TIMEOUT && !emitted_thumbnail_failed.contains(&transfer.id) {
+    if started_at.elapsed() >= THUMBNAIL_WATCH_TIMEOUT
+        && !emitted_thumbnail_failed.contains(&transfer.id)
+    {
         let payload = ThumbnailFailedPayload {
             transfer_id: transfer.id.clone(),
         };
@@ -2268,7 +2325,10 @@ fn bridge_thumbnail_event(
     }
 }
 
-fn is_received_image_transfer(previous: Option<&TransferPayload>, transfer: &TransferPayload) -> bool {
+fn is_received_image_transfer(
+    previous: Option<&TransferPayload>,
+    transfer: &TransferPayload,
+) -> bool {
     let direction = transfer
         .direction
         .as_deref()

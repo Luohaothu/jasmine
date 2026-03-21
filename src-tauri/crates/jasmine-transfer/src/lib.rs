@@ -12,9 +12,9 @@ pub use folder::{
     generate_folder_manifest, sanitize_manifest_path, FolderFileTransferResult,
     FolderFileTransferSender, FolderManifest, FolderManifestError, FolderOfferNotification,
     FolderOfferNotifier, FolderProgress, FolderProgressReporter, FolderReceiver,
-    FolderReceiverError, FolderTransferCoordinator, FolderTransferError,
-    FolderTransferOutcome, FolderTransferStatus, ManifestEntry,
-    DEFAULT_FOLDER_MANIFEST_MAX_FILES, MAX_MANIFEST_PATH_LENGTH,
+    FolderReceiverError, FolderTransferCoordinator, FolderTransferError, FolderTransferOutcome,
+    FolderTransferStatus, ManifestEntry, DEFAULT_FOLDER_MANIFEST_MAX_FILES,
+    MAX_MANIFEST_PATH_LENGTH,
 };
 pub use manager::{
     ManagedTransfer, ManagedTransferReceiver, ManagedTransferSender, TransferAggregateProgress,

@@ -16,12 +16,12 @@ use super::{
     cancel_transfer_impl, create_group_impl, delete_message_impl, edit_message_impl,
     get_identity_impl, get_messages_impl, get_peers_impl, get_settings_impl, get_transfers_impl,
     reject_file_impl, reject_folder_transfer_impl, send_file_impl, send_folder_impl,
-    send_group_message_impl, send_message_impl, setup_app_state_with_factory,
-    start_discovery_impl, stop_discovery_impl, transfer_payload_from_managed,
-    transfer_payload_from_record, update_avatar_impl, update_display_name_impl,
-    update_settings_impl, AppSetupFactory, AppState, ChatMessagePayload,
-    DiscoveryServiceHandle, FrontendEmitter, IdentityServiceHandle, MessagingServiceHandle,
-    PeerPayload, SettingsServiceHandle, SetupContext, TransferPayload, TransferServiceHandle,
+    send_group_message_impl, send_message_impl, setup_app_state_with_factory, start_discovery_impl,
+    stop_discovery_impl, transfer_payload_from_managed, transfer_payload_from_record,
+    update_avatar_impl, update_display_name_impl, update_settings_impl, AppSetupFactory, AppState,
+    ChatMessagePayload, DiscoveryServiceHandle, FrontendEmitter, IdentityServiceHandle,
+    MessagingServiceHandle, PeerPayload, SettingsServiceHandle, SetupContext, TransferPayload,
+    TransferServiceHandle,
 };
 
 fn device_id(seed: u128) -> DeviceId {
@@ -227,14 +227,11 @@ impl MessagingServiceHandle for MockMessagingService {
         new_content: &str,
         sender_id: &str,
     ) -> Result<(), String> {
-        self.edit_calls
-            .lock()
-            .expect("lock edit calls")
-            .push((
-                message_id.to_string(),
-                new_content.to_string(),
-                sender_id.to_string(),
-            ));
+        self.edit_calls.lock().expect("lock edit calls").push((
+            message_id.to_string(),
+            new_content.to_string(),
+            sender_id.to_string(),
+        ));
         Ok(())
     }
 
@@ -324,7 +321,11 @@ impl TransferServiceHandle for MockTransferService {
         Ok(())
     }
 
-    async fn accept_folder_transfer(&self, _folder_id: &str, _target_dir: &Path) -> Result<(), String> {
+    async fn accept_folder_transfer(
+        &self,
+        _folder_id: &str,
+        _target_dir: &Path,
+    ) -> Result<(), String> {
         self.accepted_folders
             .lock()
             .expect("lock accepted folders")
@@ -518,10 +519,14 @@ mod commands {
             Arc::new(MockSettingsService::default()),
         );
 
-        let message_id =
-            send_message_impl(&state, Uuid::from_u128(2).to_string(), "hello".to_string(), None)
-                .await
-                .expect("send message command");
+        let message_id = send_message_impl(
+            &state,
+            Uuid::from_u128(2).to_string(),
+            "hello".to_string(),
+            None,
+        )
+        .await
+        .expect("send message command");
 
         assert_eq!(message_id, Uuid::from_u128(11).to_string());
         assert_eq!(
@@ -696,8 +701,16 @@ mod commands {
             .expect("edit message command");
 
         assert_eq!(
-            messaging.edit_calls.lock().expect("lock edit calls").clone(),
-            vec![("msg-1".to_string(), "updated".to_string(), identity().device_id)]
+            messaging
+                .edit_calls
+                .lock()
+                .expect("lock edit calls")
+                .clone(),
+            vec![(
+                "msg-1".to_string(),
+                "updated".to_string(),
+                identity().device_id
+            )]
         );
     }
 
@@ -785,10 +798,7 @@ mod commands {
                 .lock()
                 .expect("lock sent folders")
                 .clone(),
-            vec![(
-                Uuid::from_u128(2).to_string(),
-                PathBuf::from("/tmp/folder")
-            )]
+            vec![(Uuid::from_u128(2).to_string(), PathBuf::from("/tmp/folder"))]
         );
     }
 
@@ -878,13 +888,9 @@ mod commands {
             Arc::new(MockSettingsService::default()),
         );
 
-        accept_folder_transfer_impl(
-            &state,
-            "folder-1".to_string(),
-            "/tmp/downloads".to_string(),
-        )
-        .await
-        .expect("accept folder transfer command");
+        accept_folder_transfer_impl(&state, "folder-1".to_string(), "/tmp/downloads".to_string())
+            .await
+            .expect("accept folder transfer command");
 
         assert_eq!(
             transfers
@@ -990,7 +996,10 @@ mod commands {
         let payload = transfer_payload_from_managed(&transfer);
 
         assert_eq!(payload.folder_id.as_deref(), Some("folder-1"));
-        assert_eq!(payload.folder_relative_path.as_deref(), Some("docs/report.txt"));
+        assert_eq!(
+            payload.folder_relative_path.as_deref(),
+            Some("docs/report.txt")
+        );
         assert_eq!(payload.direction.as_deref(), Some("send"));
         assert_eq!(payload.progress, 0.25);
         assert_eq!(payload.speed, 25);
@@ -1017,7 +1026,10 @@ mod commands {
         let payload = transfer_payload_from_record(&record);
 
         assert_eq!(payload.folder_id.as_deref(), Some("folder-1"));
-        assert_eq!(payload.folder_relative_path.as_deref(), Some("docs/report.txt"));
+        assert_eq!(
+            payload.folder_relative_path.as_deref(),
+            Some("docs/report.txt")
+        );
         assert_eq!(payload.progress, 1.0);
         assert_eq!(payload.size, 64);
     }
@@ -1152,8 +1164,8 @@ mod commands_error {
             "hello".to_string(),
             None,
         )
-            .await
-            .expect_err("send message should fail");
+        .await
+        .expect_err("send message should fail");
 
         assert!(error.contains("peer offline"));
     }
@@ -1328,7 +1340,8 @@ mod chat_bridge {
     #[tokio::test]
     async fn emit_chat_service_event_bridges_edit_delete_and_mention_payloads() {
         let dir = tempdir().expect("create temp dir");
-        let storage = SqliteStorage::open(dir.path().join("commands.db")).expect("open sqlite storage");
+        let storage =
+            SqliteStorage::open(dir.path().join("commands.db")).expect("open sqlite storage");
         let emitter = RecordingEmitter::new();
         let mut stored_message = message(10, 2, 2, "before", MessageStatus::Delivered);
         stored_message.edit_version = 2;

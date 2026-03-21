@@ -7,7 +7,9 @@ use jasmine_app::commands::{
     setup_default_app_state_with_config, AppRuntimeConfig, AppState, ChatMessagePayload,
     FrontendEmitter, PeerPayload, TransferPayload,
 };
-use jasmine_core::{parse_mentions, Message, PeerInfo, ProtocolMessage, StorageEngine, TransferStatus};
+use jasmine_core::{
+    parse_mentions, Message, PeerInfo, ProtocolMessage, StorageEngine, TransferStatus,
+};
 use jasmine_messaging::{WsClient, WsClientConfig, WsClientEvent, WsPeerIdentity};
 use jasmine_storage::SqliteStorage;
 use serde_json::Value;
@@ -290,7 +292,9 @@ async fn wait_for_message_payload(
         let message_id = message_id.clone();
         async move {
             let messages = state.get_messages(chat_id, 50, 0).await.ok()?;
-            messages.into_iter().find(|message| message.id == message_id)
+            messages
+                .into_iter()
+                .find(|message| message.id == message_id)
         }
     })
     .await
@@ -313,7 +317,13 @@ async fn wait_for_thumbnail_path(db_path: PathBuf, transfer_id: String) -> Strin
     wait_for(ACTION_TIMEOUT, || {
         let storage = storage.clone();
         let transfer_id = transfer_id.clone();
-        async move { storage.get_thumbnail_path(&transfer_id).await.ok().flatten() }
+        async move {
+            storage
+                .get_thumbnail_path(&transfer_id)
+                .await
+                .ok()
+                .flatten()
+        }
     })
     .await
 }
@@ -401,15 +411,24 @@ where
     .expect("timed out waiting for websocket client message")
 }
 
-async fn connect_manual_client(target: &TestNode, probe: &TestNode, display_name: &str) -> (WsClient, String) {
+async fn connect_manual_client(
+    target: &TestNode,
+    probe: &TestNode,
+    display_name: &str,
+) -> (WsClient, String) {
     let target_id = target.device_id();
     let _ = wait_for_peer(probe, target_id.clone()).await;
     let peer = wait_for_peer_record(probe.database_path(), target_id).await;
-    let ws_port = peer.ws_port.expect("target peer must advertise websocket port");
+    let ws_port = peer
+        .ws_port
+        .expect("target peer must advertise websocket port");
     let manual_id = Uuid::new_v4().to_string();
     let client = WsClient::connect(
         format!("ws://127.0.0.1:{ws_port}"),
-        WsClientConfig::new(WsPeerIdentity::new(manual_id.clone(), display_name.to_string())),
+        WsClientConfig::new(WsPeerIdentity::new(
+            manual_id.clone(),
+            display_name.to_string(),
+        )),
     )
     .await
     .expect("connect manual websocket client");
@@ -443,9 +462,8 @@ async fn phase2a_message_features_roundtrip() {
             wait_for_peer(&beta, alpha_id.clone()),
         );
 
-        let mention_content = format!(
-            "Hello @[Beta](user:{beta_id}), this mention should stay parseable."
-        );
+        let mention_content =
+            format!("Hello @[Beta](user:{beta_id}), this mention should stay parseable.");
         let mention_cursor = beta.emitter.mark();
         let mention_id = alpha
             .state
@@ -487,7 +505,8 @@ async fn phase2a_message_features_roundtrip() {
             Some(alpha_name.as_str())
         );
 
-        let receiver_mention = wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
+        let receiver_mention =
+            wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
         let parsed_mentions = parse_mentions(&receiver_mention.content);
         assert_eq!(parsed_mentions.len(), 1);
         assert_eq!(parsed_mentions[0].user_id, beta_id);
@@ -495,7 +514,11 @@ async fn phase2a_message_features_roundtrip() {
         let no_mention_cursor = beta.emitter.mark();
         let no_mention_id = alpha
             .state
-            .send_message(beta_id.clone(), "Plain text without mentions".to_string(), None)
+            .send_message(
+                beta_id.clone(),
+                "Plain text without mentions".to_string(),
+                None,
+            )
             .await
             .expect("send plain message");
         let _ = beta
@@ -512,7 +535,9 @@ async fn phase2a_message_features_roundtrip() {
             no_mention_cursor,
             EVENT_MENTION_RECEIVED,
             NO_EVENT_WAIT,
-            |payload| payload.get("messageId").and_then(Value::as_str) == Some(no_mention_id.as_str()),
+            |payload| {
+                payload.get("messageId").and_then(Value::as_str) == Some(no_mention_id.as_str())
+            },
         )
         .await;
 
@@ -526,9 +551,7 @@ async fn phase2a_message_features_roundtrip() {
             "unexpected unauthorized edit error: {unauthorized}"
         );
 
-        let edited_content = format!(
-            "Updated @[Beta](user:{beta_id}) mention content after edit."
-        );
+        let edited_content = format!("Updated @[Beta](user:{beta_id}) mention content after edit.");
         let edit_cursor = beta.emitter.mark();
         alpha
             .state
@@ -557,8 +580,10 @@ async fn phase2a_message_features_roundtrip() {
         );
         assert!(edit_event.get("editedAt").and_then(Value::as_u64).is_some());
 
-        let sender_edited = wait_for_stored_message(alpha.database_path(), mention_id.clone()).await;
-        let receiver_edited = wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
+        let sender_edited =
+            wait_for_stored_message(alpha.database_path(), mention_id.clone()).await;
+        let receiver_edited =
+            wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
         for message in [&sender_edited, &receiver_edited] {
             assert_eq!(message.content, edited_content);
             assert_eq!(message.edit_version, 1);
@@ -571,7 +596,11 @@ async fn phase2a_message_features_roundtrip() {
         let reply_content = "Snapshot reply should survive delete".to_string();
         let reply_id = beta
             .state
-            .send_message(alpha_id.clone(), reply_content.clone(), Some(mention_id.clone()))
+            .send_message(
+                alpha_id.clone(),
+                reply_content.clone(),
+                Some(mention_id.clone()),
+            )
             .await
             .expect("send quote reply");
         let _ = alpha
@@ -588,7 +617,10 @@ async fn phase2a_message_features_roundtrip() {
         let receiver_reply = wait_for_stored_message(alpha.database_path(), reply_id.clone()).await;
         for reply in [&sender_reply, &receiver_reply] {
             assert_eq!(reply.reply_to_id.as_deref(), Some(mention_id.as_str()));
-            assert_eq!(reply.reply_to_preview.as_deref(), Some(edited_content.as_str()));
+            assert_eq!(
+                reply.reply_to_preview.as_deref(),
+                Some(edited_content.as_str())
+            );
         }
 
         let delete_cursor = beta.emitter.mark();
@@ -609,23 +641,30 @@ async fn phase2a_message_features_roundtrip() {
             )
             .await;
 
-        let sender_deleted = wait_for_stored_message(alpha.database_path(), mention_id.clone()).await;
-        let receiver_deleted = wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
+        let sender_deleted =
+            wait_for_stored_message(alpha.database_path(), mention_id.clone()).await;
+        let receiver_deleted =
+            wait_for_stored_message(beta.database_path(), mention_id.clone()).await;
         for message in [&sender_deleted, &receiver_deleted] {
             assert!(message.is_deleted);
             assert!(message.deleted_at.is_some());
         }
 
-        let deleted_payload = wait_for_message_payload(&beta, alpha_id.clone(), mention_id.clone()).await;
+        let deleted_payload =
+            wait_for_message_payload(&beta, alpha_id.clone(), mention_id.clone()).await;
         assert!(deleted_payload.is_deleted);
         assert!(deleted_payload.deleted_at.is_some());
 
-        let sender_reply_after_delete = wait_for_stored_message(beta.database_path(), reply_id.clone()).await;
+        let sender_reply_after_delete =
+            wait_for_stored_message(beta.database_path(), reply_id.clone()).await;
         let receiver_reply_after_delete =
             wait_for_stored_message(alpha.database_path(), reply_id.clone()).await;
         for reply in [&sender_reply_after_delete, &receiver_reply_after_delete] {
             assert_eq!(reply.reply_to_id.as_deref(), Some(mention_id.as_str()));
-            assert_eq!(reply.reply_to_preview.as_deref(), Some(edited_content.as_str()));
+            assert_eq!(
+                reply.reply_to_preview.as_deref(),
+                Some(edited_content.as_str())
+            );
         }
 
         beta.shutdown().await;
@@ -640,7 +679,8 @@ async fn phase2a_out_of_order_edit_and_delete_buffering() {
     within_test_timeout("phase2a_out_of_order_edit_and_delete_buffering", async {
         let beta = TestNode::new().await;
         let probe = TestNode::new().await;
-        let (manual_client, manual_id) = connect_manual_client(&beta, &probe, "Manual Sender").await;
+        let (manual_client, manual_id) =
+            connect_manual_client(&beta, &probe, "Manual Sender").await;
         let beta_id = beta.device_id();
 
         let edit_message_id = Uuid::new_v4().to_string();
@@ -693,7 +733,8 @@ async fn phase2a_out_of_order_edit_and_delete_buffering() {
             )
             .await;
 
-        let edited_message = wait_for_stored_message(beta.database_path(), edit_message_id.clone()).await;
+        let edited_message =
+            wait_for_stored_message(beta.database_path(), edit_message_id.clone()).await;
         assert_eq!(edited_message.content, "Buffered edit wins");
         assert_eq!(edited_message.edit_version, 1);
         assert!(edited_message.edited_at.is_some());
@@ -751,7 +792,10 @@ async fn phase2a_out_of_order_edit_and_delete_buffering() {
             wait_for_stored_message(beta.database_path(), delete_message_id.clone()).await;
         assert!(deleted_message.is_deleted);
         assert!(deleted_message.deleted_at.is_some());
-        assert_eq!(deleted_message.content, "This message is deleted on arrival");
+        assert_eq!(
+            deleted_message.content,
+            "This message is deleted on arrival"
+        );
 
         manual_client
             .disconnect()
@@ -792,7 +836,9 @@ async fn phase2a_thumbnail_generation_and_non_image_skip() {
                 image_cursor,
                 EVENT_FILE_OFFER_RECEIVED,
                 ACTION_TIMEOUT,
-                |payload| payload.get("id").and_then(Value::as_str) == Some(image_transfer_id.as_str()),
+                |payload| {
+                    payload.get("id").and_then(Value::as_str) == Some(image_transfer_id.as_str())
+                },
             )
             .await;
         beta.state
@@ -804,14 +850,18 @@ async fn phase2a_thumbnail_generation_and_non_image_skip() {
             wait_for_transfer_state(&alpha, image_transfer_id.clone(), "completed".to_string()),
             wait_for_transfer_state(&beta, image_transfer_id.clone(), "completed".to_string()),
         );
-        let thumbnail_path = wait_for_thumbnail_path(beta.database_path(), image_transfer_id.clone()).await;
+        let thumbnail_path =
+            wait_for_thumbnail_path(beta.database_path(), image_transfer_id.clone()).await;
         let transfer_payload = wait_for_transfer_thumbnail_payload(
             &beta,
             image_transfer_id.clone(),
             thumbnail_path.clone(),
         )
         .await;
-        assert_eq!(transfer_payload.thumbnail_path.as_deref(), Some(thumbnail_path.as_str()));
+        assert_eq!(
+            transfer_payload.thumbnail_path.as_deref(),
+            Some(thumbnail_path.as_str())
+        );
         assert!(thumbnail_path.ends_with(".webp"));
         assert!(thumbnail_path.contains("thumbnails"));
         assert!(Path::new(&thumbnail_path).exists());
@@ -822,9 +872,7 @@ async fn phase2a_thumbnail_generation_and_non_image_skip() {
             .into_iter()
             .filter(|event| event.name == EVENT_THUMBNAIL_READY)
             .filter(|event| {
-                event.payload
-                    .get("transferId")
-                    .and_then(Value::as_str)
+                event.payload.get("transferId").and_then(Value::as_str)
                     == Some(image_transfer_id.as_str())
             })
             .collect::<Vec<_>>();
@@ -850,8 +898,11 @@ async fn phase2a_thumbnail_generation_and_non_image_skip() {
         .await;
 
         let text_source = alpha.app_data_dir.join("phase2a-notes.txt");
-        std::fs::write(&text_source, b"plain text file should not generate thumbnails")
-            .expect("write text fixture");
+        std::fs::write(
+            &text_source,
+            b"plain text file should not generate thumbnails",
+        )
+        .expect("write text fixture");
         let text_cursor = beta.emitter.mark();
         let text_transfer_id = alpha
             .state
@@ -865,7 +916,9 @@ async fn phase2a_thumbnail_generation_and_non_image_skip() {
                 text_cursor,
                 EVENT_FILE_OFFER_RECEIVED,
                 ACTION_TIMEOUT,
-                |payload| payload.get("id").and_then(Value::as_str) == Some(text_transfer_id.as_str()),
+                |payload| {
+                    payload.get("id").and_then(Value::as_str) == Some(text_transfer_id.as_str())
+                },
             )
             .await;
         beta.state
@@ -1018,11 +1071,15 @@ async fn phase2a_folder_transfer_reconstructs_and_rejects() {
         for (relative_path, _) in &files {
             let source_path = join_relative_path(&source_root, relative_path);
             let target_path = join_relative_path(&reconstructed_root, relative_path);
-            assert!(target_path.exists(), "missing reconstructed file {relative_path}");
+            assert!(
+                target_path.exists(),
+                "missing reconstructed file {relative_path}"
+            );
             assert_eq!(sha256_file(&source_path), sha256_file(&target_path));
         }
 
-        let alpha_storage = SqliteStorage::open(alpha.database_path()).expect("open alpha transfer storage");
+        let alpha_storage =
+            SqliteStorage::open(alpha.database_path()).expect("open alpha transfer storage");
         let mut persisted_folder_files = alpha_storage
             .get_transfers(64, 0)
             .await
@@ -1030,9 +1087,8 @@ async fn phase2a_folder_transfer_reconstructs_and_rejects() {
             .into_iter()
             .filter(|transfer| transfer.folder_id.as_deref() == Some(folder_transfer_id.as_str()))
             .collect::<Vec<_>>();
-        persisted_folder_files.sort_by(|left, right| {
-            left.folder_relative_path.cmp(&right.folder_relative_path)
-        });
+        persisted_folder_files
+            .sort_by(|left, right| left.folder_relative_path.cmp(&right.folder_relative_path));
 
         let mut expected_relative_paths = files
             .iter()
@@ -1105,14 +1161,16 @@ async fn phase2a_folder_transfer_reconstructs_and_rejects() {
             .into_iter()
             .filter(|event| event.name == EVENT_FOLDER_PROGRESS)
             .filter(|event| {
-                event.payload
+                event
+                    .payload
                     .get("folderTransferId")
                     .and_then(Value::as_str)
                     == Some(rejected_folder_id.as_str())
             })
             .collect::<Vec<_>>();
         assert!(reject_progress_events.iter().all(|event| {
-            event.payload
+            event
+                .payload
                 .get("sentBytes")
                 .and_then(Value::as_u64)
                 .unwrap_or_default()

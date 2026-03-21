@@ -215,7 +215,7 @@ impl MockTcpSender {
         self.connected.load(Ordering::SeqCst)
     }
 
-async fn wait_for_first_chunk(&self) {
+    async fn wait_for_first_chunk(&self) {
         let receiver = self
             .first_chunk_written
             .as_ref()

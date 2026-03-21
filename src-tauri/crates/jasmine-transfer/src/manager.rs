@@ -12,9 +12,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    FileOfferNotification, FileReceiver, FileReceiverError, FileReceiverSignal, FileSender,
-    FileSenderError, FileSenderSignal, TransferProgress, TransferProgressReporter,
-    generate_thumbnail,
+    generate_thumbnail, FileOfferNotification, FileReceiver, FileReceiverError, FileReceiverSignal,
+    FileSender, FileSenderError, FileSenderSignal, TransferProgress, TransferProgressReporter,
 };
 use tracing::{debug, warn};
 
@@ -876,7 +875,12 @@ where
             return;
         }
 
-        let Some(app_data_dir) = self.settings.settings_path().parent().map(Path::to_path_buf) else {
+        let Some(app_data_dir) = self
+            .settings
+            .settings_path()
+            .parent()
+            .map(Path::to_path_buf)
+        else {
             warn!(
                 transfer_id = %transfer_id,
                 "skipping thumbnail generation because app data directory is unavailable"
@@ -942,7 +946,10 @@ fn file_name_from_path(path: &Path) -> Result<String, TransferManagerError> {
         .ok_or(TransferManagerError::InvalidFileName)
 }
 
-fn build_transfer_record(entry: &ManagedTransferEntry, transfer: &ManagedTransfer) -> TransferRecord {
+fn build_transfer_record(
+    entry: &ManagedTransferEntry,
+    transfer: &ManagedTransfer,
+) -> TransferRecord {
     TransferRecord {
         id: entry.record_id,
         peer_id: transfer.peer_id.clone(),
