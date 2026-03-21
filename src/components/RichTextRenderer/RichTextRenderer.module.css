@@ -1,0 +1,123 @@
+.container {
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.container > *:first-child {
+  margin-top: 0;
+}
+
+.container > *:last-child {
+  margin-bottom: 0;
+}
+
+.container p {
+  margin: 0.5em 0;
+}
+
+.container a:not(.linkCard) {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.linkCard {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background-color: rgba(128, 128, 128, 0.1);
+  border: 1px solid rgba(128, 128, 128, 0.2);
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0;
+  text-decoration: none !important;
+  color: inherit !important;
+  transition: background-color 0.2s;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.linkCard:hover {
+  background-color: rgba(128, 128, 128, 0.15);
+}
+
+.linkCardIcon {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.linkCardContent {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.linkCardTitle {
+  font-weight: 500;
+  font-size: 0.95em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.linkCardUrl {
+  font-size: 0.75em;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.container code {
+  background-color: rgba(128, 128, 128, 0.15);
+  padding: 0.15em 0.3em;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.9em;
+}
+
+.container pre {
+  background-color: rgba(0, 0, 0, 0.05);
+  padding: 0.75em;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: monospace;
+  font-size: 0.85em;
+  margin: 0.5em 0;
+}
+
+.container pre code {
+  background-color: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
+.mention {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 600;
+  background-color: rgba(59, 130, 246, 0.15);
+  color: var(--accent, #3b82f6);
+  padding: 0 0.4em;
+  border-radius: 12px;
+  text-decoration: none;
+  margin: 0 0.1em;
+  white-space: nowrap;
+}
+
+:global(.ownBubble) .mention {
+  background-color: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+
+.container blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.75em;
+  border-left: 3px solid rgba(128, 128, 128, 0.3);
+  color: inherit;
+  opacity: 0.9;
+}
