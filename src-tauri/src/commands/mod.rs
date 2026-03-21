@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use jasmine_core::{
@@ -18,13 +19,16 @@ use jasmine_messaging::{
 use jasmine_storage::SqliteStorage;
 use jasmine_transfer::{
     FileReceiver, FileReceiverError, FileReceiverSignal, FileSender, FileSenderError,
-    FileSenderSignal, TransferManager,
+    FileSenderSignal, FolderOfferNotification, FolderProgress, FolderProgressReporter,
+    FolderReceiver, FolderTransferCoordinator, FolderTransferOutcome,
+    FolderTransferStatus, TransferDirection, TransferManager,
 };
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{Emitter as _, State};
 use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const EVENT_PEER_DISCOVERED: &str = "peer-discovered";
@@ -33,14 +37,25 @@ const EVENT_MESSAGE_RECEIVED: &str = "message-received";
 const EVENT_FILE_OFFER_RECEIVED: &str = "file-offer-received";
 const EVENT_TRANSFER_PROGRESS: &str = "transfer-progress";
 const EVENT_TRANSFER_STATE_CHANGED: &str = "transfer-state-changed";
+const EVENT_MESSAGE_EDITED: &str = "message-edited";
+const EVENT_MESSAGE_DELETED: &str = "message-deleted";
+const EVENT_MENTION_RECEIVED: &str = "mention-received";
+const EVENT_FOLDER_OFFER_RECEIVED: &str = "folder-offer-received";
+const EVENT_FOLDER_PROGRESS: &str = "folder-progress";
+const EVENT_FOLDER_COMPLETED: &str = "folder-completed";
+const EVENT_THUMBNAIL_READY: &str = "thumbnail-ready";
+const EVENT_THUMBNAIL_FAILED: &str = "thumbnail-failed";
 const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_HISTORY_LIMIT: usize = 256;
+const THUMBNAIL_WATCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 type DefaultTransferManager = TransferManager<
     FileSender<TransferSignalBridge>,
     FileReceiver<TransferSignalBridge>,
     SqliteStorage,
 >;
+type DefaultFolderCoordinator = FolderTransferCoordinator<TransferSignalBridge, Arc<DefaultTransferManager>>;
+type DefaultFolderReceiver = FolderReceiver<TransferSignalBridge>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeerPayload {
@@ -58,6 +73,12 @@ pub struct ChatMessagePayload {
     pub content: String,
     pub timestamp: i64,
     pub status: String,
+    pub edit_version: u32,
+    pub edited_at: Option<u64>,
+    pub is_deleted: bool,
+    pub deleted_at: Option<u64>,
+    pub reply_to_id: Option<String>,
+    pub reply_to_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -70,6 +91,11 @@ pub struct TransferPayload {
     pub speed: u64,
     pub state: String,
     pub sender_id: Option<String>,
+    pub local_path: Option<String>,
+    pub thumbnail_path: Option<String>,
+    pub direction: Option<String>,
+    pub folder_id: Option<String>,
+    pub folder_relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,6 +118,70 @@ struct TransferProgressPayload {
 struct TransferStatePayload {
     id: String,
     state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageEditedPayload {
+    message_id: String,
+    new_content: String,
+    edit_version: u32,
+    edited_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageDeletedPayload {
+    message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MentionReceivedPayload {
+    message_id: String,
+    mentioned_user_id: String,
+    sender_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderOfferPayload {
+    folder_transfer_id: String,
+    folder_name: String,
+    file_count: usize,
+    total_size: u64,
+    sender_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderProgressPayload {
+    folder_transfer_id: String,
+    sent_bytes: u64,
+    total_bytes: u64,
+    completed_files: usize,
+    total_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderCompletedPayload {
+    folder_transfer_id: String,
+    status: String,
+    failed_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailReadyPayload {
+    transfer_id: String,
+    thumbnail_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailFailedPayload {
+    transfer_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -163,8 +253,13 @@ impl AppState {
         get_peers_impl(self).await
     }
 
-    pub async fn send_message(&self, peer_id: String, content: String) -> Result<String, String> {
-        send_message_impl(self, peer_id, content).await
+    pub async fn send_message(
+        &self,
+        peer_id: String,
+        content: String,
+        reply_to_id: Option<String>,
+    ) -> Result<String, String> {
+        send_message_impl(self, peer_id, content, reply_to_id).await
     }
 
     pub async fn get_messages(
@@ -184,12 +279,29 @@ impl AppState {
         &self,
         group_id: String,
         content: String,
+        reply_to_id: Option<String>,
     ) -> Result<String, String> {
-        send_group_message_impl(self, group_id, content).await
+        send_group_message_impl(self, group_id, content, reply_to_id).await
+    }
+
+    pub async fn edit_message(
+        &self,
+        message_id: String,
+        new_content: String,
+    ) -> Result<(), String> {
+        edit_message_impl(self, message_id, new_content).await
+    }
+
+    pub async fn delete_message(&self, message_id: String) -> Result<(), String> {
+        delete_message_impl(self, message_id).await
     }
 
     pub async fn send_file(&self, peer_id: String, file_path: String) -> Result<String, String> {
         send_file_impl(self, peer_id, file_path).await
+    }
+
+    pub async fn send_folder(&self, peer_id: String, folder_path: String) -> Result<String, String> {
+        send_folder_impl(self, peer_id, folder_path).await
     }
 
     pub async fn accept_file(&self, offer_id: String) -> Result<(), String> {
@@ -206,6 +318,22 @@ impl AppState {
 
     pub async fn cancel_transfer(&self, transfer_id: String) -> Result<(), String> {
         cancel_transfer_impl(self, transfer_id).await
+    }
+
+    pub async fn accept_folder_transfer(
+        &self,
+        folder_id: String,
+        target_dir: String,
+    ) -> Result<(), String> {
+        accept_folder_transfer_impl(self, folder_id, target_dir).await
+    }
+
+    pub async fn reject_folder_transfer(&self, folder_id: String) -> Result<(), String> {
+        reject_folder_transfer_impl(self, folder_id).await
+    }
+
+    pub async fn cancel_folder_transfer(&self, folder_id: String) -> Result<(), String> {
+        cancel_folder_transfer_impl(self, folder_id).await
     }
 
     pub async fn get_transfers(&self) -> Result<Vec<TransferPayload>, String> {
@@ -268,6 +396,72 @@ impl FrontendEmitter for TauriEmitter {
     }
 }
 
+#[derive(Default)]
+struct FolderBridgeState {
+    pending_offers: Mutex<HashMap<String, DeviceId>>,
+    active_receive_senders: Mutex<HashMap<String, DeviceId>>,
+}
+
+impl FolderBridgeState {
+    fn remember_pending_offer(&self, offer: &FolderOfferNotification) {
+        self.pending_offers
+            .lock()
+            .expect("lock pending folder offers")
+            .insert(offer.folder_transfer_id.clone(), offer.sender_id.clone());
+    }
+
+    fn take_pending_offer_sender(&self, folder_id: &str) -> Option<DeviceId> {
+        self.pending_offers
+            .lock()
+            .expect("lock pending folder offers")
+            .remove(folder_id)
+    }
+
+    fn has_pending_offer(&self, folder_id: &str) -> bool {
+        self.pending_offers
+            .lock()
+            .expect("lock pending folder offers")
+            .contains_key(folder_id)
+    }
+
+    fn has_active_receive_for_sender(&self, sender_id: &DeviceId) -> bool {
+        self.active_receive_senders
+            .lock()
+            .expect("lock active folder receives")
+            .values()
+            .any(|active_sender| active_sender == sender_id)
+    }
+
+    fn activate_receive(&self, folder_id: String, sender_id: DeviceId) {
+        self.active_receive_senders
+            .lock()
+            .expect("lock active folder receives")
+            .insert(folder_id, sender_id);
+    }
+
+    fn deactivate_receive(&self, folder_id: &str) {
+        self.active_receive_senders
+            .lock()
+            .expect("lock active folder receives")
+            .remove(folder_id);
+    }
+
+    fn routes_file_offer(&self, sender_id: &DeviceId) -> bool {
+        self.has_active_receive_for_sender(sender_id)
+    }
+}
+
+struct FolderEventReporter {
+    emitter: Arc<dyn FrontendEmitter>,
+}
+
+impl FolderProgressReporter for FolderEventReporter {
+    fn report(&self, progress: FolderProgress) {
+        let payload = folder_progress_payload(&progress);
+        let _ = emit_payload(self.emitter.as_ref(), EVENT_FOLDER_PROGRESS, &payload);
+    }
+}
+
 #[async_trait]
 pub trait AppSetupFactory: Send + Sync {
     async fn build(
@@ -286,7 +480,12 @@ pub trait DiscoveryServiceHandle: Send + Sync {
 
 #[async_trait]
 pub trait MessagingServiceHandle: Send + Sync {
-    async fn send_message(&self, peer_id: &str, content: &str) -> Result<Message, String>;
+    async fn send_message(
+        &self,
+        peer_id: &str,
+        content: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<Message, String>;
     async fn get_messages(
         &self,
         chat_id: &str,
@@ -298,16 +497,27 @@ pub trait MessagingServiceHandle: Send + Sync {
         name: &str,
         members: &[String],
     ) -> Result<jasmine_core::GroupInfo, String>;
-    async fn send_group_message(&self, group_id: &str, content: &str) -> Result<Message, String>;
+    async fn send_group_message(
+        &self,
+        group_id: &str,
+        content: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<Message, String>;
+    async fn edit_message(&self, message_id: &str, new_content: &str, sender_id: &str) -> Result<(), String>;
+    async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<(), String>;
     async fn shutdown(&self) -> Result<(), String>;
 }
 
 #[async_trait]
 pub trait TransferServiceHandle: Send + Sync {
     async fn send_file(&self, peer_id: &str, file_path: &Path) -> Result<String, String>;
+    async fn send_folder(&self, peer_id: &str, folder_path: &Path) -> Result<String, String>;
     async fn accept_file(&self, offer_id: &str) -> Result<String, String>;
     async fn reject_file(&self, offer_id: &str, reason: Option<String>) -> Result<(), String>;
     async fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String>;
+    async fn accept_folder_transfer(&self, folder_id: &str, target_dir: &Path) -> Result<(), String>;
+    async fn reject_folder_transfer(&self, folder_id: &str) -> Result<(), String>;
+    async fn cancel_folder_transfer(&self, folder_id: &str) -> Result<(), String>;
     async fn get_transfers(&self) -> Result<Vec<TransferPayload>, String>;
 }
 
@@ -344,8 +554,9 @@ pub async fn send_message(
     state: State<'_, Arc<AppState>>,
     peerId: String,
     content: String,
+    replyToId: Option<String>,
 ) -> Result<String, String> {
-    send_message_impl(state.inner().as_ref(), peerId, content).await
+    send_message_impl(state.inner().as_ref(), peerId, content, replyToId).await
 }
 
 #[tauri::command]
@@ -373,8 +584,28 @@ pub async fn send_group_message(
     state: State<'_, Arc<AppState>>,
     groupId: String,
     content: String,
+    replyToId: Option<String>,
 ) -> Result<String, String> {
-    send_group_message_impl(state.inner().as_ref(), groupId, content).await
+    send_group_message_impl(state.inner().as_ref(), groupId, content, replyToId).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn edit_message(
+    state: State<'_, Arc<AppState>>,
+    messageId: String,
+    newContent: String,
+) -> Result<(), String> {
+    edit_message_impl(state.inner().as_ref(), messageId, newContent).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn delete_message(
+    state: State<'_, Arc<AppState>>,
+    messageId: String,
+) -> Result<(), String> {
+    delete_message_impl(state.inner().as_ref(), messageId).await
 }
 
 #[tauri::command]
@@ -384,6 +615,16 @@ pub async fn send_file(
     file_path: String,
 ) -> Result<String, String> {
     send_file_impl(state.inner().as_ref(), peer_id, file_path).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn send_folder(
+    state: State<'_, Arc<AppState>>,
+    peerId: String,
+    folderPath: String,
+) -> Result<String, String> {
+    send_folder_impl(state.inner().as_ref(), peerId, folderPath).await
 }
 
 #[tauri::command]
@@ -406,6 +647,34 @@ pub async fn cancel_transfer(
     transfer_id: String,
 ) -> Result<(), String> {
     cancel_transfer_impl(state.inner().as_ref(), transfer_id).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn accept_folder_transfer(
+    state: State<'_, Arc<AppState>>,
+    folderId: String,
+    targetDir: String,
+) -> Result<(), String> {
+    accept_folder_transfer_impl(state.inner().as_ref(), folderId, targetDir).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn reject_folder_transfer(
+    state: State<'_, Arc<AppState>>,
+    folderId: String,
+) -> Result<(), String> {
+    reject_folder_transfer_impl(state.inner().as_ref(), folderId).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn cancel_folder_transfer(
+    state: State<'_, Arc<AppState>>,
+    folderId: String,
+) -> Result<(), String> {
+    cancel_folder_transfer_impl(state.inner().as_ref(), folderId).await
 }
 
 #[tauri::command]
@@ -465,8 +734,12 @@ pub(crate) async fn send_message_impl(
     state: &AppState,
     peer_id: String,
     content: String,
+    reply_to_id: Option<String>,
 ) -> Result<String, String> {
-    let message = state.messaging.send_message(&peer_id, &content).await?;
+    let message = state
+        .messaging
+        .send_message(&peer_id, &content, reply_to_id.as_deref())
+        .await?;
     Ok(message.id.to_string())
 }
 
@@ -500,12 +773,31 @@ pub(crate) async fn send_group_message_impl(
     state: &AppState,
     group_id: String,
     content: String,
+    reply_to_id: Option<String>,
 ) -> Result<String, String> {
     let message = state
         .messaging
-        .send_group_message(&group_id, &content)
+        .send_group_message(&group_id, &content, reply_to_id.as_deref())
         .await?;
     Ok(message.id.to_string())
+}
+
+pub(crate) async fn edit_message_impl(
+    state: &AppState,
+    message_id: String,
+    new_content: String,
+) -> Result<(), String> {
+    state
+        .messaging
+        .edit_message(&message_id, &new_content, &state.local_device_id())
+        .await
+}
+
+pub(crate) async fn delete_message_impl(state: &AppState, message_id: String) -> Result<(), String> {
+    state
+        .messaging
+        .delete_message(&message_id, &state.local_device_id())
+        .await
 }
 
 pub(crate) async fn send_file_impl(
@@ -516,6 +808,17 @@ pub(crate) async fn send_file_impl(
     state
         .transfers
         .send_file(&peer_id, Path::new(&file_path))
+        .await
+}
+
+pub(crate) async fn send_folder_impl(
+    state: &AppState,
+    peer_id: String,
+    folder_path: String,
+) -> Result<String, String> {
+    state
+        .transfers
+        .send_folder(&peer_id, Path::new(&folder_path))
         .await
 }
 
@@ -537,6 +840,31 @@ pub(crate) async fn cancel_transfer_impl(
     transfer_id: String,
 ) -> Result<(), String> {
     state.transfers.cancel_transfer(&transfer_id).await
+}
+
+pub(crate) async fn accept_folder_transfer_impl(
+    state: &AppState,
+    folder_id: String,
+    target_dir: String,
+) -> Result<(), String> {
+    state
+        .transfers
+        .accept_folder_transfer(&folder_id, Path::new(&target_dir))
+        .await
+}
+
+pub(crate) async fn reject_folder_transfer_impl(
+    state: &AppState,
+    folder_id: String,
+) -> Result<(), String> {
+    state.transfers.reject_folder_transfer(&folder_id).await
+}
+
+pub(crate) async fn cancel_folder_transfer_impl(
+    state: &AppState,
+    folder_id: String,
+) -> Result<(), String> {
+    state.transfers.cancel_folder_transfer(&folder_id).await
 }
 
 pub(crate) async fn get_transfers_impl(state: &AppState) -> Result<Vec<TransferPayload>, String> {
@@ -677,11 +1005,13 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         );
         spawn_chat_event_bridge(
             chat.clone(),
+            Arc::clone(&storage),
             Arc::clone(&emitter),
             identity.device_id.clone(),
         );
 
         let transfer_signal = TransferSignalBridge::new(Arc::clone(&connector));
+        let folder_bridge = Arc::new(FolderBridgeState::default());
         let file_sender = Arc::new(FileSender::new(transfer_signal.clone()));
         let file_receiver = Arc::new(FileReceiver::new(
             transfer_signal.clone(),
@@ -696,17 +1026,29 @@ impl AppSetupFactory for DefaultAppSetupFactory {
             )
             .map_err(|error| error.to_string())?,
         );
+        let folder_coordinator = Arc::new(DefaultFolderCoordinator::new(
+            transfer_signal.clone(),
+            Arc::clone(&transfer_manager),
+        ));
+        let folder_receiver = Arc::new(DefaultFolderReceiver::new(
+            transfer_signal.clone(),
+            settings_service.clone(),
+        ));
 
         connector.add_observer(Arc::new(ChatClientObserver { chat: chat.clone() }));
         connector.add_observer(Arc::new(TransferClientObserver {
             signal: transfer_signal.clone(),
             transfer_manager: Arc::downgrade(&transfer_manager),
+            folder_receiver: Arc::clone(&folder_receiver),
+            folder_bridge: Arc::clone(&folder_bridge),
             emitter: Arc::clone(&emitter),
         }));
 
         spawn_server_transfer_bridge(
             Arc::clone(&server),
             Arc::clone(&transfer_manager),
+            Arc::clone(&folder_receiver),
+            Arc::clone(&folder_bridge),
             transfer_signal.clone(),
             Arc::clone(&emitter),
         );
@@ -714,6 +1056,12 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         let transfer_service: Arc<dyn TransferServiceHandle> = Arc::new(RealTransferService {
             manager: Arc::clone(&transfer_manager),
             storage: Arc::clone(&storage),
+            folder_coordinator,
+            folder_receiver,
+            folder_bridge,
+            folder_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            emitter: Arc::clone(&emitter),
+            local_device_id: DeviceId(local_device_id),
         });
         spawn_transfer_progress_bridge(Arc::clone(&transfer_service), Arc::clone(&emitter));
 
@@ -768,6 +1116,7 @@ fn attach_discovery_callbacks(
 
 fn spawn_chat_event_bridge(
     chat: ChatService<SqliteStorage>,
+    storage: Arc<SqliteStorage>,
     emitter: Arc<dyn FrontendEmitter>,
     local_device_id: String,
 ) {
@@ -775,11 +1124,9 @@ fn spawn_chat_event_bridge(
         let mut events = chat.subscribe();
         loop {
             match events.recv().await {
-                Ok(ChatServiceEvent::MessageReceived { peer_id, message }) => {
-                    let payload = chat_message_payload(&local_device_id, &peer_id, message);
-                    let _ = emit_payload(emitter.as_ref(), EVENT_MESSAGE_RECEIVED, &payload);
+                Ok(event) => {
+                    emit_chat_service_event(event, storage.as_ref(), emitter.as_ref(), &local_device_id).await;
                 }
-                Ok(ChatServiceEvent::MessageStatusUpdated { .. }) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -787,9 +1134,64 @@ fn spawn_chat_event_bridge(
     });
 }
 
+async fn emit_chat_service_event(
+    event: ChatServiceEvent,
+    storage: &SqliteStorage,
+    emitter: &dyn FrontendEmitter,
+    local_device_id: &str,
+) {
+    match event {
+        ChatServiceEvent::MessageReceived { peer_id, message } => {
+            let payload = chat_message_payload(local_device_id, &peer_id, message);
+            let _ = emit_payload(emitter, EVENT_MESSAGE_RECEIVED, &payload);
+        }
+        ChatServiceEvent::MessageEdited {
+            message_id,
+            new_content,
+            edit_version,
+        } => {
+            let edited_at = storage
+                .get_message(&message_id.to_string())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|message| message.edited_at)
+                .unwrap_or_default();
+            let payload = MessageEditedPayload {
+                message_id: message_id.to_string(),
+                new_content,
+                edit_version,
+                edited_at,
+            };
+            let _ = emit_payload(emitter, EVENT_MESSAGE_EDITED, &payload);
+        }
+        ChatServiceEvent::MessageDeleted { message_id } => {
+            let payload = MessageDeletedPayload {
+                message_id: message_id.to_string(),
+            };
+            let _ = emit_payload(emitter, EVENT_MESSAGE_DELETED, &payload);
+        }
+        ChatServiceEvent::MentionReceived {
+            message_id,
+            mentioned_user_id,
+            sender_name,
+        } => {
+            let payload = MentionReceivedPayload {
+                message_id: message_id.to_string(),
+                mentioned_user_id,
+                sender_name,
+            };
+            let _ = emit_payload(emitter, EVENT_MENTION_RECEIVED, &payload);
+        }
+        ChatServiceEvent::MessageStatusUpdated { .. } => {}
+    }
+}
+
 fn spawn_server_transfer_bridge(
     server: Arc<WsServer>,
     transfer_manager: Arc<DefaultTransferManager>,
+    folder_receiver: Arc<DefaultFolderReceiver>,
+    folder_bridge: Arc<FolderBridgeState>,
     signal: TransferSignalBridge,
     emitter: Arc<dyn FrontendEmitter>,
 ) {
@@ -806,11 +1208,16 @@ fn spawn_server_transfer_bridge(
                     };
                     handle_transfer_protocol_message(
                         message,
-                        sender_id,
-                        sender_address,
-                        Arc::downgrade(&transfer_manager),
-                        signal.clone(),
-                        Arc::clone(&emitter),
+                        TransferProtocolContext {
+                            sender_id,
+                            sender_name: peer.identity.display_name,
+                            sender_address,
+                            transfer_manager: Arc::downgrade(&transfer_manager),
+                            folder_receiver: Arc::clone(&folder_receiver),
+                            folder_bridge: Arc::clone(&folder_bridge),
+                            signal: signal.clone(),
+                            emitter: Arc::clone(&emitter),
+                        },
                     )
                     .await;
                 }
@@ -828,6 +1235,9 @@ fn spawn_transfer_progress_bridge(
 ) {
     tauri::async_runtime::spawn(async move {
         let mut previous = HashMap::<String, TransferPayload>::new();
+        let mut pending_thumbnail_failures = HashMap::<String, Instant>::new();
+        let mut emitted_thumbnail_ready = HashSet::<String>::new();
+        let mut emitted_thumbnail_failed = HashSet::<String>::new();
         let mut interval = time::interval(TRANSFER_POLL_INTERVAL);
 
         loop {
@@ -837,7 +1247,9 @@ fn spawn_transfer_progress_bridge(
             };
 
             let mut current_by_id = HashMap::new();
+            let mut current_ids = HashSet::new();
             for transfer in current {
+                let previous_transfer = previous.get(&transfer.id);
                 if let Some(last) = previous.get(&transfer.id) {
                     if last.state != transfer.state {
                         let _ = emit_payload(
@@ -883,43 +1295,87 @@ fn spawn_transfer_progress_bridge(
                     );
                 }
 
+                bridge_thumbnail_event(
+                    emitter.as_ref(),
+                    previous_transfer,
+                    &transfer,
+                    &mut pending_thumbnail_failures,
+                    &mut emitted_thumbnail_ready,
+                    &mut emitted_thumbnail_failed,
+                );
+
+                current_ids.insert(transfer.id.clone());
                 current_by_id.insert(transfer.id.clone(), transfer);
             }
 
+            pending_thumbnail_failures.retain(|transfer_id, _| current_ids.contains(transfer_id));
+            emitted_thumbnail_ready.retain(|transfer_id| current_ids.contains(transfer_id));
+            emitted_thumbnail_failed.retain(|transfer_id| current_ids.contains(transfer_id));
             previous = current_by_id;
         }
     });
 }
 
-async fn handle_transfer_protocol_message(
-    message: ProtocolMessage,
+struct TransferProtocolContext {
     sender_id: DeviceId,
+    sender_name: String,
     sender_address: SocketAddr,
     transfer_manager: Weak<DefaultTransferManager>,
+    folder_receiver: Arc<DefaultFolderReceiver>,
+    folder_bridge: Arc<FolderBridgeState>,
     signal: TransferSignalBridge,
     emitter: Arc<dyn FrontendEmitter>,
-) {
-    match message {
-        file_offer @ ProtocolMessage::FileOffer { .. } => {
-            let Some(transfer_manager) = transfer_manager.upgrade() else {
-                return;
-            };
+}
 
-            if let Ok(Some(notification)) = transfer_manager
-                .handle_signal_message(sender_id, sender_address, file_offer)
+async fn handle_transfer_protocol_message(message: ProtocolMessage, context: TransferProtocolContext) {
+    match message {
+        folder_manifest @ ProtocolMessage::FolderManifest { .. } => {
+            if let Ok(Some(notification)) = context
+                .folder_receiver
+                .handle_signal_message(context.sender_id.clone(), context.sender_address, folder_manifest)
                 .await
             {
-                let payload = FileOfferPayload {
-                    id: notification.offer_id,
-                    filename: notification.filename,
-                    size: notification.size,
-                    sender_id: notification.sender_id.0.to_string(),
+                context.folder_bridge.remember_pending_offer(&notification);
+                let payload = FolderOfferPayload {
+                    folder_transfer_id: notification.folder_transfer_id,
+                    folder_name: notification.folder_name,
+                    file_count: notification.file_count,
+                    total_size: notification.total_size,
+                    sender_name: context.sender_name,
                 };
-                let _ = emit_payload(emitter.as_ref(), EVENT_FILE_OFFER_RECEIVED, &payload);
+                let _ = emit_payload(context.emitter.as_ref(), EVENT_FOLDER_OFFER_RECEIVED, &payload);
             }
         }
-        ProtocolMessage::FileAccept { .. } | ProtocolMessage::FileReject { .. } => {
-            let _ = signal.route_response(message);
+        file_offer @ ProtocolMessage::FileOffer { .. } => {
+            if context.folder_bridge.routes_file_offer(&context.sender_id) {
+                let _ = context
+                    .folder_receiver
+                    .handle_signal_message(context.sender_id, context.sender_address, file_offer)
+                    .await;
+            } else {
+                let Some(transfer_manager) = context.transfer_manager.upgrade() else {
+                    return;
+                };
+
+                if let Ok(Some(notification)) = transfer_manager
+                    .handle_signal_message(context.sender_id, context.sender_address, file_offer)
+                    .await
+                {
+                    let payload = FileOfferPayload {
+                        id: notification.offer_id,
+                        filename: notification.filename,
+                        size: notification.size,
+                        sender_id: notification.sender_id.0.to_string(),
+                    };
+                    let _ = emit_payload(context.emitter.as_ref(), EVENT_FILE_OFFER_RECEIVED, &payload);
+                }
+            }
+        }
+        ProtocolMessage::FileAccept { .. }
+        | ProtocolMessage::FileReject { .. }
+        | ProtocolMessage::FolderAccept { .. }
+        | ProtocolMessage::FolderReject { .. } => {
+            let _ = context.signal.route_response(message);
         }
         _ => {}
     }
@@ -945,6 +1401,10 @@ impl TransferSignalBridge {
         let offer_id = match &message {
             ProtocolMessage::FileAccept { offer_id } => offer_id.clone(),
             ProtocolMessage::FileReject { offer_id, .. } => offer_id.clone(),
+            ProtocolMessage::FolderAccept { folder_transfer_id } => folder_transfer_id.clone(),
+            ProtocolMessage::FolderReject {
+                folder_transfer_id, ..
+            } => folder_transfer_id.clone(),
             _ => return false,
         };
 
@@ -970,6 +1430,9 @@ impl FileSenderSignal for TransferSignalBridge {
     ) -> Result<(), FileSenderError> {
         let offer_id = match &message {
             ProtocolMessage::FileOffer { id, .. } => Some(id.clone()),
+            ProtocolMessage::FolderManifest {
+                folder_transfer_id, ..
+            } => Some(folder_transfer_id.clone()),
             _ => None,
         };
 
@@ -1198,6 +1661,8 @@ impl ClientObserver for ChatClientObserver {
 struct TransferClientObserver {
     signal: TransferSignalBridge,
     transfer_manager: Weak<DefaultTransferManager>,
+    folder_receiver: Arc<DefaultFolderReceiver>,
+    folder_bridge: Arc<FolderBridgeState>,
     emitter: Arc<dyn FrontendEmitter>,
 }
 
@@ -1208,10 +1673,13 @@ impl ClientObserver for TransferClientObserver {
             .remote_peer()
             .ok_or_else(|| "client remote peer is unavailable".to_string())?;
         let sender_id = parse_device_id(&remote_peer.identity.device_id)?;
+        let sender_name = remote_peer.identity.display_name.clone();
         let sender_address =
             SocketAddr::from_str(&remote_peer.address).map_err(|error| error.to_string())?;
         let signal = self.signal.clone();
         let transfer_manager = self.transfer_manager.clone();
+        let folder_receiver = Arc::clone(&self.folder_receiver);
+        let folder_bridge = Arc::clone(&self.folder_bridge);
         let emitter = Arc::clone(&self.emitter);
 
         tauri::async_runtime::spawn(async move {
@@ -1221,11 +1689,16 @@ impl ClientObserver for TransferClientObserver {
                     Ok(WsClientEvent::MessageReceived { message }) => {
                         handle_transfer_protocol_message(
                             message,
-                            sender_id.clone(),
-                            sender_address,
-                            transfer_manager.clone(),
-                            signal.clone(),
-                            Arc::clone(&emitter),
+                            TransferProtocolContext {
+                                sender_id: sender_id.clone(),
+                                sender_name: sender_name.clone(),
+                                sender_address,
+                                transfer_manager: transfer_manager.clone(),
+                                folder_receiver: Arc::clone(&folder_receiver),
+                                folder_bridge: Arc::clone(&folder_bridge),
+                                signal: signal.clone(),
+                                emitter: Arc::clone(&emitter),
+                            },
                         )
                         .await;
                     }
@@ -1270,10 +1743,15 @@ struct RealMessagingService {
 
 #[async_trait]
 impl MessagingServiceHandle for RealMessagingService {
-    async fn send_message(&self, peer_id: &str, content: &str) -> Result<Message, String> {
+    async fn send_message(
+        &self,
+        peer_id: &str,
+        content: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<Message, String> {
         let _ = self.connector.ensure_connected(peer_id).await;
         self.chat
-            .send_message(peer_id, content.to_string())
+            .send_message_with_reply(peer_id, content.to_string(), reply_to_id.map(str::to_string))
             .await
             .map_err(|error| error.to_string())
     }
@@ -1306,10 +1784,29 @@ impl MessagingServiceHandle for RealMessagingService {
             .map_err(|error| error.to_string())
     }
 
-    async fn send_group_message(&self, group_id: &str, content: &str) -> Result<Message, String> {
+    async fn send_group_message(
+        &self,
+        group_id: &str,
+        content: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<Message, String> {
         let group_id = ChatId(parse_uuid(group_id, "group_id")?);
         self.chat
-            .send_to_group(&group_id, content.to_string())
+            .send_to_group_with_reply(&group_id, content.to_string(), reply_to_id.map(str::to_string))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn edit_message(&self, message_id: &str, new_content: &str, sender_id: &str) -> Result<(), String> {
+        self.chat
+            .edit_message(message_id, new_content, sender_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<(), String> {
+        self.chat
+            .delete_message(message_id, sender_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1322,6 +1819,12 @@ impl MessagingServiceHandle for RealMessagingService {
 struct RealTransferService {
     manager: Arc<DefaultTransferManager>,
     storage: Arc<SqliteStorage>,
+    folder_coordinator: Arc<DefaultFolderCoordinator>,
+    folder_receiver: Arc<DefaultFolderReceiver>,
+    folder_bridge: Arc<FolderBridgeState>,
+    folder_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    emitter: Arc<dyn FrontendEmitter>,
+    local_device_id: DeviceId,
 }
 
 #[async_trait]
@@ -1335,6 +1838,46 @@ impl TransferServiceHandle for RealTransferService {
             )
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn send_folder(&self, _peer_id: &str, _folder_path: &Path) -> Result<String, String> {
+        let peer_id = DeviceId(parse_uuid(_peer_id, "peer_id")?);
+        let folder_transfer_id = Uuid::new_v4().to_string();
+        let cancellation = CancellationToken::new();
+        self.folder_cancellations
+            .lock()
+            .expect("lock folder transfer cancellations")
+            .insert(folder_transfer_id.clone(), cancellation.clone());
+
+        let coordinator = Arc::clone(&self.folder_coordinator);
+        let emitter = Arc::clone(&self.emitter);
+        let cancellations = Arc::clone(&self.folder_cancellations);
+        let sender_id = self.local_device_id.clone();
+        let folder_path = _folder_path.to_path_buf();
+        let task_folder_id = folder_transfer_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let reporter: Arc<dyn FolderProgressReporter> = Arc::new(FolderEventReporter {
+                emitter: Arc::clone(&emitter),
+            });
+            let result = coordinator
+                .send_folder_with_id(
+                    sender_id,
+                    peer_id,
+                    folder_path,
+                    task_folder_id.clone(),
+                    cancellation,
+                    Some(reporter),
+                )
+                .await;
+            cancellations
+                .lock()
+                .expect("lock folder transfer cancellations")
+                .remove(&task_folder_id);
+            emit_folder_completion_result(emitter.as_ref(), &task_folder_id, result);
+        });
+
+        Ok(folder_transfer_id)
     }
 
     async fn accept_file(&self, offer_id: &str) -> Result<String, String> {
@@ -1354,6 +1897,79 @@ impl TransferServiceHandle for RealTransferService {
     async fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
         self.manager
             .cancel_transfer(transfer_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn accept_folder_transfer(&self, _folder_id: &str, _target_dir: &Path) -> Result<(), String> {
+        let sender_id = self
+            .folder_bridge
+            .take_pending_offer_sender(_folder_id)
+            .ok_or_else(|| format!("unknown folder transfer {}", _folder_id))?;
+        self.folder_bridge
+            .activate_receive(_folder_id.to_string(), sender_id);
+
+        let cancellation = CancellationToken::new();
+        self.folder_cancellations
+            .lock()
+            .expect("lock folder transfer cancellations")
+            .insert(_folder_id.to_string(), cancellation.clone());
+
+        let receiver = Arc::clone(&self.folder_receiver);
+        let folder_bridge = Arc::clone(&self.folder_bridge);
+        let cancellations = Arc::clone(&self.folder_cancellations);
+        let emitter = Arc::clone(&self.emitter);
+        let folder_id = _folder_id.to_string();
+        let target_dir = _target_dir.to_path_buf();
+
+        tauri::async_runtime::spawn(async move {
+            let reporter: Arc<dyn FolderProgressReporter> = Arc::new(FolderEventReporter {
+                emitter: Arc::clone(&emitter),
+            });
+            let result = receiver
+                .accept_offer_with_cancellation(
+                    &folder_id,
+                    target_dir,
+                    cancellation,
+                    Some(reporter),
+                )
+                .await;
+            folder_bridge.deactivate_receive(&folder_id);
+            cancellations
+                .lock()
+                .expect("lock folder transfer cancellations")
+                .remove(&folder_id);
+            emit_folder_completion_result(emitter.as_ref(), &folder_id, result);
+        });
+
+        Ok(())
+    }
+
+    async fn reject_folder_transfer(&self, _folder_id: &str) -> Result<(), String> {
+        let _ = self.folder_bridge.take_pending_offer_sender(_folder_id);
+        self.folder_receiver
+            .reject_offer(_folder_id, None)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn cancel_folder_transfer(&self, _folder_id: &str) -> Result<(), String> {
+        if let Some(cancellation) = self
+            .folder_cancellations
+            .lock()
+            .expect("lock folder transfer cancellations")
+            .get(_folder_id)
+            .cloned()
+        {
+            cancellation.cancel();
+            return Ok(());
+        }
+
+        if self.folder_bridge.has_pending_offer(_folder_id) {
+            let _ = self.folder_bridge.take_pending_offer_sender(_folder_id);
+        }
+        self.folder_receiver
+            .cancel_transfer(_folder_id)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1446,12 +2062,26 @@ fn chat_message_payload(
     peer_id: &str,
     message: Message,
 ) -> ChatMessagePayload {
-    let sender_uuid = message.sender_id.0.to_string();
-    let chat_id = message.chat_id.0.to_string();
+    let Message {
+        id,
+        chat_id,
+        sender_id,
+        content,
+        timestamp_ms,
+        status,
+        edit_version,
+        edited_at,
+        is_deleted,
+        deleted_at,
+        reply_to_id,
+        reply_to_preview,
+    } = message;
+    let sender_uuid = sender_id.0.to_string();
+    let chat_id = chat_id.0.to_string();
     let sender_is_local = sender_uuid == local_device_id;
 
     ChatMessagePayload {
-        id: message.id.to_string(),
+        id: id.to_string(),
         sender_id: if sender_is_local {
             "local".to_string()
         } else {
@@ -1464,9 +2094,15 @@ fn chat_message_payload(
         } else {
             chat_id.clone()
         },
-        content: message.content,
-        timestamp: message.timestamp_ms,
-        status: message_status_label(&message.status).to_string(),
+        content,
+        timestamp: timestamp_ms,
+        status: message_status_label(&status).to_string(),
+        edit_version,
+        edited_at,
+        is_deleted,
+        deleted_at,
+        reply_to_id,
+        reply_to_preview,
     }
 }
 
@@ -1494,6 +2130,11 @@ fn transfer_payload_from_managed(transfer: &jasmine_transfer::ManagedTransfer) -
         speed,
         state: transfer_status_label(&transfer.status).to_string(),
         sender_id: Some(transfer.peer_id.0.to_string()),
+        local_path: Some(transfer.local_path.to_string_lossy().into_owned()),
+        thumbnail_path: None,
+        direction: Some(transfer_direction_label(transfer.direction).to_string()),
+        folder_id: transfer.folder_id.clone(),
+        folder_relative_path: transfer.folder_relative_path.clone(),
     }
 }
 
@@ -1509,7 +2150,150 @@ fn transfer_payload_from_record(record: &TransferRecord) -> TransferPayload {
         speed: 0,
         state: transfer_status_label(&record.status).to_string(),
         sender_id: Some(record.peer_id.0.to_string()),
+        local_path: Some(record.local_path.to_string_lossy().into_owned()),
+        thumbnail_path: record.thumbnail_path.clone(),
+        direction: None,
+        folder_id: record.folder_id.clone(),
+        folder_relative_path: record.folder_relative_path.clone(),
     }
+}
+
+fn transfer_direction_label(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::Send => "send",
+        TransferDirection::Receive => "receive",
+    }
+}
+
+fn folder_progress_payload(progress: &FolderProgress) -> FolderProgressPayload {
+    FolderProgressPayload {
+        folder_transfer_id: progress.folder_transfer_id.clone(),
+        sent_bytes: progress.sent_bytes,
+        total_bytes: progress.total_bytes,
+        completed_files: progress.completed_files,
+        total_files: progress.total_files,
+    }
+}
+
+fn emit_folder_completion_result<E>(
+    emitter: &dyn FrontendEmitter,
+    folder_transfer_id: &str,
+    result: Result<FolderTransferOutcome, E>,
+) where
+    E: ToString,
+{
+    let payload = match result {
+        Ok(outcome) => {
+            let failed_files = outcome
+                .file_results
+                .iter()
+                .filter(|file| file.status == TransferStatus::Failed)
+                .count();
+            FolderCompletedPayload {
+                folder_transfer_id: outcome.folder_transfer_id,
+                status: folder_transfer_status_label(outcome.progress.status).to_string(),
+                failed_files: (failed_files > 0).then_some(failed_files),
+            }
+        }
+        Err(_) => FolderCompletedPayload {
+            folder_transfer_id: folder_transfer_id.to_string(),
+            status: "failed".to_string(),
+            failed_files: None,
+        },
+    };
+
+    let _ = emit_payload(emitter, EVENT_FOLDER_COMPLETED, &payload);
+}
+
+fn folder_transfer_status_label(status: FolderTransferStatus) -> &'static str {
+    match status {
+        FolderTransferStatus::Pending => "pending",
+        FolderTransferStatus::Sending => "sending",
+        FolderTransferStatus::Completed => "completed",
+        FolderTransferStatus::PartiallyFailed => "partially-failed",
+        FolderTransferStatus::Cancelled => "cancelled",
+        FolderTransferStatus::Rejected => "rejected",
+    }
+}
+
+fn bridge_thumbnail_event(
+    emitter: &dyn FrontendEmitter,
+    previous: Option<&TransferPayload>,
+    transfer: &TransferPayload,
+    pending_thumbnail_failures: &mut HashMap<String, Instant>,
+    emitted_thumbnail_ready: &mut HashSet<String>,
+    emitted_thumbnail_failed: &mut HashSet<String>,
+) {
+    let is_candidate = pending_thumbnail_failures.contains_key(&transfer.id)
+        || emitted_thumbnail_ready.contains(&transfer.id)
+        || emitted_thumbnail_failed.contains(&transfer.id)
+        || is_received_image_transfer(previous, transfer);
+
+    if !is_candidate {
+        return;
+    }
+
+    if let Some(thumbnail_path) = transfer.thumbnail_path.as_ref() {
+        if !emitted_thumbnail_ready.contains(&transfer.id)
+            || previous.and_then(|value| value.thumbnail_path.as_ref()) != Some(thumbnail_path)
+        {
+            let payload = ThumbnailReadyPayload {
+                transfer_id: transfer.id.clone(),
+                thumbnail_path: thumbnail_path.clone(),
+            };
+            let _ = emit_payload(emitter, EVENT_THUMBNAIL_READY, &payload);
+        }
+
+        emitted_thumbnail_ready.insert(transfer.id.clone());
+        emitted_thumbnail_failed.remove(&transfer.id);
+        pending_thumbnail_failures.remove(&transfer.id);
+        return;
+    }
+
+    if transfer.state != "completed" {
+        pending_thumbnail_failures.remove(&transfer.id);
+        emitted_thumbnail_failed.remove(&transfer.id);
+        return;
+    }
+
+    let started_at = pending_thumbnail_failures
+        .entry(transfer.id.clone())
+        .or_insert_with(Instant::now);
+    if started_at.elapsed() >= THUMBNAIL_WATCH_TIMEOUT && !emitted_thumbnail_failed.contains(&transfer.id) {
+        let payload = ThumbnailFailedPayload {
+            transfer_id: transfer.id.clone(),
+        };
+        let _ = emit_payload(emitter, EVENT_THUMBNAIL_FAILED, &payload);
+        emitted_thumbnail_failed.insert(transfer.id.clone());
+    }
+}
+
+fn is_received_image_transfer(previous: Option<&TransferPayload>, transfer: &TransferPayload) -> bool {
+    let direction = transfer
+        .direction
+        .as_deref()
+        .or(previous.and_then(|value| value.direction.as_deref()));
+    if direction != Some("receive") {
+        return false;
+    }
+
+    transfer
+        .local_path
+        .as_deref()
+        .or(previous.and_then(|value| value.local_path.as_deref()))
+        .is_some_and(is_supported_image_path)
+}
+
+fn is_supported_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "gif" | "webp"
+            )
+        })
 }
 
 fn progress_ratio(status: TransferStatus, bytes_sent: u64, total_bytes: u64) -> f64 {
