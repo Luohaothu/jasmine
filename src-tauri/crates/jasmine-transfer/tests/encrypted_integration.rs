@@ -419,7 +419,7 @@ impl ManagedTransferSender for DummySender {
 struct IntegrationMockReceiver {
     download_dir: PathBuf,
     pending_offers: Arc<Mutex<HashMap<String, PendingOfferState>>>,
-    resume_offsets: Arc<Mutex<Vec<(String, Option<u64>)>>>,
+    resume_offsets: Arc<Mutex<Vec<ResumeOffsetCall>>>,
     current_resume_token: Arc<Mutex<Option<String>>>,
     controls: Arc<Mutex<HashMap<String, Arc<WorkerControl>>>>,
     notify: Arc<Notify>,
@@ -431,6 +431,8 @@ struct PendingOfferState {
     size: u64,
     download_dir: PathBuf,
 }
+
+type ResumeOffsetCall = (String, Option<u64>);
 
 impl IntegrationMockReceiver {
     fn new(download_dir: PathBuf) -> Self {
@@ -1143,7 +1145,7 @@ async fn encrypted_integration_epoch_mismatch_forces_restart_from_zero() {
     let temp = tempdir().expect("tempdir");
     let settings = SettingsService::new(temp.path().join("app-data"));
     save_download_dir(&settings, &temp.path().join("downloads"));
-    let sender = Arc::new(DummySender::default());
+    let sender = Arc::new(DummySender);
     let receiver = Arc::new(IntegrationMockReceiver::new(temp.path().join("downloads")));
     receiver.set_current_resume_token(Some("rotated-transfer-resume-token".to_string()));
     let storage = Arc::new(

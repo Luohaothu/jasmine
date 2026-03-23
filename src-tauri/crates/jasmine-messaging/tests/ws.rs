@@ -143,10 +143,11 @@ async fn expect_protocol_message<S>(socket: &mut WebSocketStream<S>, label: &str
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let frame = time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap_or_else(|_| panic!("{label} timeout"))
-        .unwrap_or_else(|| panic!("{label} missing frame"));
+    let frame = match time::timeout(Duration::from_secs(2), socket.next()).await {
+        Ok(Some(frame)) => frame,
+        Ok(None) => panic!("{label} missing frame"),
+        Err(_) => panic!("{label} timeout"),
+    };
 
     match frame {
         Ok(Message::Text(payload)) => {
@@ -167,10 +168,11 @@ async fn expect_text_protocol_message<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let frame = time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap_or_else(|_| panic!("{label} timeout"))
-        .unwrap_or_else(|| panic!("{label} missing frame"));
+    let frame = match time::timeout(Duration::from_secs(2), socket.next()).await {
+        Ok(Some(frame)) => frame,
+        Ok(None) => panic!("{label} missing frame"),
+        Err(_) => panic!("{label} timeout"),
+    };
 
     match frame {
         Ok(Message::Text(payload)) => {
@@ -184,10 +186,11 @@ async fn expect_binary_frame_payload<S>(socket: &mut WebSocketStream<S>, label: 
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let frame = time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap_or_else(|_| panic!("{label} timeout"))
-        .unwrap_or_else(|| panic!("{label} missing frame"));
+    let frame = match time::timeout(Duration::from_secs(2), socket.next()).await {
+        Ok(Some(frame)) => frame,
+        Ok(None) => panic!("{label} missing frame"),
+        Err(_) => panic!("{label} timeout"),
+    };
 
     match frame {
         Ok(Message::Binary(payload)) => payload.to_vec(),

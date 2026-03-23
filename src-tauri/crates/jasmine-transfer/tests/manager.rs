@@ -334,6 +334,7 @@ struct PendingOfferState {
 }
 
 type RejectedOffer = (String, Option<String>);
+type ResumeOffsetCall = (String, Option<u64>);
 
 #[derive(Clone)]
 struct MockReceiver {
@@ -341,7 +342,7 @@ struct MockReceiver {
     pending_offers: Arc<Mutex<HashMap<String, PendingOfferState>>>,
     completed_payloads: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     started: Arc<Mutex<Vec<String>>>,
-    resume_offsets: Arc<Mutex<Vec<(String, Option<u64>)>>>,
+    resume_offsets: Arc<Mutex<Vec<ResumeOffsetCall>>>,
     current_resume_token: Arc<Mutex<Option<String>>>,
     rejected: Arc<Mutex<Vec<RejectedOffer>>>,
     controls: Arc<Mutex<HashMap<String, Arc<WorkerControl>>>>,
