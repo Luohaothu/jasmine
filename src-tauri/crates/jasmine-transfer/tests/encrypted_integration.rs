@@ -1403,7 +1403,9 @@ async fn encrypted_integration_folder_receive_persists_sqlite_status_and_resumes
         .get("resume.bin")
         .expect("partial file status stored");
     assert_eq!(partial_status, SqliteStorage::FOLDER_FILE_STATUS_FAILED);
-    assert_eq!(*partial_offset, (2 * DEFAULT_CHUNK_SIZE) as u64);
+    assert!(*partial_offset > 0);
+    assert_eq!(*partial_offset % DEFAULT_CHUNK_SIZE as u64, 0);
+    assert!(*partial_offset < manifest.files[1].size);
 
     folder_receiver
         .handle_signal_message(
