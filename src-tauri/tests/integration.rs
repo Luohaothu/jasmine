@@ -502,7 +502,7 @@ async fn test_group_fanout() {
             wait_for_peer(&gamma, alpha_id.clone()),
         );
 
-        let group_id = alpha
+        let group = alpha
             .state
             .create_group(
                 "Study Group".to_string(),
@@ -510,6 +510,7 @@ async fn test_group_fanout() {
             )
             .await
             .expect("create group");
+        let group_id = group.id.clone();
         let expected_members = vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()];
 
         let _ = tokio::join!(
@@ -544,7 +545,7 @@ async fn test_group_fanout() {
         let (beta_event, gamma_event) = tokio::join!(
             beta.emitter.wait_for_event(
                 beta_cursor,
-                "message-received",
+                "group-message-received",
                 ACTION_TIMEOUT,
                 |payload| {
                     payload.get("id").and_then(Value::as_str) == Some(message_id.as_str())
@@ -552,7 +553,7 @@ async fn test_group_fanout() {
             ),
             gamma.emitter.wait_for_event(
                 gamma_cursor,
-                "message-received",
+                "group-message-received",
                 ACTION_TIMEOUT,
                 |payload| {
                     payload.get("id").and_then(Value::as_str) == Some(message_id.as_str())
@@ -566,7 +567,7 @@ async fn test_group_fanout() {
                 Some("Hello group")
             );
             assert_eq!(
-                payload.get("receiverId").and_then(Value::as_str),
+                payload.get("groupId").and_then(Value::as_str),
                 Some(group_id.as_str())
             );
             assert_eq!(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -9,6 +9,7 @@ use jasmine_core::protocol::{
     FolderFileEntry, FolderManifestData, ProtocolMessage, MAX_PROTOCOL_MESSAGE_BYTES,
 };
 use jasmine_core::{CoreError, DeviceId, SettingsService, StorageEngine, TransferStatus};
+use jasmine_storage::SqliteStorage;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -34,6 +35,7 @@ pub const DEFAULT_FOLDER_MANIFEST_MAX_FILES: usize = 200;
 pub const MAX_MANIFEST_PATH_LENGTH: usize = 260;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const MANAGED_TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FOLDER_STATUS_DB_FILE_NAME: &str = "jasmine.db";
 
 pub type FolderManifest = FolderManifestData;
 pub type ManifestEntry = FolderFileEntry;
@@ -131,7 +133,7 @@ pub enum FolderTransferError {
     #[error("folder signalling error: {0}")]
     Signal(#[from] FileSenderError),
     #[error("unexpected folder transfer response: {0:?}")]
-    UnexpectedResponse(ProtocolMessage),
+    UnexpectedResponse(Box<ProtocolMessage>),
 }
 
 #[derive(Debug, Error)]
@@ -150,6 +152,8 @@ pub enum FolderReceiverError {
     File(#[from] FileReceiverError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("folder status storage error: {0}")]
+    Storage(#[from] CoreError),
 }
 
 pub trait FolderFileTransferSender: Send + Sync {
@@ -399,10 +403,62 @@ where
             response = self.signal.wait_for_response(&folder_transfer_id) => response?,
         };
 
+        let mut entries_to_send = manifest.files.clone();
+        let mut file_results = Vec::with_capacity(manifest.files.len());
+
         match response {
             ProtocolMessage::FolderAccept {
                 folder_transfer_id: accepted_id,
             } if accepted_id == folder_transfer_id => {
+                update_folder_status(
+                    &progress_state,
+                    FolderTransferStatus::Sending,
+                    progress.as_ref(),
+                );
+            }
+            ProtocolMessage::FolderResumeRequest {
+                folder_id,
+                completed_files,
+                partial_files,
+            } if folder_id == folder_transfer_id => {
+                let resume_plan = build_sender_resume_plan(
+                    &folder_transfer_id,
+                    &manifest,
+                    completed_files,
+                    partial_files,
+                )?;
+                set_folder_resume_baseline(
+                    &progress_state,
+                    resume_plan.completed_bytes,
+                    resume_plan.completed_files,
+                );
+                file_results.extend(resume_plan.completed_results.clone());
+                entries_to_send = resume_plan.files_to_send.clone();
+                self.signal
+                    .send_message(
+                        &peer_id,
+                        ProtocolMessage::FolderResumeAccept {
+                            folder_id: folder_transfer_id.clone(),
+                            files_to_send: resume_plan.files_to_send,
+                        },
+                    )
+                    .await?;
+
+                if entries_to_send.is_empty() {
+                    update_folder_status(
+                        &progress_state,
+                        FolderTransferStatus::Completed,
+                        progress.as_ref(),
+                    );
+                    return Ok(FolderTransferOutcome {
+                        folder_transfer_id,
+                        manifest,
+                        progress: progress_snapshot(&progress_state),
+                        file_results,
+                        rejection_reason: None,
+                    });
+                }
+
                 update_folder_status(
                     &progress_state,
                     FolderTransferStatus::Sending,
@@ -426,13 +482,11 @@ where
                     rejection_reason: Some(reason),
                 });
             }
-            other => return Err(FolderTransferError::UnexpectedResponse(other)),
+            other => return Err(FolderTransferError::UnexpectedResponse(Box::new(other))),
         }
-
-        let mut file_results = Vec::with_capacity(manifest.files.len());
         let mut had_failures = false;
 
-        for entry in &manifest.files {
+        for entry in &entries_to_send {
             if cancellation.is_cancelled() {
                 return Ok(cancelled_outcome_with_files(
                     &manifest,
@@ -445,7 +499,7 @@ where
 
             let relative_path = sanitize_manifest_path(&entry.relative_path)?;
             let file_path = manifest_entry_path(folder_path, &relative_path);
-            let transfer_id = Uuid::new_v4().to_string();
+            let transfer_id = folder_file_transfer_id(&folder_transfer_id, &relative_path);
             let progress_proxy: Arc<dyn TransferProgressReporter> =
                 Arc::new(FolderAggregateProgressReporter {
                     state: Arc::clone(&progress_state),
@@ -555,6 +609,7 @@ where
 {
     signal: S,
     file_receiver: FileReceiver<S>,
+    folder_status_db_path: PathBuf,
     offer_notifier: Option<Arc<dyn FolderOfferNotifier>>,
     state: Mutex<FolderReceiverState>,
 }
@@ -564,13 +619,15 @@ where
     S: FileReceiverSignal + Clone,
 {
     pub fn new(signal: S, settings: SettingsService) -> Self {
+        let folder_status_db_path = folder_status_db_path(&settings);
         let file_receiver = FileReceiver::new(signal.clone(), settings);
-        Self::with_parts(signal, file_receiver, None)
+        Self::with_parts(signal, file_receiver, None, folder_status_db_path)
     }
 
     pub fn with_config(signal: S, settings: SettingsService, config: FileReceiverConfig) -> Self {
+        let folder_status_db_path = folder_status_db_path(&settings);
         let file_receiver = FileReceiver::with_config(signal.clone(), settings, config);
-        Self::with_parts(signal, file_receiver, None)
+        Self::with_parts(signal, file_receiver, None, folder_status_db_path)
     }
 
     pub fn with_dependencies(
@@ -580,6 +637,7 @@ where
         disk_space_checker: Arc<dyn DiskSpaceChecker>,
         offer_notifier: Option<Arc<dyn FolderOfferNotifier>>,
     ) -> Self {
+        let folder_status_db_path = folder_status_db_path(&settings);
         let file_receiver = FileReceiver::with_dependencies(
             signal.clone(),
             settings,
@@ -587,17 +645,19 @@ where
             disk_space_checker,
             None,
         );
-        Self::with_parts(signal, file_receiver, offer_notifier)
+        Self::with_parts(signal, file_receiver, offer_notifier, folder_status_db_path)
     }
 
     fn with_parts(
         signal: S,
         file_receiver: FileReceiver<S>,
         offer_notifier: Option<Arc<dyn FolderOfferNotifier>>,
+        folder_status_db_path: PathBuf,
     ) -> Self {
         Self {
             signal,
             file_receiver,
+            folder_status_db_path,
             offer_notifier,
             state: Mutex::new(FolderReceiverState {
                 pending_offers: HashMap::new(),
@@ -686,6 +746,7 @@ where
         let folder_name = sanitize_folder_name(&pending.manifest.folder_name)?;
         let root_dir = target_dir.as_ref().join(&folder_name);
         let manifest = pending.manifest.clone();
+        let folder_status_storage = self.open_folder_status_storage()?;
         let progress_state = Arc::new(Mutex::new(FolderProgressState {
             progress: FolderProgress {
                 folder_transfer_id: folder_transfer_id.to_string(),
@@ -711,14 +772,69 @@ where
         }
 
         tokio::fs::create_dir_all(&root_dir).await?;
-        self.signal
-            .send_message(
-                &pending.sender_id,
-                ProtocolMessage::FolderAccept {
-                    folder_transfer_id: folder_transfer_id.to_string(),
-                },
-            )
-            .await?;
+        let resume_plan = inspect_receive_resume_plan(
+            folder_transfer_id,
+            &manifest,
+            self.file_receiver.chunk_size(),
+            &folder_status_storage,
+        )
+        .await?;
+        let mut expected_entries = manifest.files.clone();
+        let mut partial_offsets = resume_plan.partial_offsets;
+        let mut file_results = resume_plan.completed_results;
+        set_folder_resume_baseline(
+            &progress_state,
+            resume_plan.completed_bytes,
+            resume_plan.completed_files,
+        );
+
+        if resume_plan.has_resume_state {
+            self.signal
+                .send_message(
+                    &pending.sender_id,
+                    ProtocolMessage::FolderResumeRequest {
+                        folder_id: folder_transfer_id.to_string(),
+                        completed_files: resume_plan.completed_files_list,
+                        partial_files: resume_plan.partial_files_list,
+                    },
+                )
+                .await?;
+
+            match self.signal.wait_for_response(folder_transfer_id).await? {
+                ProtocolMessage::FolderResumeAccept {
+                    folder_id,
+                    files_to_send,
+                } if folder_id == folder_transfer_id => {
+                    expected_entries = files_to_send;
+                }
+                other => return Err(FolderReceiverError::UnexpectedMessage(Box::new(other))),
+            }
+        } else {
+            self.signal
+                .send_message(
+                    &pending.sender_id,
+                    ProtocolMessage::FolderAccept {
+                        folder_transfer_id: folder_transfer_id.to_string(),
+                    },
+                )
+                .await?;
+        }
+
+        if expected_entries.is_empty() {
+            drop(active_guard);
+            update_folder_status(
+                &progress_state,
+                FolderTransferStatus::Completed,
+                progress.as_ref(),
+            );
+            return Ok(FolderTransferOutcome {
+                folder_transfer_id: folder_transfer_id.to_string(),
+                manifest,
+                progress: progress_snapshot(&progress_state),
+                file_results,
+                rejection_reason: None,
+            });
+        }
 
         update_folder_status(
             &progress_state,
@@ -726,10 +842,9 @@ where
             progress.as_ref(),
         );
 
-        let mut file_results = Vec::with_capacity(manifest.files.len());
         let mut had_failures = false;
 
-        for entry in &manifest.files {
+        for entry in &expected_entries {
             let queued_offer = tokio::select! {
                 _ = cancellation.cancelled() => {
                     return Ok(cancelled_outcome_with_files(
@@ -750,15 +865,20 @@ where
                 .receive_manifest_file(
                     entry,
                     queued_offer,
-                    &root_dir,
-                    cancellation.clone(),
-                    &progress_state,
-                    progress.as_ref(),
+                    FolderManifestReceiveContext {
+                        root_dir: &root_dir,
+                        resume_offset: partial_offsets.remove(&entry.relative_path),
+                        cancellation: cancellation.clone(),
+                        progress_state: &progress_state,
+                        progress: progress.as_ref(),
+                    },
                 )
                 .await?;
 
             let was_cancelled = file_result.status == TransferStatus::Cancelled;
             had_failures |= file_result.status == TransferStatus::Failed;
+            persist_folder_file_result(&folder_status_storage, folder_transfer_id, &file_result)
+                .await?;
             file_results.push(file_result);
 
             if was_cancelled {
@@ -919,10 +1039,7 @@ where
         &self,
         entry: &ManifestEntry,
         queued_offer: QueuedFolderFileOffer,
-        root_dir: &Path,
-        cancellation: CancellationToken,
-        progress_state: &Arc<Mutex<FolderProgressState>>,
-        progress: Option<&Arc<dyn FolderProgressReporter>>,
+        context: FolderManifestReceiveContext<'_>,
     ) -> Result<FolderFileTransferResult, FolderReceiverError> {
         let offer = parse_folder_file_offer(queued_offer.message)?;
         let relative_path = match sanitize_manifest_path(&entry.relative_path) {
@@ -935,8 +1052,8 @@ where
                         relative_path: &entry.relative_path,
                         total_bytes: entry.size,
                         reason: error.to_string(),
-                        progress_state,
-                        progress,
+                        progress_state: context.progress_state,
+                        progress: context.progress,
                     })
                     .await;
             }
@@ -953,8 +1070,8 @@ where
                         relative_path: &relative_path,
                         total_bytes: entry.size,
                         reason: error.to_string(),
-                        progress_state,
-                        progress,
+                        progress_state: context.progress_state,
+                        progress: context.progress,
                     })
                     .await;
             }
@@ -970,8 +1087,8 @@ where
                     reason: format!(
                         "file offer did not match manifest path: expected {expected_filename}, got {offered_filename}"
                     ),
-                    progress_state,
-                    progress,
+                    progress_state: context.progress_state,
+                    progress: context.progress,
                 })
                 .await;
         }
@@ -987,8 +1104,8 @@ where
                         "file offer size did not match manifest: expected {}, got {}",
                         entry.size, offer.size
                     ),
-                    progress_state,
-                    progress,
+                    progress_state: context.progress_state,
+                    progress: context.progress,
                 })
                 .await;
         }
@@ -1004,18 +1121,18 @@ where
                         "file offer hash did not match manifest: expected {}, got {}",
                         entry.sha256, offer.sha256
                     ),
-                    progress_state,
-                    progress,
+                    progress_state: context.progress_state,
+                    progress: context.progress,
                 })
                 .await;
         }
 
-        let final_path = manifest_entry_path(root_dir, &relative_path);
+        let final_path = manifest_entry_path(context.root_dir, &relative_path);
         let progress_proxy: Arc<dyn TransferProgressReporter> =
             Arc::new(FolderAggregateProgressReporter {
-                state: Arc::clone(progress_state),
+                state: Arc::clone(context.progress_state),
                 file_total_bytes: entry.size,
-                reporter: progress.cloned(),
+                reporter: context.progress.cloned(),
             });
         let receive_result = match self
             .file_receiver
@@ -1029,9 +1146,10 @@ where
         {
             Ok(_) => {
                 self.file_receiver
-                    .accept_offer_with_cancellation(
+                    .accept_offer_with_resume_offset_and_cancellation(
                         &offer.offer_id,
-                        cancellation,
+                        context.resume_offset,
+                        context.cancellation.clone(),
                         Some(progress_proxy),
                     )
                     .await
@@ -1039,10 +1157,10 @@ where
             Err(error) => Err(error),
         };
         let attempted_bytes = settle_active_file_progress(
-            progress_state,
+            context.progress_state,
             entry.size,
             receive_result.is_ok(),
-            progress,
+            context.progress,
         );
 
         Ok(match receive_result {
@@ -1109,6 +1227,10 @@ where
             .active_receives
             .remove(folder_transfer_id);
     }
+
+    fn open_folder_status_storage(&self) -> Result<SqliteStorage, FolderReceiverError> {
+        SqliteStorage::open(&self.folder_status_db_path).map_err(FolderReceiverError::from)
+    }
 }
 
 struct FolderReceiverState {
@@ -1141,6 +1263,31 @@ struct ParsedFolderFileOffer {
     transfer_port: u16,
 }
 
+struct FolderSenderResumePlan {
+    files_to_send: Vec<FolderFileEntry>,
+    completed_results: Vec<FolderFileTransferResult>,
+    completed_bytes: u64,
+    completed_files: usize,
+}
+
+struct FolderReceiveResumePlan {
+    has_resume_state: bool,
+    completed_files_list: Vec<String>,
+    partial_files_list: Vec<(String, u64)>,
+    partial_offsets: HashMap<String, u64>,
+    completed_results: Vec<FolderFileTransferResult>,
+    completed_bytes: u64,
+    completed_files: usize,
+}
+
+struct FolderManifestReceiveContext<'a> {
+    root_dir: &'a Path,
+    resume_offset: Option<u64>,
+    cancellation: CancellationToken,
+    progress_state: &'a Arc<Mutex<FolderProgressState>>,
+    progress: Option<&'a Arc<dyn FolderProgressReporter>>,
+}
+
 struct ManifestFileRejection<'a> {
     sender_id: &'a DeviceId,
     offer_id: &'a str,
@@ -1161,6 +1308,146 @@ impl ParsedFolderFileOffer {
             transfer_port: self.transfer_port,
         }
     }
+}
+
+fn folder_file_transfer_id(folder_transfer_id: &str, relative_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(folder_transfer_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(relative_path.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
+}
+
+async fn inspect_receive_resume_plan(
+    folder_transfer_id: &str,
+    manifest: &FolderManifest,
+    chunk_size: usize,
+    folder_status_storage: &SqliteStorage,
+) -> Result<FolderReceiveResumePlan, FolderReceiverError> {
+    let stored_statuses = folder_status_storage
+        .get_folder_file_statuses(folder_transfer_id)
+        .await?;
+    let stored_statuses = stored_statuses
+        .into_iter()
+        .map(|(file_path, status, bytes_transferred)| (file_path, (status, bytes_transferred)))
+        .collect::<HashMap<String, (String, u64)>>();
+    let mut completed_files_list = Vec::new();
+    let mut partial_files_list = Vec::new();
+    let mut partial_offsets = HashMap::new();
+    let mut completed_results = Vec::new();
+    let mut completed_bytes = 0_u64;
+    let mut completed_files = 0_usize;
+
+    for entry in &manifest.files {
+        let relative_path = sanitize_manifest_path(&entry.relative_path)?;
+        let Some((status, bytes_transferred)) = stored_statuses.get(&relative_path) else {
+            continue;
+        };
+
+        if status == SqliteStorage::FOLDER_FILE_STATUS_COMPLETED {
+            completed_files += 1;
+            completed_bytes += entry.size;
+            completed_files_list.push(relative_path.clone());
+            completed_results.push(FolderFileTransferResult {
+                transfer_id: folder_file_transfer_id(folder_transfer_id, &relative_path),
+                relative_path,
+                status: TransferStatus::Completed,
+                bytes_sent: entry.size,
+                total_bytes: entry.size,
+                error: None,
+            });
+            continue;
+        }
+
+        if status != SqliteStorage::FOLDER_FILE_STATUS_FAILED {
+            continue;
+        }
+
+        let offset = *bytes_transferred;
+        if offset == 0 || offset >= entry.size || offset % chunk_size as u64 != 0 {
+            continue;
+        }
+
+        partial_files_list.push((relative_path.clone(), offset));
+        partial_offsets.insert(relative_path, offset);
+    }
+
+    let has_resume_state = !completed_files_list.is_empty() || !partial_files_list.is_empty();
+
+    Ok(FolderReceiveResumePlan {
+        has_resume_state,
+        completed_files_list,
+        partial_files_list,
+        partial_offsets,
+        completed_results,
+        completed_bytes,
+        completed_files,
+    })
+}
+
+fn build_sender_resume_plan(
+    folder_transfer_id: &str,
+    manifest: &FolderManifest,
+    completed_files: Vec<String>,
+    partial_files: Vec<(String, u64)>,
+) -> Result<FolderSenderResumePlan, FolderTransferError> {
+    let completed: HashSet<String> = completed_files
+        .into_iter()
+        .map(|path| sanitize_manifest_path(&path))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(FolderTransferError::Manifest)?;
+    let partial: HashSet<String> = partial_files
+        .into_iter()
+        .map(|(path, _)| sanitize_manifest_path(&path))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(FolderTransferError::Manifest)?;
+
+    let mut files_to_send = Vec::new();
+    let mut completed_results = Vec::new();
+    let mut completed_bytes = 0_u64;
+    let mut completed_count = 0_usize;
+
+    for entry in &manifest.files {
+        let relative_path = sanitize_manifest_path(&entry.relative_path)?;
+        if completed.contains(&relative_path) && !partial.contains(&relative_path) {
+            completed_count += 1;
+            completed_bytes += entry.size;
+            completed_results.push(FolderFileTransferResult {
+                transfer_id: folder_file_transfer_id(folder_transfer_id, &relative_path),
+                relative_path,
+                status: TransferStatus::Completed,
+                bytes_sent: entry.size,
+                total_bytes: entry.size,
+                error: None,
+            });
+        } else {
+            files_to_send.push(entry.clone());
+        }
+    }
+
+    Ok(FolderSenderResumePlan {
+        files_to_send,
+        completed_results,
+        completed_bytes,
+        completed_files: completed_count,
+    })
+}
+
+fn set_folder_resume_baseline(
+    state: &Arc<Mutex<FolderProgressState>>,
+    completed_bytes: u64,
+    completed_files: usize,
+) {
+    let mut state = state.lock().expect("lock folder progress state");
+    state.settled_bytes_sent = completed_bytes;
+    state.active_file_bytes_sent = 0;
+    state.progress.sent_bytes = completed_bytes;
+    state.progress.completed_files = completed_files;
 }
 
 struct ActiveReceiveGuard<'a, S>
@@ -1191,6 +1478,44 @@ where
         self.receiver
             .remove_active_receive(&self.folder_transfer_id);
     }
+}
+
+fn folder_status_db_path(settings: &SettingsService) -> PathBuf {
+    settings
+        .settings_path()
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(FOLDER_STATUS_DB_FILE_NAME)
+}
+
+async fn persist_folder_file_result(
+    folder_status_storage: &SqliteStorage,
+    folder_transfer_id: &str,
+    file_result: &FolderFileTransferResult,
+) -> Result<(), FolderReceiverError> {
+    let (status, bytes_transferred) = match file_result.status {
+        TransferStatus::Completed => (
+            SqliteStorage::FOLDER_FILE_STATUS_COMPLETED,
+            file_result.total_bytes,
+        ),
+        TransferStatus::Failed | TransferStatus::Cancelled => (
+            SqliteStorage::FOLDER_FILE_STATUS_FAILED,
+            file_result.bytes_sent,
+        ),
+        TransferStatus::Pending | TransferStatus::Active => return Ok(()),
+    };
+
+    folder_status_storage
+        .save_folder_file_status(
+            folder_transfer_id,
+            &file_result.relative_path,
+            status,
+            bytes_transferred,
+        )
+        .await?;
+
+    Ok(())
 }
 
 fn parse_folder_file_offer(

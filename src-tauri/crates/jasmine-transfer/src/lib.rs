@@ -8,6 +8,11 @@ pub mod thumbnail;
 
 use jasmine_core::{FileTransfer, TransferOffer};
 
+pub type FileCryptoMaterial = (
+    [u8; jasmine_crypto::FILE_KEY_LEN],
+    [u8; jasmine_crypto::NONCE_PREFIX_LEN],
+);
+
 pub use folder::{
     generate_folder_manifest, sanitize_manifest_path, FolderFileTransferResult,
     FolderFileTransferSender, FolderManifest, FolderManifestError, FolderOfferNotification,

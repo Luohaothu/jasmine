@@ -43,7 +43,7 @@
   padding: 2px 6px;
   font-size: 12px;
   font-weight: bold;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .panel {
@@ -126,13 +126,27 @@
   text-transform: capitalize;
 }
 
-.status-active { color: var(--primary-color, #0066cc); }
-.status-queued { color: var(--text-secondary, #888888); }
-.status-completed { color: var(--success-color, #009900); }
-.status-failed { color: var(--error-color, #cc0000); }
-.status-partially-failed { color: var(--warning-color, #ff9800); }
-.status-cancelled { color: var(--text-secondary, #888888); }
-.status-rejected { color: var(--error-color, #cc0000); }
+.status-active {
+  color: var(--primary-color, #0066cc);
+}
+.status-queued {
+  color: var(--text-secondary, #888888);
+}
+.status-completed {
+  color: var(--success-color, #009900);
+}
+.status-failed {
+  color: var(--error-color, #cc0000);
+}
+.status-partially-failed {
+  color: var(--warning-color, #ff9800);
+}
+.status-cancelled {
+  color: var(--text-secondary, #888888);
+}
+.status-rejected {
+  color: var(--error-color, #cc0000);
+}
 
 .progressContainer {
   height: 6px;
@@ -144,16 +158,34 @@
 
 .progressBar {
   height: 100%;
-  transition: width 0.2s ease, background-color 0.3s;
+  transition:
+    width 0.2s ease,
+    background-color 0.3s;
 }
 
-.progress-active { background: var(--primary-color, #0066cc); }
-.progress-queued { background: var(--text-secondary, #888888); width: 0 !important; }
-.progress-completed { background: var(--success-color, #009900); width: 100% !important; }
-.progress-failed { background: var(--error-color, #cc0000); }
-.progress-partially-failed { background: var(--warning-color, #ff9800); }
-.progress-cancelled { background: var(--text-secondary, #888888); }
-.progress-rejected { background: var(--error-color, #cc0000); }
+.progress-active {
+  background: var(--primary-color, #0066cc);
+}
+.progress-queued {
+  background: var(--text-secondary, #888888);
+  width: 0 !important;
+}
+.progress-completed {
+  background: var(--success-color, #009900);
+  width: 100% !important;
+}
+.progress-failed {
+  background: var(--error-color, #cc0000);
+}
+.progress-partially-failed {
+  background: var(--warning-color, #ff9800);
+}
+.progress-cancelled {
+  background: var(--text-secondary, #888888);
+}
+.progress-rejected {
+  background: var(--error-color, #cc0000);
+}
 
 .itemFooter {
   display: flex;
@@ -161,6 +193,12 @@
   align-items: center;
   font-size: 12px;
   color: var(--text-secondary, #666666);
+}
+
+.itemActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .speed {
@@ -174,4 +212,26 @@
   cursor: pointer;
   padding: 2px 4px;
   font-size: 12px;
+}
+
+.actionBtn {
+  background: transparent;
+  border: none;
+  color: var(--primary-color, #0066cc);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.secondaryBtn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary, #666666);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+.secondaryBtn:disabled, .actionBtn:disabled, .cancelBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

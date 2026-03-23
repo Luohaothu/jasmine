@@ -37,6 +37,14 @@ fn normalize_relative_path(root: &Path, file_path: &Path) -> String {
         .join("/")
 }
 
+fn test_file_key() -> [u8; 32] {
+    [0x31; 32]
+}
+
+fn test_nonce_prefix() -> [u8; 8] {
+    [0x7a; 8]
+}
+
 #[derive(Clone, Default)]
 struct MockFolderSignal {
     sent_messages: Arc<Mutex<Vec<(DeviceId, ProtocolMessage)>>>,
@@ -71,6 +79,26 @@ impl MockFolderSignal {
             .remove(response_id)
             .expect("response sender for id");
         sender.send(response).expect("deliver mocked response");
+    }
+
+    async fn wait_for_matching_message<P>(&self, predicate: P) -> (DeviceId, ProtocolMessage)
+    where
+        P: Fn(&ProtocolMessage) -> bool,
+    {
+        loop {
+            if let Some(message) = self
+                .sent_messages
+                .lock()
+                .expect("lock sent messages")
+                .iter()
+                .find(|(_, message)| predicate(message))
+                .cloned()
+            {
+                return message;
+            }
+
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -117,6 +145,14 @@ impl FileSenderSignal for MockFolderSignal {
             .remove(response_id)
             .expect("response receiver for id");
         receiver.await.map_err(|_| FileSenderError::SignalClosed)
+    }
+
+    async fn file_crypto_material(
+        &self,
+        _peer_id: &DeviceId,
+        _file_id: &str,
+    ) -> Result<jasmine_transfer::FileCryptoMaterial, FileSenderError> {
+        Ok((test_file_key(), test_nonce_prefix()))
     }
 }
 
@@ -700,4 +736,182 @@ async fn folder_coordinator_cancellation_stops_remaining_queued_work_cleanly() {
         .snapshot()
         .iter()
         .any(|event| event.status == FolderTransferStatus::Cancelled));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_resume_skip_skips_completed_files_and_sends_partial_then_remaining_in_order() {
+    let temp = tempdir().expect("tempdir");
+    let folder = temp.path().join("resume-skip");
+    write_file(&folder.join("a.txt"), b"aaaa");
+    write_file(&folder.join("b.txt"), b"bbbb");
+    write_file(&folder.join("c.txt"), b"cccccccc");
+    write_file(&folder.join("d.txt"), b"dddd");
+    write_file(&folder.join("e.txt"), b"eeee");
+
+    let signal = MockFolderSignal::default();
+    let file_sender = MockFolderFileSender::new(folder.clone());
+    let coordinator = FolderTransferCoordinator::new(signal.clone(), file_sender.clone());
+
+    let send_task = tokio::spawn(async move {
+        coordinator
+            .send_folder(
+                device_id(),
+                device_id(),
+                folder,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+    });
+
+    let (_, manifest_message) = signal.wait_for_manifest().await;
+    let folder_transfer_id = match manifest_message {
+        ProtocolMessage::FolderManifest {
+            folder_transfer_id, ..
+        } => folder_transfer_id,
+        other => panic!("expected FolderManifest, got {other:?}"),
+    };
+
+    signal.respond(
+        &folder_transfer_id,
+        ProtocolMessage::FolderResumeRequest {
+            folder_id: folder_transfer_id.clone(),
+            completed_files: vec!["a.txt".to_string(), "b.txt".to_string()],
+            partial_files: vec![("c.txt".to_string(), 4)],
+        },
+    );
+
+    let (_, resume_accept_message) = signal
+        .wait_for_matching_message(|message| {
+            matches!(message, ProtocolMessage::FolderResumeAccept { .. })
+        })
+        .await;
+
+    match resume_accept_message {
+        ProtocolMessage::FolderResumeAccept {
+            folder_id,
+            files_to_send,
+        } => {
+            assert_eq!(folder_id, folder_transfer_id);
+            assert_eq!(
+                files_to_send
+                    .iter()
+                    .map(|entry| entry.relative_path.clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "c.txt".to_string(),
+                    "d.txt".to_string(),
+                    "e.txt".to_string()
+                ]
+            );
+        }
+        other => panic!("expected FolderResumeAccept, got {other:?}"),
+    }
+
+    let outcome = send_task
+        .await
+        .expect("join folder resume send task")
+        .expect("folder resume send succeeds");
+
+    assert_eq!(
+        file_sender.started_paths(),
+        vec![
+            "c.txt".to_string(),
+            "d.txt".to_string(),
+            "e.txt".to_string()
+        ]
+    );
+    assert_eq!(outcome.progress.status, FolderTransferStatus::Completed);
+    assert_eq!(outcome.progress.completed_files, 5);
+    assert_eq!(outcome.progress.sent_bytes, 24);
+    assert_eq!(
+        outcome
+            .file_results
+            .iter()
+            .map(|result| (result.relative_path.clone(), result.status.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("a.txt".to_string(), TransferStatus::Completed),
+            ("b.txt".to_string(), TransferStatus::Completed),
+            ("c.txt".to_string(), TransferStatus::Completed),
+            ("d.txt".to_string(), TransferStatus::Completed),
+            ("e.txt".to_string(), TransferStatus::Completed),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_resume_all_complete_returns_noop_accept_and_sends_nothing() {
+    let temp = tempdir().expect("tempdir");
+    let folder = temp.path().join("resume-noop");
+    write_file(&folder.join("a.txt"), b"aaaa");
+    write_file(&folder.join("b.txt"), b"bbbb");
+
+    let signal = MockFolderSignal::default();
+    let file_sender = MockFolderFileSender::new(folder.clone());
+    let coordinator = FolderTransferCoordinator::new(signal.clone(), file_sender.clone());
+
+    let send_task = tokio::spawn(async move {
+        coordinator
+            .send_folder(
+                device_id(),
+                device_id(),
+                folder,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+    });
+
+    let (_, manifest_message) = signal.wait_for_manifest().await;
+    let folder_transfer_id = match manifest_message {
+        ProtocolMessage::FolderManifest {
+            folder_transfer_id, ..
+        } => folder_transfer_id,
+        other => panic!("expected FolderManifest, got {other:?}"),
+    };
+
+    signal.respond(
+        &folder_transfer_id,
+        ProtocolMessage::FolderResumeRequest {
+            folder_id: folder_transfer_id.clone(),
+            completed_files: vec!["a.txt".to_string(), "b.txt".to_string()],
+            partial_files: Vec::new(),
+        },
+    );
+
+    let (_, resume_accept_message) = signal
+        .wait_for_matching_message(|message| {
+            matches!(message, ProtocolMessage::FolderResumeAccept { .. })
+        })
+        .await;
+
+    match resume_accept_message {
+        ProtocolMessage::FolderResumeAccept {
+            folder_id,
+            files_to_send,
+        } => {
+            assert_eq!(folder_id, folder_transfer_id);
+            assert!(files_to_send.is_empty());
+        }
+        other => panic!("expected FolderResumeAccept, got {other:?}"),
+    }
+
+    let outcome = send_task
+        .await
+        .expect("join no-op folder resume task")
+        .expect("folder no-op resume succeeds");
+
+    assert!(file_sender.started_paths().is_empty());
+    assert_eq!(outcome.progress.status, FolderTransferStatus::Completed);
+    assert_eq!(outcome.progress.completed_files, 2);
+    assert_eq!(outcome.progress.sent_bytes, 8);
+    assert_eq!(
+        outcome
+            .file_results
+            .iter()
+            .map(|result| result.relative_path.clone())
+            .collect::<Vec<_>>(),
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
 }

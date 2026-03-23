@@ -1,17 +1,18 @@
-import { useEffect } from "react";
-import { createBrowserRouter, Outlet } from "react-router-dom";
-import { DeviceList } from "./components/DeviceList";
-import { ChatView } from "./components/ChatView/ChatView";
-import Settings from "./components/Settings/Settings";
-import { GroupChatWrapper } from "./components/GroupChat/GroupChatWrapper";
-import { FileTransferPanel } from "./components/FileTransfer/FileTransferPanel";
-import { FileReceiveDialog } from "./components/FileTransfer/FileReceiveDialog";
-import { FolderTransferPanel } from "./components/FolderTransfer/FolderTransferPanel";
-import { FolderReceiveDialog } from "./components/FolderTransfer/FolderReceiveDialog";
-import { setupChatEventListeners } from "./stores/chatStore";
-import { setupFolderTransferListeners } from "./stores/folderTransferStore";
-import { setupTransferListeners } from "./stores/transferStore";
-import "./App.css";
+import { useEffect } from 'react';
+import { createBrowserRouter, Outlet } from 'react-router-dom';
+import { DeviceList } from './components/DeviceList';
+import { ChatView } from './components/ChatView/ChatView';
+import Settings from './components/Settings/Settings';
+import { GroupChatWrapper } from './components/GroupChat/GroupChatWrapper';
+import { FileTransferPanel } from './components/FileTransfer/FileTransferPanel';
+import { FileReceiveDialog } from './components/FileTransfer/FileReceiveDialog';
+import { FolderTransferPanel } from './components/FolderTransfer/FolderTransferPanel';
+import { FolderReceiveDialog } from './components/FolderTransfer/FolderReceiveDialog';
+import { setupChatEventListeners } from './stores/chatStore';
+import { setupFolderTransferListeners } from './stores/folderTransferStore';
+import { setupGroupListeners } from './stores/groupStore';
+import { setupTransferListeners } from './stores/transferStore';
+import './App.css';
 
 export const AppShell = () => {
   useEffect(() => {
@@ -19,7 +20,12 @@ export const AppShell = () => {
     let disposed = false;
 
     const registerListeners = async () => {
-      for (const setup of [setupTransferListeners, setupFolderTransferListeners, setupChatEventListeners]) {
+      for (const setup of [
+        setupTransferListeners,
+        setupFolderTransferListeners,
+        setupChatEventListeners,
+        setupGroupListeners,
+      ]) {
         try {
           const cleanup = await setup();
           if (disposed) {
@@ -28,18 +34,20 @@ export const AppShell = () => {
             cleanups.push(cleanup);
           }
         } catch (error) {
-          console.error("Listener setup failed:", error);
+          console.error('Listener setup failed:', error);
         }
       }
     };
 
     registerListeners().catch((error) => {
-      console.error("Failed to register listeners:", error);
+      console.error('Failed to register listeners:', error);
     });
 
     return () => {
       disposed = true;
-      cleanups.forEach((cleanup) => cleanup());
+      cleanups.forEach((cleanup) => {
+        cleanup();
+      });
     };
   }, []);
 
@@ -63,13 +71,13 @@ const WelcomePlaceholder = () => {
 
 export const appRouter = createBrowserRouter([
   {
-    path: "/",
+    path: '/',
     element: <AppShell />,
     children: [
       { index: true, element: <WelcomePlaceholder /> },
-      { path: "chat/:peerId", element: <ChatView /> },
-      { path: "group/:groupId", element: <GroupChatWrapper /> },
-      { path: "settings", element: <Settings /> },
+      { path: 'chat/:peerId', element: <ChatView /> },
+      { path: 'group/:groupId', element: <GroupChatWrapper /> },
+      { path: 'settings', element: <Settings /> },
     ],
   },
 ]);

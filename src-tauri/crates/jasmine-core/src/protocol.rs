@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{CoreError, Result};
 
@@ -46,6 +47,15 @@ pub enum ProtocolMessage {
     FolderAccept {
         folder_transfer_id: String,
     },
+    FolderResumeRequest {
+        folder_id: String,
+        completed_files: Vec<String>,
+        partial_files: Vec<(String, u64)>,
+    },
+    FolderResumeAccept {
+        folder_id: String,
+        files_to_send: Vec<FolderFileEntry>,
+    },
     FolderReject {
         folder_transfer_id: String,
         reason: String,
@@ -64,10 +74,55 @@ pub enum ProtocolMessage {
         offer_id: String,
         reason: Option<String>,
     },
+    KeyExchangeInit {
+        ephemeral_public_key: String,
+        protocol_version: u32,
+    },
+    KeyExchangeResponse {
+        ephemeral_public_key: String,
+    },
+    VersionIncompatible {
+        local_version: u32,
+        remote_version: u32,
+        message: String,
+    },
+    SenderKeyDistribution {
+        group_id: String,
+        sender_key_data: String,
+        epoch: u32,
+    },
+    SenderKeyRequest {
+        group_id: String,
+        requesting_peer_id: String,
+    },
+    SenderKeyRotation {
+        group_id: String,
+        new_sender_key_data: String,
+        new_epoch: u32,
+    },
+    GroupMessage {
+        group_id: String,
+        sender_key_id: Uuid,
+        epoch: u32,
+        nonce: [u8; 12],
+        encrypted_content: Vec<u8>,
+    },
+    FileResumeRequest {
+        offer_id: String,
+        offset: u64,
+    },
+    FileResumeAccept {
+        offer_id: String,
+        offset: u64,
+    },
     PeerInfo {
         device_id: String,
         display_name: String,
         avatar_hash: Option<String>,
+        #[serde(default)]
+        public_key: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u32>,
     },
     GroupCreate {
         group_id: String,
@@ -77,6 +132,10 @@ pub enum ProtocolMessage {
     GroupInvite {
         group_id: String,
         inviter_id: String,
+    },
+    GroupMemberLeft {
+        group_id: String,
+        member_id: String,
     },
     Ack {
         message_id: String,
@@ -172,6 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_incompatible_roundtrip() {
+        let message = ProtocolMessage::VersionIncompatible {
+            local_version: 2,
+            remote_version: 1,
+            message: "peer protocol version 1 is incompatible; minimum supported version is 2"
+                .to_string(),
+        };
+
+        let payload = message
+            .to_json()
+            .expect("serialize version incompatible message");
+        let decoded =
+            ProtocolMessage::from_json(&payload).expect("deserialize version incompatible message");
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
     fn protocol_folder_manifest_roundtrip() {
         let message = ProtocolMessage::FolderManifest {
             folder_transfer_id: "folder-001".to_string(),
@@ -220,6 +297,19 @@ mod tests {
 
         assert_eq!(accept, decoded_accept);
         assert_eq!(reject, decoded_reject);
+    }
+
+    #[test]
+    fn protocol_group_member_left_roundtrip() {
+        let message = ProtocolMessage::GroupMemberLeft {
+            group_id: "group-001".to_string(),
+            member_id: "user-002".to_string(),
+        };
+
+        let payload = message.to_json().expect("serialize group member left");
+        let decoded = ProtocolMessage::from_json(&payload).expect("deserialize group member left");
+
+        assert_eq!(message, decoded);
     }
 
     #[test]

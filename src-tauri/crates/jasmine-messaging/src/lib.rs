@@ -3,9 +3,11 @@ mod transport;
 mod ws_client;
 mod ws_server;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use jasmine_core::{ChatId, Message, MessageTransport, ProtocolMessage};
+use jasmine_storage::SqliteStorage;
 use thiserror::Error;
 
 pub use chat::{
@@ -24,6 +26,12 @@ pub const DEFAULT_MAX_MISSED_HEARTBEATS: u32 = 3;
 pub enum MessagingError {
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("protocol error: {message}")]
+    ProtocolVersionIncompatible {
+        local_version: u32,
+        remote_version: u32,
+        message: String,
+    },
     #[error("transport error: {0}")]
     Transport(String),
     #[error("storage error: {0}")]
@@ -47,6 +55,7 @@ pub enum WsDisconnectReason {
     LocalClosed,
     RemoteClosed,
     HeartbeatTimedOut,
+    ProtocolVersionIncompatible,
     ProtocolViolation,
     TransportError(String),
 }
@@ -56,6 +65,8 @@ pub struct WsPeerIdentity {
     pub device_id: String,
     pub display_name: String,
     pub avatar_hash: Option<String>,
+    pub public_key: String,
+    pub protocol_version: u32,
 }
 
 impl WsPeerIdentity {
@@ -64,6 +75,8 @@ impl WsPeerIdentity {
             device_id: device_id.into(),
             display_name: display_name.into(),
             avatar_hash: None,
+            public_key: String::new(),
+            protocol_version: jasmine_core::CURRENT_PROTOCOL_VERSION,
         }
     }
 
@@ -72,11 +85,23 @@ impl WsPeerIdentity {
         self
     }
 
+    pub fn with_transport_identity(
+        mut self,
+        public_key: impl Into<String>,
+        protocol_version: u32,
+    ) -> Self {
+        self.public_key = public_key.into();
+        self.protocol_version = protocol_version;
+        self
+    }
+
     pub(crate) fn to_protocol_message(&self) -> ProtocolMessage {
         ProtocolMessage::PeerInfo {
             device_id: self.device_id.clone(),
             display_name: self.display_name.clone(),
             avatar_hash: self.avatar_hash.clone(),
+            public_key: (!self.public_key.trim().is_empty()).then_some(self.public_key.clone()),
+            protocol_version: Some(self.protocol_version),
         }
     }
 
@@ -86,6 +111,8 @@ impl WsPeerIdentity {
                 device_id,
                 display_name,
                 avatar_hash,
+                public_key,
+                protocol_version,
             } => {
                 if device_id.trim().is_empty() {
                     return Err(MessagingError::Protocol(
@@ -103,6 +130,9 @@ impl WsPeerIdentity {
                     device_id,
                     display_name,
                     avatar_hash,
+                    public_key: public_key.unwrap_or_default(),
+                    protocol_version: protocol_version
+                        .unwrap_or(jasmine_core::CURRENT_PROTOCOL_VERSION),
                 })
             }
             other => Err(MessagingError::Protocol(format!(
@@ -118,10 +148,12 @@ pub struct WsPeerConnection {
     pub address: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WsServerConfig {
     pub bind_addr: String,
     pub local_peer: WsPeerIdentity,
+    pub local_private_key: Option<Vec<u8>>,
+    pub peer_key_store: Option<Arc<SqliteStorage>>,
     pub heartbeat_interval: Duration,
     pub max_missed_heartbeats: u32,
     pub handshake_timeout: Duration,
@@ -132,6 +164,8 @@ impl WsServerConfig {
         Self {
             bind_addr: DEFAULT_WS_BIND_ADDR.to_string(),
             local_peer,
+            local_private_key: None,
+            peer_key_store: None,
             heartbeat_interval: DEFAULT_WS_HEARTBEAT_INTERVAL,
             max_missed_heartbeats: DEFAULT_MAX_MISSED_HEARTBEATS,
             handshake_timeout: DEFAULT_WS_HANDSHAKE_TIMEOUT,
@@ -139,9 +173,11 @@ impl WsServerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WsClientConfig {
     pub local_peer: WsPeerIdentity,
+    pub local_private_key: Option<Vec<u8>>,
+    pub peer_key_store: Option<Arc<SqliteStorage>>,
     pub heartbeat_interval: Duration,
     pub max_missed_heartbeats: u32,
     pub handshake_timeout: Duration,
@@ -151,6 +187,8 @@ impl WsClientConfig {
     pub fn new(local_peer: WsPeerIdentity) -> Self {
         Self {
             local_peer,
+            local_private_key: None,
+            peer_key_store: None,
             heartbeat_interval: DEFAULT_WS_HEARTBEAT_INTERVAL,
             max_missed_heartbeats: DEFAULT_MAX_MISSED_HEARTBEATS,
             handshake_timeout: DEFAULT_WS_HANDSHAKE_TIMEOUT,

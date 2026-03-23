@@ -1,13 +1,26 @@
-import React from "react";
-import { useParams } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
-import { GroupChat } from "./GroupChat";
-import { useGroupStore } from "../../stores/groupStore";
+import React, { useEffect } from 'react';
+import { useParams } from 'react-router-dom';
+import { GroupChat } from './GroupChat';
+import { useGroupStore } from '../../stores/groupStore';
 
 export const GroupChatWrapper: React.FC = () => {
   const { groupId } = useParams<{ groupId: string }>();
   const groups = useGroupStore((state) => state.groups);
-  const addGroupMessage = useGroupStore((state) => state.addGroupMessage);
+  const fetchGroupInfo = useGroupStore((state) => state.fetchGroupInfo);
+  const sendGroupMessage = useGroupStore((state) => state.sendGroupMessage);
+  const addMembers = useGroupStore((state) => state.addMembers);
+  const removeMembers = useGroupStore((state) => state.removeMembers);
+  const leaveGroup = useGroupStore((state) => state.leaveGroup);
+
+  useEffect(() => {
+    if (!groupId) {
+      return;
+    }
+
+    void fetchGroupInfo(groupId).catch((error) => {
+      console.error('Failed to fetch group info:', error);
+    });
+  }, [fetchGroupInfo, groupId]);
 
   if (!groupId) return <div className="placeholder-view">Invalid Group ID</div>;
 
@@ -19,34 +32,33 @@ export const GroupChatWrapper: React.FC = () => {
 
   const handleSendMessage = async (content: string, replyToId?: string) => {
     try {
-      const messageId = await invoke<string>("send_group_message", {
-        groupId,
-        content,
-        replyToId: replyToId || null,
-      });
-
-      let replyToPreview: string | undefined;
-      if (replyToId) {
-        const repliedMsg = group.messages.find(m => m.id === replyToId);
-        if (repliedMsg) {
-          replyToPreview = repliedMsg.content.length > 80 
-            ? repliedMsg.content.slice(0, 80) + '…' 
-            : repliedMsg.content;
-        }
-      }
-
-      addGroupMessage(groupId, {
-        id: messageId,
-        senderId: "me",
-        senderName: "Me",
-        content,
-        timestamp: Date.now(),
-        isOwn: true,
-        replyToId,
-        replyToPreview,
-      });
+      await sendGroupMessage(groupId, content, replyToId);
     } catch (error) {
-      console.error("Failed to send group message:", error);
+      console.error('Failed to send group message:', error);
+    }
+  };
+
+  const handleAddMembers = async (memberIds: string[]) => {
+    try {
+      await addMembers(groupId, memberIds);
+    } catch (error) {
+      console.error('Failed to add group members:', error);
+    }
+  };
+
+  const handleRemoveMember = async (memberId: string) => {
+    try {
+      await removeMembers(groupId, [memberId]);
+    } catch (error) {
+      console.error('Failed to remove group member:', error);
+    }
+  };
+
+  const handleLeaveGroup = async () => {
+    try {
+      await leaveGroup(groupId);
+    } catch (error) {
+      console.error('Failed to leave group:', error);
     }
   };
 
@@ -56,6 +68,9 @@ export const GroupChatWrapper: React.FC = () => {
       members={group.members}
       messages={group.messages}
       onSendMessage={handleSendMessage}
+      onAddMembers={handleAddMembers}
+      onRemoveMember={handleRemoveMember}
+      onLeaveGroup={handleLeaveGroup}
     />
   );
 };

@@ -9,6 +9,7 @@ authors = ["you"]
 
 [workspace.dependencies]
 jasmine-core = { path = "crates/jasmine-core" }
+jasmine-crypto = { path = "crates/jasmine-crypto" }
 jasmine-discovery = { path = "crates/jasmine-discovery" }
 jasmine-messaging = { path = "crates/jasmine-messaging" }
 jasmine-storage = { path = "crates/jasmine-storage" }
@@ -43,6 +44,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 async-trait = "0.1"
 jasmine-core.workspace = true
+jasmine-crypto.workspace = true
 jasmine-discovery.workspace = true
 jasmine-messaging.workspace = true
 jasmine-storage.workspace = true
@@ -57,5 +59,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+futures-util = "0.3"
 sha2 = "0.10"
 tempfile = "3"
+tokio-tungstenite = "0.27"

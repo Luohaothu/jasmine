@@ -39,6 +39,7 @@ pub struct ManagedTransfer {
     pub progress: Option<TransferProgress>,
     pub folder_id: Option<String>,
     pub folder_relative_path: Option<String>,
+    pub resume_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -87,6 +88,12 @@ pub trait ManagedTransferSender: Send + Sync + 'static {
         cancellation: CancellationToken,
         progress: Option<Arc<dyn TransferProgressReporter>>,
     ) -> Result<(), TransferManagerError>;
+
+    async fn current_resume_token(
+        &self,
+        peer_id: &DeviceId,
+        file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError>;
 }
 
 pub trait ManagedTransferReceiver: Send + Sync + 'static {
@@ -100,9 +107,16 @@ pub trait ManagedTransferReceiver: Send + Sync + 'static {
     async fn accept_offer(
         &self,
         offer_id: &str,
+        resume_offset: Option<u64>,
         cancellation: CancellationToken,
         progress: Option<Arc<dyn TransferProgressReporter>>,
     ) -> Result<PathBuf, TransferManagerError>;
+
+    async fn current_resume_token(
+        &self,
+        peer_id: &DeviceId,
+        file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError>;
 
     async fn reject_offer(
         &self,
@@ -133,6 +147,16 @@ where
         .await
         .map_err(TransferManagerError::from)
     }
+
+    async fn current_resume_token(
+        &self,
+        peer_id: &DeviceId,
+        file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError> {
+        FileSender::current_resume_token(self, peer_id, file_id)
+            .await
+            .map_err(TransferManagerError::from)
+    }
 }
 
 impl<S> ManagedTransferReceiver for FileReceiver<S>
@@ -153,10 +177,26 @@ where
     async fn accept_offer(
         &self,
         offer_id: &str,
+        resume_offset: Option<u64>,
         cancellation: CancellationToken,
         progress: Option<Arc<dyn TransferProgressReporter>>,
     ) -> Result<PathBuf, TransferManagerError> {
-        self.accept_offer_with_cancellation(offer_id, cancellation, progress)
+        self.accept_offer_with_resume_offset_and_cancellation(
+            offer_id,
+            resume_offset,
+            cancellation,
+            progress,
+        )
+        .await
+        .map_err(TransferManagerError::from)
+    }
+
+    async fn current_resume_token(
+        &self,
+        peer_id: &DeviceId,
+        file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError> {
+        FileReceiver::current_resume_token(self, peer_id, file_id)
             .await
             .map_err(TransferManagerError::from)
     }
@@ -266,6 +306,11 @@ where
         let total_bytes = std::fs::metadata(&file_path)
             .map_err(|error| TransferManagerError::Worker(error.to_string()))?
             .len();
+        let resume_token = self
+            .inner
+            .sender
+            .current_resume_token(&peer_id, &transfer_id)
+            .await?;
         let folder_id = folder_link.as_ref().map(|link| link.folder_id.clone());
         let folder_relative_path = folder_link
             .as_ref()
@@ -283,6 +328,7 @@ where
             progress: None,
             folder_id,
             folder_relative_path,
+            resume_token,
         };
 
         self.inner.enqueue_transfer(ManagedTransferEntry {
@@ -342,18 +388,37 @@ where
             .notification
             .download_dir
             .join(&pending_offer.notification.filename);
+        let resume_token = self
+            .inner
+            .receiver
+            .current_resume_token(&pending_offer.notification.sender_id, offer_id)
+            .await?;
+        let resume_offset = self
+            .inner
+            .resume_offset_for_offer(
+                offer_id,
+                &pending_offer.notification,
+                resume_token.as_deref(),
+            )
+            .await?;
         let transfer = ManagedTransfer {
             id: offer_id.to_string(),
             peer_id: pending_offer.notification.sender_id.clone(),
             chat_id,
             file_name: pending_offer.notification.filename.clone(),
-            local_path: predicted_path,
+            local_path: predicted_path.clone(),
             direction: TransferDirection::Receive,
             status: TransferStatus::Pending,
             total_bytes: pending_offer.notification.size,
-            progress: None,
+            progress: resume_offset.map(|offset| TransferProgress {
+                transfer_id: offer_id.to_string(),
+                bytes_sent: offset,
+                total_bytes: pending_offer.notification.size,
+                speed_bps: 0,
+            }),
             folder_id: None,
             folder_relative_path: None,
+            resume_token: resume_token.clone(),
         };
 
         self.inner.enqueue_transfer(ManagedTransferEntry {
@@ -361,6 +426,10 @@ where
             transfer,
             source: TransferSource::Receive {
                 offer_id: offer_id.to_string(),
+                peer_id: pending_offer.notification.sender_id.clone(),
+                local_path: predicted_path.clone(),
+                resume_offset,
+                resume_token: resume_token.clone(),
             },
             cancellation: CancellationToken::new(),
             progress_reporter: None,
@@ -467,6 +536,10 @@ enum TransferSource {
     },
     Receive {
         offer_id: String,
+        peer_id: DeviceId,
+        local_path: PathBuf,
+        resume_offset: Option<u64>,
+        resume_token: Option<String>,
     },
 }
 
@@ -626,14 +699,20 @@ where
     }
 
     fn record_progress(&self, transfer_id: &str, progress: TransferProgress) {
-        let reporter = {
+        let (reporter, record) = {
             let mut state = self.state.lock().expect("lock transfer manager state");
             let Some(entry) = state.transfers.get_mut(transfer_id) else {
                 return;
             };
             entry.transfer.progress = Some(progress.clone());
-            entry.progress_reporter.clone()
+            let updated_transfer = entry.transfer.clone();
+            (
+                entry.progress_reporter.clone(),
+                build_transfer_record(entry, &updated_transfer),
+            )
         };
+
+        self.persist_record_blocking(record);
 
         if let Some(reporter) = reporter {
             reporter.report(progress);
@@ -648,7 +727,7 @@ where
                 entry.transfer.status.clone(),
                 entry.cancellation.clone(),
                 match &entry.source {
-                    TransferSource::Receive { offer_id } => Some(offer_id.clone()),
+                    TransferSource::Receive { offer_id, .. } => Some(offer_id.clone()),
                     TransferSource::Send { .. } => None,
                 },
             )
@@ -707,11 +786,14 @@ where
 
     fn persist_record_blocking(&self, record: TransferRecord) {
         let storage = Arc::clone(&self.storage);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build transfer storage runtime");
-        let _ = runtime.block_on(async move { storage.save_transfer(&record).await });
+        let persist_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build transfer storage runtime");
+            let _ = runtime.block_on(async move { storage.save_transfer(&record).await });
+        });
+        let _ = persist_thread.join();
     }
 
     fn transfer_record(&self, transfer_id: &str) -> Option<TransferRecord> {
@@ -719,6 +801,116 @@ where
         let entry = state.transfers.get(transfer_id)?;
 
         Some(build_transfer_record(entry, &entry.transfer))
+    }
+
+    async fn resume_offset_for_offer(
+        &self,
+        offer_id: &str,
+        notification: &FileOfferNotification,
+        current_resume_token: Option<&str>,
+    ) -> Result<Option<u64>, TransferManagerError> {
+        let Some(resume_info) = self
+            .storage
+            .get_transfer_resume_info(offer_id)
+            .await
+            .map_err(|error| TransferManagerError::Storage(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        let partial_path =
+            partial_path_for_resume(&notification.download_dir.join(&notification.filename));
+
+        let can_resume = {
+            if resume_info.bytes_transferred == 0
+                || resume_info.bytes_transferred > notification.size
+                || resume_info.resume_token.as_deref() != current_resume_token
+            {
+                false
+            } else {
+                match std::fs::metadata(&partial_path) {
+                    Ok(metadata) => metadata.len() == resume_info.bytes_transferred,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(TransferManagerError::Worker(error.to_string())),
+                }
+            }
+        };
+
+        if can_resume {
+            return Ok(Some(resume_info.bytes_transferred));
+        }
+
+        if let Err(error) = std::fs::remove_file(&partial_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(TransferManagerError::Worker(error.to_string()));
+            }
+        }
+
+        self.storage
+            .update_bytes_transferred(offer_id, 0)
+            .await
+            .map_err(|error| TransferManagerError::Storage(error.to_string()))?;
+
+        Ok(None)
+    }
+
+    async fn prepare_receive_runtime_context(
+        &self,
+        transfer_id: &str,
+        offer_id: &str,
+        peer_id: &DeviceId,
+        local_path: &Path,
+        requested_resume_offset: Option<u64>,
+        expected_resume_token: Option<&str>,
+    ) -> Result<Option<u64>, TransferManagerError> {
+        let current_resume_token = self
+            .receiver
+            .current_resume_token(peer_id, offer_id)
+            .await?;
+        let resume_is_safe = requested_resume_offset.is_none()
+            || current_resume_token.as_deref() == expected_resume_token;
+
+        if !resume_is_safe {
+            self.reset_resume_state(offer_id, local_path).await?;
+        }
+
+        let token_changed = current_resume_token.as_deref() != expected_resume_token;
+        if token_changed || !resume_is_safe {
+            {
+                let mut state = self.state.lock().expect("lock transfer manager state");
+                if let Some(entry) = state.transfers.get_mut(transfer_id) {
+                    entry.transfer.resume_token = current_resume_token.clone();
+                    if !resume_is_safe {
+                        entry.transfer.progress = None;
+                    }
+                }
+            }
+            self.persist_transfer_async(transfer_id).await?;
+        }
+
+        Ok(if resume_is_safe {
+            requested_resume_offset
+        } else {
+            None
+        })
+    }
+
+    async fn reset_resume_state(
+        &self,
+        offer_id: &str,
+        local_path: &Path,
+    ) -> Result<(), TransferManagerError> {
+        let partial_path = partial_path_for_resume(local_path);
+        if let Err(error) = std::fs::remove_file(&partial_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(TransferManagerError::Worker(error.to_string()));
+            }
+        }
+
+        self.storage
+            .update_bytes_transferred(offer_id, 0)
+            .await
+            .map_err(|error| TransferManagerError::Storage(error.to_string()))
     }
 
     async fn start_ready_transfers_async(self: &Arc<Self>) -> Result<(), TransferManagerError> {
@@ -792,11 +984,34 @@ where
                         )
                         .await
                         .map(|_| WorkerResult::SendCompleted),
-                    TransferSource::Receive { offer_id } => inner
-                        .receiver
-                        .accept_offer(&offer_id, start.cancellation, Some(reporter))
-                        .await
-                        .map(WorkerResult::ReceiveCompleted),
+                    TransferSource::Receive {
+                        offer_id,
+                        peer_id,
+                        local_path,
+                        resume_offset,
+                        resume_token,
+                    } => {
+                        let safe_resume_offset = inner
+                            .prepare_receive_runtime_context(
+                                &transfer_id,
+                                &offer_id,
+                                &peer_id,
+                                &local_path,
+                                resume_offset,
+                                resume_token.as_deref(),
+                            )
+                            .await?;
+                        inner
+                            .receiver
+                            .accept_offer(
+                                &offer_id,
+                                safe_resume_offset,
+                                start.cancellation,
+                                Some(reporter),
+                            )
+                            .await
+                            .map(WorkerResult::ReceiveCompleted)
+                    }
                 }
             });
 
@@ -964,6 +1179,12 @@ fn build_transfer_record(
     entry: &ManagedTransferEntry,
     transfer: &ManagedTransfer,
 ) -> TransferRecord {
+    let bytes_transferred = transfer
+        .progress
+        .as_ref()
+        .map(|progress| progress.bytes_sent)
+        .unwrap_or(0);
+
     TransferRecord {
         id: entry.record_id,
         peer_id: transfer.peer_id.clone(),
@@ -974,7 +1195,18 @@ fn build_transfer_record(
         thumbnail_path: None,
         folder_id: transfer.folder_id.clone(),
         folder_relative_path: transfer.folder_relative_path.clone(),
+        bytes_transferred,
+        resume_token: transfer.resume_token.clone(),
     }
+}
+
+fn partial_path_for_resume(final_path: &Path) -> PathBuf {
+    let file_name = final_path
+        .file_name()
+        .expect("resume path must have file name");
+    let mut partial_name = file_name.to_os_string();
+    partial_name.push(".jasmine-partial");
+    final_path.with_file_name(partial_name)
 }
 
 impl From<FileSenderError> for TransferManagerError {
