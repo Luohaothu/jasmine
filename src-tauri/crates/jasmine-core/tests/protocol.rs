@@ -148,12 +148,110 @@ fn protocol_roundtrip_file_reject() {
 }
 
 #[test]
+fn protocol_roundtrip_key_exchange_init() {
+    protocol_roundtrip(ProtocolMessage::KeyExchangeInit {
+        ephemeral_public_key: "ephemeral-init-key".to_string(),
+        protocol_version: 2,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_key_exchange_response() {
+    protocol_roundtrip(ProtocolMessage::KeyExchangeResponse {
+        ephemeral_public_key: "ephemeral-response-key".to_string(),
+    });
+}
+
+#[test]
+fn protocol_roundtrip_sender_key_distribution() {
+    protocol_roundtrip(ProtocolMessage::SenderKeyDistribution {
+        group_id: "group-key-dist-001".to_string(),
+        sender_key_data: "sender-key-data".to_string(),
+        epoch: 3,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_sender_key_rotation() {
+    protocol_roundtrip(ProtocolMessage::SenderKeyRotation {
+        group_id: "group-key-rot-001".to_string(),
+        new_sender_key_data: "new-sender-key-data".to_string(),
+        new_epoch: 4,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_file_resume_request() {
+    protocol_roundtrip(ProtocolMessage::FileResumeRequest {
+        offer_id: "offer-resume-001".to_string(),
+        offset: 12_345,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_file_resume_accept() {
+    protocol_roundtrip(ProtocolMessage::FileResumeAccept {
+        offer_id: "offer-resume-001".to_string(),
+        offset: 12_345,
+    });
+}
+
+#[test]
 fn protocol_roundtrip_peer_info() {
     protocol_roundtrip(ProtocolMessage::PeerInfo {
         device_id: "dev-001".to_string(),
         display_name: "desktop-room".to_string(),
         avatar_hash: None,
+        public_key: None,
+        protocol_version: None,
     });
+}
+
+#[test]
+fn protocol_peer_info_backward_compatible_without_new_fields() {
+    let raw_json = r#"
+        {
+            "type": "PeerInfo",
+            "device_id": "dev-legacy",
+            "display_name": "legacy-device",
+            "avatar_hash": "avatar-legacy"
+        }
+    "#;
+
+    let message =
+        serde_json::from_str::<ProtocolMessage>(raw_json).expect("deserialize legacy peer info");
+
+    assert_eq!(
+        message,
+        ProtocolMessage::PeerInfo {
+            device_id: "dev-legacy".to_string(),
+            display_name: "legacy-device".to_string(),
+            avatar_hash: Some("avatar-legacy".to_string()),
+            public_key: None,
+            protocol_version: None,
+        }
+    );
+}
+
+#[test]
+fn protocol_peer_info_serializes_with_optional_fields() {
+    let message = ProtocolMessage::PeerInfo {
+        device_id: "dev-002".to_string(),
+        display_name: "secure-device".to_string(),
+        avatar_hash: Some("avatar-002".to_string()),
+        public_key: Some("base64-25519-key".to_string()),
+        protocol_version: Some(2),
+    };
+
+    let json = serde_json::to_string(&message).expect("serialize peer info with optional fields");
+    let parsed = serde_json::from_str::<serde_json::Value>(&json).expect("parse peer info json");
+
+    assert_eq!(parsed["type"], "PeerInfo");
+    assert_eq!(parsed["device_id"], "dev-002");
+    assert_eq!(parsed["display_name"], "secure-device");
+    assert_eq!(parsed["avatar_hash"], "avatar-002");
+    assert_eq!(parsed["public_key"], "base64-25519-key");
+    assert_eq!(parsed["protocol_version"], 2);
 }
 
 #[test]

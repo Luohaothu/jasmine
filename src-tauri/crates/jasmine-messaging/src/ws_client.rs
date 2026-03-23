@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use jasmine_core::ProtocolMessage;
+use jasmine_crypto::Session;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
@@ -17,6 +18,7 @@ pub enum WsClientEvent {
 
 pub struct WsClient {
     remote_peer: WsPeerConnection,
+    session: Arc<Mutex<Session>>,
     events: broadcast::Sender<WsClientEvent>,
     command_tx: mpsc::Sender<ConnectionCommand>,
     shutdown_tx: watch::Sender<bool>,
@@ -30,9 +32,11 @@ impl WsClient {
         let (mut socket, _) = connect_async(url.as_str())
             .await
             .map_err(|error| MessagingError::Transport(error.to_string()))?;
-        let remote_peer = perform_client_handshake(
+        let handshake = perform_client_handshake(
             &mut socket,
             &config.local_peer,
+            config.local_private_key.as_deref(),
+            config.peer_key_store.as_deref(),
             ws_endpoint(&url),
             config.handshake_timeout,
         )
@@ -42,10 +46,13 @@ impl WsClient {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let event_sender = events.clone();
         let message_sender = event_sender.clone();
+        let session = Arc::new(Mutex::new(handshake.session));
+        let loop_session = Arc::clone(&session);
 
         let task = tokio::spawn(async move {
             let reason = run_connection_loop(
                 socket,
+                loop_session,
                 config.heartbeat_interval,
                 config.max_missed_heartbeats,
                 command_rx,
@@ -59,7 +66,8 @@ impl WsClient {
         });
 
         Ok(Self {
-            remote_peer,
+            remote_peer: handshake.peer,
+            session,
             events,
             command_tx,
             shutdown_tx,
@@ -74,6 +82,20 @@ impl WsClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<WsClientEvent> {
         self.events.subscribe()
+    }
+
+    pub fn file_crypto_material(&self, file_id: &str) -> ([u8; 32], [u8; 8]) {
+        self.session
+            .lock()
+            .expect("lock ws client session")
+            .derive_file_crypto_material(file_id)
+    }
+
+    pub fn sender_key_distribution_material(&self) -> [u8; 32] {
+        self.session
+            .lock()
+            .expect("lock ws client session")
+            .sender_key_distribution_material()
     }
 
     pub async fn send(&self, message: ProtocolMessage) -> Result<()> {

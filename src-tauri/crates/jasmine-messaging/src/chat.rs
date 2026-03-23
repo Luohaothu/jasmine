@@ -4,9 +4,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jasmine_core::{
     parse_mentions, AckStatus, ChatId, CoreError, GroupInfo, Message, MessageStatus,
-    ProtocolMessage, StorageEngine, UserId,
+    ProtocolMessage, SenderKeyInfo, StorageEngine, UserId,
+};
+use jasmine_crypto::{
+    chunk_nonce, create_distribution_message, decrypt, encrypt, generate_sender_key,
+    process_distribution_message, SenderKey,
 };
 use jasmine_storage::{ChatRecord, ChatType, SqliteStorage};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -40,6 +45,20 @@ pub enum ChatServiceEvent {
     MessageReceived {
         peer_id: String,
         message: Message,
+    },
+    GroupCreated {
+        group_id: ChatId,
+    },
+    GroupUpdated {
+        group_id: ChatId,
+    },
+    GroupMembersAdded {
+        group_id: ChatId,
+        member_ids: Vec<String>,
+    },
+    GroupMembersRemoved {
+        group_id: ChatId,
+        member_ids: Vec<String>,
     },
     MessageEdited {
         message_id: Uuid,
@@ -150,6 +169,14 @@ struct IncomingTextMessage {
     reply_to_preview: Option<String>,
 }
 
+struct IncomingGroupMessage {
+    group_id: String,
+    sender_key_id: Uuid,
+    epoch: u32,
+    nonce: [u8; 12],
+    encrypted_content: Vec<u8>,
+}
+
 struct IncomingMessageEdit {
     message_id: String,
     chat_id: String,
@@ -165,6 +192,25 @@ struct IncomingMessageDelete {
     sender_id: String,
     timestamp_ms: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncodedSenderKeyDistributionPayload {
+    key_id: String,
+    encrypted_key_material: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupMessageCiphertextPayload {
+    id: String,
+    content: String,
+    timestamp: i64,
+    #[serde(default)]
+    reply_to_id: Option<String>,
+    #[serde(default)]
+    reply_to_preview: Option<String>,
+}
+
+const GROUP_MESSAGE_AAD_PREFIX: &[u8] = b"jasmine/group-message/v1";
 
 #[derive(Debug, Clone)]
 struct PendingEdit {
@@ -229,6 +275,7 @@ struct ChatServiceInner<S: ChatStorage + 'static> {
     pending_acks: Mutex<HashMap<String, oneshot::Sender<()>>>,
     pending_edits: Mutex<HashMap<String, Vec<PendingEdit>>>,
     pending_deletes: Mutex<HashMap<String, PendingDelete>>,
+    group_sender_key_counters: Mutex<HashMap<String, u32>>,
 }
 
 pub struct ChatService<S: ChatStorage + 'static> {
@@ -267,6 +314,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             pending_acks: Mutex::new(HashMap::new()),
             pending_edits: Mutex::new(HashMap::new()),
             pending_deletes: Mutex::new(HashMap::new()),
+            group_sender_key_counters: Mutex::new(HashMap::new()),
         });
 
         let mut server_events = inner.server.subscribe();
@@ -506,6 +554,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
         };
 
         self.inner.save_group(group.clone()).await?;
+        self.inner.emit_group_created(group.id.clone());
         self.inner
             .fanout_group_create(
                 &group,
@@ -562,17 +611,14 @@ impl<S: ChatStorage + 'static> ChatService<S> {
         self.inner.save_message(message.clone()).await?;
         parse_mentions(&message.content);
 
+        let sender_key = self
+            .inner
+            .ensure_sender_key_distributed(&group, &recipients)
+            .await?;
+
         let mut delivered_to_any = recipients.is_empty();
         for peer_id in recipients {
-            let protocol_message = ProtocolMessage::TextMessage {
-                id: message.id.to_string(),
-                chat_id: group.id.0.to_string(),
-                sender_id: self.inner.local_peer.device_id.clone(),
-                content: message.content.clone(),
-                timestamp: message.timestamp_ms,
-                reply_to_id: message.reply_to_id.clone(),
-                reply_to_preview: message.reply_to_preview.clone(),
-            };
+            let protocol_message = self.inner.encrypt_group_message(&message, &sender_key)?;
 
             match self.inner.send_to_peer(&peer_id, protocol_message).await {
                 Ok(()) => delivered_to_any = true,
@@ -617,6 +663,9 @@ impl<S: ChatStorage + 'static> ChatService<S> {
 
         self.inner.save_group(updated.clone()).await?;
         self.inner
+            .emit_group_members_added(&updated.id, user_ids_to_peer_ids(&added_member_ids));
+        self.inner.emit_group_updated(updated.id.clone());
+        self.inner
             .fanout_group_invite(
                 &updated.id,
                 &self.inner.local_peer.device_id,
@@ -629,6 +678,22 @@ impl<S: ChatStorage + 'static> ChatService<S> {
                 other_group_member_peer_ids(&updated, &self.inner.local_peer.device_id),
             )
             .await;
+        if let Some(sender_key) = self
+            .inner
+            .load_sender_key(&updated.id.0.to_string(), &self.inner.local_peer.device_id)
+            .await?
+        {
+            if let Ok(sender_key) = sender_key_from_info(&sender_key) {
+                self.inner
+                    .distribute_sender_key(
+                        &updated.id.0.to_string(),
+                        &self.inner.local_peer.device_id,
+                        &sender_key,
+                        &user_ids_to_peer_ids(&added_member_ids),
+                    )
+                    .await;
+            }
+        }
 
         Ok(updated.info())
     }
@@ -649,8 +714,28 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             member_ids: remove_members(&group.member_ids, member_ids)?,
             ..group.clone()
         };
+        let removed_member_ids = removed_members(&group.member_ids, &updated.member_ids);
+        let local_peer_left_group = removed_member_ids.len() == 1
+            && removed_member_ids[0] == self.inner.local_peer.device_id;
 
         self.inner.save_group(updated.clone()).await?;
+        self.inner
+            .emit_group_members_removed(&updated.id, removed_member_ids.clone());
+        self.inner.emit_group_updated(updated.id.clone());
+        if local_peer_left_group {
+            self.inner
+                .fanout_group_member_left(
+                    &updated.id,
+                    &self.inner.local_peer.device_id,
+                    user_ids_to_peer_ids(&updated.member_ids),
+                )
+                .await;
+            return Ok(updated.info());
+        }
+
+        self.inner
+            .rotate_sender_key_on_membership_reduction(&group, &updated)
+            .await?;
         self.inner
             .fanout_group_create(
                 &updated,
@@ -819,6 +904,26 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 )
                 .await
             }
+            ProtocolMessage::GroupMessage {
+                group_id,
+                sender_key_id,
+                epoch,
+                nonce,
+                encrypted_content,
+            } => {
+                self.handle_incoming_group_message(
+                    peer_id,
+                    reply_route,
+                    IncomingGroupMessage {
+                        group_id,
+                        sender_key_id,
+                        epoch,
+                        nonce,
+                        encrypted_content,
+                    },
+                )
+                .await
+            }
             ProtocolMessage::GroupCreate {
                 group_id,
                 name,
@@ -828,6 +933,28 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                     .await
             }
             ProtocolMessage::GroupInvite { .. } => Ok(()),
+            ProtocolMessage::GroupMemberLeft {
+                group_id,
+                member_id,
+            } => {
+                self.handle_group_member_left(peer_id, group_id, member_id)
+                    .await
+            }
+            ProtocolMessage::SenderKeyDistribution {
+                group_id,
+                sender_key_data,
+                epoch,
+            } => {
+                self.handle_sender_key_distribution(peer_id, group_id, sender_key_data, epoch)
+                    .await
+            }
+            ProtocolMessage::SenderKeyRequest {
+                group_id,
+                requesting_peer_id,
+            } => {
+                self.handle_sender_key_request(peer_id, group_id, requesting_peer_id)
+                    .await
+            }
             ProtocolMessage::Ack { message_id, .. } => {
                 let message_uuid = parse_uuid(&message_id, "message_id")?;
                 let cancel = self
@@ -1114,18 +1241,195 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         }
 
         let group_id = ChatId(parse_uuid(&group_id, "group_id")?);
-        let created_at_ms = self
-            .load_group(group_id.clone())
-            .await?
+        let previous_group = self.load_group(group_id.clone()).await?;
+        let created_at_ms = previous_group
+            .as_ref()
             .map(|group| group.created_at_ms)
             .unwrap_or_else(now_ms);
-        self.save_group(GroupState {
+        let next_group = GroupState {
             id: group_id,
             name: normalize_group_name(name)?,
             member_ids,
             created_at_ms,
-        })
+        };
+        self.save_group(next_group.clone()).await?;
+        self.emit_group_state_change(previous_group.as_ref(), &next_group);
+        Ok(())
+    }
+
+    async fn handle_sender_key_distribution(
+        &self,
+        peer_id: String,
+        group_id: String,
+        sender_key_data: String,
+        epoch: u32,
+    ) -> Result<()> {
+        let session_key = self.sender_key_distribution_material(&peer_id)?;
+        let distribution =
+            parse_protocol_sender_key_distribution(&peer_id, group_id, sender_key_data, epoch)?;
+        let sender_key = process_distribution_message(&distribution, &session_key)
+            .map_err(|error| MessagingError::Validation(error.to_string()))?;
+
+        self.save_sender_key(&distribution.group_id, &peer_id, &sender_key)
+            .await
+    }
+
+    async fn handle_sender_key_request(
+        &self,
+        peer_id: String,
+        group_id: String,
+        requesting_peer_id: String,
+    ) -> Result<()> {
+        if requesting_peer_id != peer_id {
+            return Err(MessagingError::Validation(format!(
+                "sender key request requesting_peer_id {} does not match connected peer {peer_id}",
+                requesting_peer_id
+            )));
+        }
+
+        let group_chat_id = ChatId(parse_uuid(&group_id, "group_id")?);
+        let Some(group) = self.load_group(group_chat_id).await? else {
+            return Ok(());
+        };
+
+        let requester_user_id = user_id_from_peer_id(&peer_id)?;
+        let local_user_id = user_id_from_peer_id(&self.local_peer.device_id)?;
+        if !group.member_ids.contains(&requester_user_id)
+            || !group.member_ids.contains(&local_user_id)
+        {
+            return Ok(());
+        }
+
+        let Some(stored_sender_key) = self
+            .load_sender_key(&group_id, &self.local_peer.device_id)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let sender_key = sender_key_from_info(&stored_sender_key)?;
+        let session_key = self.sender_key_distribution_material(&peer_id)?;
+        let distribution = create_distribution_message(
+            group_id,
+            self.local_peer.device_id.clone(),
+            &sender_key,
+            &session_key,
+        )
+        .map_err(|error| MessagingError::Validation(error.to_string()))?;
+        let message = protocol_sender_key_distribution_message(&distribution)?;
+        self.send_to_peer(&peer_id, message).await
+    }
+
+    async fn handle_group_member_left(
+        &self,
+        peer_id: String,
+        group_id: String,
+        member_id: String,
+    ) -> Result<()> {
+        if member_id != peer_id {
+            return Err(MessagingError::Validation(format!(
+                "group member left member_id {} does not match connected peer {peer_id}",
+                member_id
+            )));
+        }
+
+        let group_chat_id = ChatId(parse_uuid(&group_id, "group_id")?);
+        let Some(group) = self.load_group(group_chat_id).await? else {
+            return Ok(());
+        };
+
+        let departed_user_id = user_id_from_peer_id(&member_id)?;
+        let updated_member_ids = group
+            .member_ids
+            .iter()
+            .filter(|member| **member != departed_user_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let updated = GroupState {
+            member_ids: updated_member_ids,
+            ..group.clone()
+        };
+
+        if updated.member_ids != group.member_ids {
+            self.save_group(updated.clone()).await?;
+            self.emit_group_members_removed(&updated.id, vec![member_id]);
+            self.emit_group_updated(updated.id.clone());
+        }
+
+        self.rotate_sender_key_after_group_member_left(&updated)
+            .await
+    }
+
+    async fn handle_incoming_group_message(
+        &self,
+        peer_id: String,
+        reply_route: ReplyRoute,
+        incoming: IncomingGroupMessage,
+    ) -> Result<()> {
+        let group_id = incoming.group_id;
+        let sender_key_id = incoming.sender_key_id;
+        let epoch = incoming.epoch;
+        let nonce = incoming.nonce;
+        let encrypted_content = incoming.encrypted_content;
+
+        let Some(stored_sender_key) = self
+            .load_sender_key_by_epoch(&group_id, &peer_id, epoch)
+            .await?
+        else {
+            self.request_sender_key_recovery(reply_route, &peer_id, &group_id)
+                .await;
+            return Ok(());
+        };
+
+        if stored_sender_key.key_id != sender_key_id {
+            return Err(MessagingError::Validation(format!(
+                "sender key id mismatch for group {group_id}, sender {peer_id}, epoch {epoch}"
+            )));
+        }
+
+        let key_material = sender_key_material_array(&stored_sender_key)?;
+        let plaintext = decrypt(
+            &key_material,
+            &nonce,
+            &encrypted_content,
+            &group_message_aad(&group_id, &peer_id, &sender_key_id, epoch),
+        )
+        .map_err(|error| MessagingError::Validation(error.to_string()))?;
+        let payload: GroupMessageCiphertextPayload =
+            serde_json::from_slice(&plaintext).map_err(|error| {
+                MessagingError::Validation(format!("invalid group message payload: {error}"))
+            })?;
+
+        self.handle_incoming_text_message(
+            peer_id.clone(),
+            reply_route,
+            IncomingTextMessage {
+                id: payload.id,
+                chat_id: group_id,
+                sender_id: peer_id,
+                content: payload.content,
+                timestamp: payload.timestamp,
+                reply_to_id: payload.reply_to_id,
+                reply_to_preview: payload.reply_to_preview,
+            },
+        )
         .await
+    }
+
+    async fn request_sender_key_recovery(
+        &self,
+        reply_route: ReplyRoute,
+        peer_id: &str,
+        group_id: &str,
+    ) {
+        let request = ProtocolMessage::SenderKeyRequest {
+            group_id: group_id.to_string(),
+            requesting_peer_id: self.local_peer.device_id.clone(),
+        };
+
+        if let Err(error) = reply_route.send(&self.server, request).await {
+            warn!(peer_id, group_id, error = %error, "sender key recovery request failed");
+        }
     }
 
     async fn send_to_peer(&self, peer_id: &str, message: ProtocolMessage) -> Result<()> {
@@ -1337,6 +1641,53 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         });
     }
 
+    fn emit_group_created(&self, group_id: ChatId) {
+        let _ = self
+            .events
+            .send(ChatServiceEvent::GroupCreated { group_id });
+    }
+
+    fn emit_group_updated(&self, group_id: ChatId) {
+        let _ = self
+            .events
+            .send(ChatServiceEvent::GroupUpdated { group_id });
+    }
+
+    fn emit_group_members_added(&self, group_id: &ChatId, member_ids: Vec<String>) {
+        if member_ids.is_empty() {
+            return;
+        }
+        let _ = self.events.send(ChatServiceEvent::GroupMembersAdded {
+            group_id: group_id.clone(),
+            member_ids,
+        });
+    }
+
+    fn emit_group_members_removed(&self, group_id: &ChatId, member_ids: Vec<String>) {
+        if member_ids.is_empty() {
+            return;
+        }
+        let _ = self.events.send(ChatServiceEvent::GroupMembersRemoved {
+            group_id: group_id.clone(),
+            member_ids,
+        });
+    }
+
+    fn emit_group_state_change(&self, previous: Option<&GroupState>, current: &GroupState) {
+        let Some(previous) = previous else {
+            self.emit_group_created(current.id.clone());
+            return;
+        };
+
+        let added = added_members(&previous.member_ids, &current.member_ids);
+        let removed = removed_members(&previous.member_ids, &current.member_ids);
+        self.emit_group_members_added(&current.id, added);
+        self.emit_group_members_removed(&current.id, removed);
+        if previous.name != current.name || previous.member_ids != current.member_ids {
+            self.emit_group_updated(current.id.clone());
+        }
+    }
+
     fn peer_display_name(&self, peer_id: &str) -> String {
         if let Some(display_name) = self
             .clients
@@ -1355,6 +1706,228 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
             .find(|peer| peer.identity.device_id == peer_id)
             .map(|peer| peer.identity.display_name)
             .unwrap_or_else(|| peer_id.to_string())
+    }
+
+    fn sender_key_distribution_material(&self, peer_id: &str) -> Result<[u8; 32]> {
+        if let Some(material) = self
+            .clients
+            .lock()
+            .expect("lock chat clients")
+            .get(peer_id)
+            .map(|client| client.sender_key_distribution_material())
+        {
+            return Ok(material);
+        }
+
+        self.server.sender_key_distribution_material(peer_id)
+    }
+
+    async fn ensure_sender_key_distributed(
+        &self,
+        group: &GroupState,
+        recipients: &[String],
+    ) -> Result<SenderKeyInfo> {
+        let group_id = group.id.0.to_string();
+        let local_sender_id = self.local_peer.device_id.clone();
+        if let Some(existing) = self.load_sender_key(&group_id, &local_sender_id).await? {
+            return Ok(existing);
+        }
+
+        let sender_key = generate_sender_key();
+        self.save_sender_key(&group_id, &local_sender_id, &sender_key)
+            .await?;
+        let stored_sender_key = self
+            .load_sender_key(&group_id, &local_sender_id)
+            .await?
+            .ok_or_else(|| {
+                MessagingError::Storage(format!(
+                    "sender key for group {group_id} and sender {local_sender_id} was not persisted"
+                ))
+            })?;
+
+        self.distribute_sender_key(
+            &group.id.0.to_string(),
+            &local_sender_id,
+            &sender_key,
+            recipients,
+        )
+        .await;
+
+        Ok(stored_sender_key)
+    }
+
+    async fn rotate_sender_key_on_membership_reduction(
+        &self,
+        previous: &GroupState,
+        updated: &GroupState,
+    ) -> Result<()> {
+        if updated.member_ids.len() >= previous.member_ids.len() {
+            return Ok(());
+        }
+
+        let local_user_id = user_id_from_peer_id(&self.local_peer.device_id)?;
+        if !updated.member_ids.contains(&local_user_id) {
+            return Ok(());
+        }
+
+        self.rotate_local_sender_key(updated, false).await
+    }
+
+    async fn rotate_sender_key_after_group_member_left(&self, group: &GroupState) -> Result<()> {
+        let local_user_id = user_id_from_peer_id(&self.local_peer.device_id)?;
+        if !group.member_ids.contains(&local_user_id) {
+            return Ok(());
+        }
+
+        self.rotate_local_sender_key(group, true).await
+    }
+
+    async fn rotate_local_sender_key(
+        &self,
+        group: &GroupState,
+        create_if_missing: bool,
+    ) -> Result<()> {
+        let local_sender_id = self.local_peer.device_id.clone();
+        let existing = self
+            .load_sender_key(&group.id.0.to_string(), &local_sender_id)
+            .await?;
+        if existing.is_none() && !create_if_missing {
+            return Ok(());
+        }
+
+        let next_epoch = existing
+            .as_ref()
+            .map(|sender_key| sender_key.epoch.saturating_add(1))
+            .unwrap_or(0);
+
+        let mut rotated = generate_sender_key();
+        rotated.epoch = next_epoch;
+        self.save_sender_key(&group.id.0.to_string(), &local_sender_id, &rotated)
+            .await?;
+        self.distribute_sender_key(
+            &group.id.0.to_string(),
+            &local_sender_id,
+            &rotated,
+            &other_group_member_peer_ids(group, &self.local_peer.device_id),
+        )
+        .await;
+
+        Ok(())
+    }
+
+    async fn fanout_group_member_left(
+        &self,
+        group_id: &ChatId,
+        member_id: &str,
+        peer_ids: Vec<String>,
+    ) {
+        for peer_id in peer_ids {
+            let message = ProtocolMessage::GroupMemberLeft {
+                group_id: group_id.0.to_string(),
+                member_id: member_id.to_string(),
+            };
+
+            match self.send_to_peer(&peer_id, message).await {
+                Ok(()) | Err(MessagingError::PeerNotConnected(_)) => {}
+                Err(error) => {
+                    warn!(peer_id, group_id = %group_id.0, error = %error, "group member left send failed");
+                }
+            }
+        }
+    }
+
+    async fn distribute_sender_key(
+        &self,
+        group_id: &str,
+        sender_id: &str,
+        sender_key: &SenderKey,
+        recipients: &[String],
+    ) {
+        for peer_id in recipients {
+            let session_key = match self.sender_key_distribution_material(peer_id) {
+                Ok(material) => material,
+                Err(MessagingError::PeerNotConnected(_)) => continue,
+                Err(error) => {
+                    warn!(peer_id, group_id, error = %error, "sender key distribution session unavailable");
+                    continue;
+                }
+            };
+
+            let distribution = create_distribution_message(
+                group_id.to_string(),
+                sender_id.to_string(),
+                sender_key,
+                &session_key,
+            )
+            .map_err(|error| MessagingError::Validation(error.to_string()));
+            let Ok(distribution) = distribution else {
+                warn!(peer_id, group_id, "sender key distribution creation failed");
+                continue;
+            };
+            let message = match protocol_sender_key_distribution_message(&distribution) {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(peer_id, group_id, error = %error, "sender key distribution encoding failed");
+                    continue;
+                }
+            };
+
+            match self.send_to_peer(peer_id, message).await {
+                Ok(()) | Err(MessagingError::PeerNotConnected(_)) => {}
+                Err(error) => {
+                    warn!(peer_id, group_id, error = %error, "sender key distribution send failed");
+                }
+            }
+        }
+    }
+
+    fn encrypt_group_message(
+        &self,
+        message: &Message,
+        sender_key: &SenderKeyInfo,
+    ) -> Result<ProtocolMessage> {
+        let sender_key_id = sender_key.key_id;
+        let counter_key = sender_key_counter_key(&message.chat_id.0.to_string(), sender_key);
+        let counter = {
+            let mut counters = self
+                .group_sender_key_counters
+                .lock()
+                .expect("lock group sender key counters");
+            let counter = counters.entry(counter_key).or_insert(0);
+            let value = *counter;
+            *counter = counter.saturating_add(1);
+            value
+        };
+        let nonce = chunk_nonce(&[0u8; 8], counter);
+        let key_material = sender_key_material_array(sender_key)?;
+        let payload = serde_json::to_vec(&GroupMessageCiphertextPayload {
+            id: message.id.to_string(),
+            content: message.content.clone(),
+            timestamp: message.timestamp_ms,
+            reply_to_id: message.reply_to_id.clone(),
+            reply_to_preview: message.reply_to_preview.clone(),
+        })
+        .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+        let encrypted_content = encrypt(
+            &key_material,
+            &nonce,
+            &payload,
+            &group_message_aad(
+                &message.chat_id.0.to_string(),
+                &self.local_peer.device_id,
+                &sender_key_id,
+                sender_key.epoch,
+            ),
+        )
+        .map_err(|error| MessagingError::Validation(error.to_string()))?;
+
+        Ok(ProtocolMessage::GroupMessage {
+            group_id: message.chat_id.0.to_string(),
+            sender_key_id,
+            epoch: sender_key.epoch,
+            nonce,
+            encrypted_content,
+        })
     }
 
     fn buffer_pending_edit(&self, message_id: String, edit: PendingEdit) {
@@ -1456,6 +2029,101 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
 
             runtime
                 .block_on(async move { storage.save_group(&group_info, created_at_ms).await })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn save_sender_key(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+        sender_key: &SenderKey,
+    ) -> Result<()> {
+        let storage = Arc::clone(&self.storage);
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+        let key_id = sender_key.key_id;
+        let key_material = sender_key.key_material.to_vec();
+        let epoch = sender_key.epoch;
+        let created_at_ms = u64::try_from(sender_key.created_at).map_err(|_| {
+            MessagingError::Validation(format!(
+                "sender key created_at must be non-negative, got {}",
+                sender_key.created_at
+            ))
+        })?;
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move {
+                    storage
+                        .save_sender_key(
+                            &group_id,
+                            &sender_device_id,
+                            &key_id,
+                            &key_material,
+                            epoch,
+                            created_at_ms,
+                        )
+                        .await
+                })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn load_sender_key(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+    ) -> Result<Option<SenderKeyInfo>> {
+        let storage = Arc::clone(&self.storage);
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move { storage.get_sender_key(&group_id, &sender_device_id).await })
+                .map_err(MessagingError::from)
+        })
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?
+    }
+
+    async fn load_sender_key_by_epoch(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+        epoch: u32,
+    ) -> Result<Option<SenderKeyInfo>> {
+        let storage = Arc::clone(&self.storage);
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+            runtime
+                .block_on(async move {
+                    storage
+                        .get_sender_key_by_epoch(&group_id, &sender_device_id, epoch)
+                        .await
+                })
                 .map_err(MessagingError::from)
         })
         .await
@@ -1610,10 +2278,90 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
     }
 }
 
+fn protocol_sender_key_distribution_message(
+    distribution: &jasmine_crypto::SenderKeyDistribution,
+) -> Result<ProtocolMessage> {
+    let payload = EncodedSenderKeyDistributionPayload {
+        key_id: distribution.key_id.to_string(),
+        encrypted_key_material: distribution.encrypted_key_material.clone(),
+    };
+    let sender_key_data = serde_json::to_string(&payload)
+        .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+
+    Ok(ProtocolMessage::SenderKeyDistribution {
+        group_id: distribution.group_id.clone(),
+        sender_key_data,
+        epoch: distribution.epoch,
+    })
+}
+
+fn parse_protocol_sender_key_distribution(
+    sender_id: &str,
+    group_id: String,
+    sender_key_data: String,
+    epoch: u32,
+) -> Result<jasmine_crypto::SenderKeyDistribution> {
+    let payload: EncodedSenderKeyDistributionPayload = serde_json::from_str(&sender_key_data)
+        .map_err(|error| {
+            MessagingError::Validation(format!("invalid sender key distribution payload: {error}"))
+        })?;
+
+    Ok(jasmine_crypto::SenderKeyDistribution {
+        group_id,
+        sender_id: sender_id.to_string(),
+        key_id: parse_uuid(&payload.key_id, "sender_key_distribution.key_id")?,
+        epoch,
+        encrypted_key_material: payload.encrypted_key_material,
+    })
+}
+
 fn parse_uuid(raw: &str, field: &str) -> Result<Uuid> {
     Uuid::parse_str(raw).map_err(|error| {
         MessagingError::Validation(format!("{field} must be a valid UUID: {error}"))
     })
+}
+
+fn sender_key_counter_key(group_id: &str, sender_key: &SenderKeyInfo) -> String {
+    format!("{group_id}:{}:{}", sender_key.key_id, sender_key.epoch,)
+}
+
+fn sender_key_material_array(sender_key: &SenderKeyInfo) -> Result<[u8; 32]> {
+    let actual = sender_key.key_data.len();
+    sender_key.key_data.as_slice().try_into().map_err(|_| {
+        MessagingError::Validation(format!(
+            "sender key {} material must be 32 bytes, got {actual}",
+            sender_key.key_id
+        ))
+    })
+}
+
+fn sender_key_from_info(sender_key: &SenderKeyInfo) -> Result<SenderKey> {
+    Ok(SenderKey {
+        key_id: sender_key.key_id,
+        epoch: sender_key.epoch,
+        key_material: sender_key_material_array(sender_key)?,
+        created_at: i64::try_from(sender_key.created_at).map_err(|_| {
+            MessagingError::Validation(format!(
+                "sender key {} created_at does not fit i64: {}",
+                sender_key.key_id, sender_key.created_at
+            ))
+        })?,
+    })
+}
+
+fn group_message_aad(group_id: &str, sender_id: &str, sender_key_id: &Uuid, epoch: u32) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        GROUP_MESSAGE_AAD_PREFIX.len() + group_id.len() + sender_id.len() + 16 + 7,
+    );
+    aad.extend_from_slice(GROUP_MESSAGE_AAD_PREFIX);
+    aad.push(0);
+    aad.extend_from_slice(group_id.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(sender_id.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(sender_key_id.as_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad
 }
 
 fn user_id_from_peer_id(peer_id: &str) -> Result<UserId> {
@@ -1682,6 +2430,24 @@ fn remove_members(existing: &[UserId], member_ids: Vec<String>) -> Result<Vec<Us
         .filter(|member_id| !removed.contains(&member_id.0.to_string()))
         .cloned()
         .collect())
+}
+
+fn added_members(previous: &[UserId], current: &[UserId]) -> Vec<String> {
+    let previous: HashSet<Uuid> = previous.iter().map(|member_id| member_id.0).collect();
+    current
+        .iter()
+        .filter(|member_id| !previous.contains(&member_id.0))
+        .map(|member_id| member_id.0.to_string())
+        .collect()
+}
+
+fn removed_members(previous: &[UserId], current: &[UserId]) -> Vec<String> {
+    let current: HashSet<Uuid> = current.iter().map(|member_id| member_id.0).collect();
+    previous
+        .iter()
+        .filter(|member_id| !current.contains(&member_id.0))
+        .map(|member_id| member_id.0.to_string())
+        .collect()
 }
 
 fn ensure_group_contains_peer(group: &GroupState, peer_id: &str) -> Result<()> {

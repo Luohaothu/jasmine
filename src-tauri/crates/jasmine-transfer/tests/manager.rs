@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use image::{DynamicImage, ImageFormat, ImageReader, Rgba, RgbaImage};
 use jasmine_core::{
-    AppSettings, ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, ProtocolMessage,
-    SettingsService, StorageEngine, TransferRecord, TransferStatus,
+    AppSettings, ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, PeerKeyInfo,
+    ProtocolMessage, ResumeInfo, SenderKeyInfo, SettingsService, StorageEngine, TransferRecord,
+    TransferStatus,
 };
 use jasmine_transfer::{
     FileOfferNotification, FileSenderError, FileSenderSignal, FolderTransferCoordinator,
     ManagedTransfer, ManagedTransferReceiver, ManagedTransferSender, TransferAggregateProgress,
     TransferDirection, TransferManager, TransferManagerError, TransferProgress,
-    TransferProgressReporter, THUMBNAIL_MAX_EDGE,
+    TransferProgressReporter, DEFAULT_CHUNK_SIZE, THUMBNAIL_MAX_EDGE,
 };
 use tempfile::tempdir;
 use tokio::sync::{oneshot, Notify};
@@ -28,6 +29,18 @@ fn device_id() -> DeviceId {
 
 fn chat_id() -> ChatId {
     ChatId(Uuid::new_v4())
+}
+
+fn test_file_key() -> [u8; 32] {
+    [0x31; 32]
+}
+
+fn test_nonce_prefix() -> [u8; 8] {
+    [0x7a; 8]
+}
+
+fn test_resume_token() -> String {
+    "mock-transfer-resume-token".to_string()
 }
 
 fn save_settings(settings: &SettingsService, max_concurrent_transfers: u8) {
@@ -148,6 +161,14 @@ impl FileSenderSignal for MockFolderSignal {
             .remove(response_id)
             .expect("folder response receiver for id");
         receiver.await.map_err(|_| FileSenderError::SignalClosed)
+    }
+
+    async fn file_crypto_material(
+        &self,
+        _peer_id: &DeviceId,
+        _file_id: &str,
+    ) -> Result<jasmine_transfer::FileCryptoMaterial, FileSenderError> {
+        Ok((test_file_key(), test_nonce_prefix()))
     }
 }
 
@@ -295,6 +316,14 @@ impl ManagedTransferSender for MockSender {
             }
         }
     }
+
+    async fn current_resume_token(
+        &self,
+        _peer_id: &DeviceId,
+        _file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError> {
+        Ok(Some(test_resume_token()))
+    }
 }
 
 #[derive(Clone)]
@@ -305,6 +334,7 @@ struct PendingOfferState {
 }
 
 type RejectedOffer = (String, Option<String>);
+type ResumeOffsetCall = (String, Option<u64>);
 
 #[derive(Clone)]
 struct MockReceiver {
@@ -312,6 +342,8 @@ struct MockReceiver {
     pending_offers: Arc<Mutex<HashMap<String, PendingOfferState>>>,
     completed_payloads: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     started: Arc<Mutex<Vec<String>>>,
+    resume_offsets: Arc<Mutex<Vec<ResumeOffsetCall>>>,
+    current_resume_token: Arc<Mutex<Option<String>>>,
     rejected: Arc<Mutex<Vec<RejectedOffer>>>,
     controls: Arc<Mutex<HashMap<String, Arc<WorkerControl>>>>,
     notify: Arc<Notify>,
@@ -324,6 +356,8 @@ impl MockReceiver {
             pending_offers: Arc::new(Mutex::new(HashMap::new())),
             completed_payloads: Arc::new(Mutex::new(HashMap::new())),
             started: Arc::new(Mutex::new(Vec::new())),
+            resume_offsets: Arc::new(Mutex::new(Vec::new())),
+            current_resume_token: Arc::new(Mutex::new(Some(test_resume_token()))),
             rejected: Arc::new(Mutex::new(Vec::new())),
             controls: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
@@ -353,11 +387,25 @@ impl MockReceiver {
             .clone()
     }
 
+    fn resume_offsets(&self) -> Vec<(String, Option<u64>)> {
+        self.resume_offsets
+            .lock()
+            .expect("lock receiver resume offsets")
+            .clone()
+    }
+
     fn set_completed_payload(&self, transfer_id: &str, payload: Vec<u8>) {
         self.completed_payloads
             .lock()
             .expect("lock receiver completed payloads")
             .insert(transfer_id.to_string(), payload);
+    }
+
+    fn set_current_resume_token(&self, token: Option<String>) {
+        *self
+            .current_resume_token
+            .lock()
+            .expect("lock receiver current resume token") = token;
     }
 
     fn complete(&self, transfer_id: &str) {
@@ -411,6 +459,7 @@ impl ManagedTransferReceiver for MockReceiver {
     async fn accept_offer(
         &self,
         offer_id: &str,
+        resume_offset: Option<u64>,
         cancellation: CancellationToken,
         progress: Option<Arc<dyn TransferProgressReporter>>,
     ) -> Result<PathBuf, TransferManagerError> {
@@ -427,6 +476,10 @@ impl ManagedTransferReceiver for MockReceiver {
             .lock()
             .expect("lock receiver controls")
             .insert(offer_id.to_string(), Arc::clone(&control));
+        self.resume_offsets
+            .lock()
+            .expect("lock receiver resume offsets")
+            .push((offer_id.to_string(), resume_offset));
         self.started
             .lock()
             .expect("lock receiver started")
@@ -469,6 +522,18 @@ impl ManagedTransferReceiver for MockReceiver {
                 Ok(final_path)
             }
         }
+    }
+
+    async fn current_resume_token(
+        &self,
+        _peer_id: &DeviceId,
+        _file_id: &str,
+    ) -> Result<Option<String>, TransferManagerError> {
+        Ok(self
+            .current_resume_token
+            .lock()
+            .expect("lock receiver current resume token")
+            .clone())
     }
 
     async fn reject_offer(
@@ -523,6 +588,13 @@ impl MockStorage {
             .get(transfer_id)
             .and_then(|transfer| transfer.thumbnail_path.clone())
     }
+
+    fn seed_transfer(&self, transfer: TransferRecord) {
+        self.transfers
+            .lock()
+            .expect("lock storage transfers")
+            .insert(transfer.id, transfer);
+    }
 }
 
 impl StorageEngine for MockStorage {
@@ -551,6 +623,82 @@ impl StorageEngine for MockStorage {
 
     async fn save_peer(&self, _peer: &PeerInfo) -> Result<(), CoreError> {
         Err(CoreError::NotImplemented("peers not used in manager tests"))
+    }
+
+    async fn save_peer_key(
+        &self,
+        _device_id: &str,
+        _public_key: &[u8],
+        _fingerprint: &str,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "peer keys not used in manager tests",
+        ))
+    }
+
+    async fn get_peer_key(&self, _device_id: &str) -> Result<Option<PeerKeyInfo>, CoreError> {
+        Err(CoreError::NotImplemented(
+            "peer keys not used in manager tests",
+        ))
+    }
+
+    async fn get_all_peer_keys(&self) -> Result<Vec<PeerKeyInfo>, CoreError> {
+        Err(CoreError::NotImplemented(
+            "peer keys not used in manager tests",
+        ))
+    }
+
+    async fn set_peer_verified(&self, _device_id: &str, _verified: bool) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "peer keys not used in manager tests",
+        ))
+    }
+
+    async fn update_peer_key_last_seen(&self, _device_id: &str) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "peer keys not used in manager tests",
+        ))
+    }
+
+    async fn save_sender_key(
+        &self,
+        _group_id: &str,
+        _sender_device_id: &str,
+        _key_id: &Uuid,
+        _key_data: &[u8],
+        _epoch: u32,
+        _created_at_ms: u64,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "sender keys not used in manager tests",
+        ))
+    }
+
+    async fn get_sender_key(
+        &self,
+        _group_id: &str,
+        _sender_device_id: &str,
+    ) -> Result<Option<SenderKeyInfo>, CoreError> {
+        Err(CoreError::NotImplemented(
+            "sender keys not used in manager tests",
+        ))
+    }
+
+    async fn get_sender_key_by_epoch(
+        &self,
+        _group_id: &str,
+        _sender_device_id: &str,
+        _epoch: u32,
+    ) -> Result<Option<SenderKeyInfo>, CoreError> {
+        Err(CoreError::NotImplemented(
+            "sender keys not used in manager tests",
+        ))
+    }
+
+    async fn delete_sender_keys_for_group(&self, _group_id: &str) -> Result<(), CoreError> {
+        Err(CoreError::NotImplemented(
+            "sender keys not used in manager tests",
+        ))
     }
 
     async fn update_message_status(
@@ -638,6 +786,38 @@ impl StorageEngine for MockStorage {
         Ok(self.thumbnail_path(&transfer_id))
     }
 
+    async fn update_bytes_transferred(
+        &self,
+        transfer_id: &str,
+        bytes: u64,
+    ) -> Result<(), CoreError> {
+        let transfer_id = Uuid::parse_str(transfer_id)
+            .map_err(|error| CoreError::Persistence(error.to_string()))?;
+        let mut transfers = self.transfers.lock().expect("lock storage transfers");
+        let transfer = transfers
+            .get_mut(&transfer_id)
+            .ok_or_else(|| CoreError::Persistence("missing transfer".to_string()))?;
+        transfer.bytes_transferred = bytes;
+        Ok(())
+    }
+
+    async fn get_transfer_resume_info(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<ResumeInfo>, CoreError> {
+        let transfer_id = Uuid::parse_str(transfer_id)
+            .map_err(|error| CoreError::Persistence(error.to_string()))?;
+        Ok(self
+            .transfers
+            .lock()
+            .expect("lock storage transfers")
+            .get(&transfer_id)
+            .map(|transfer| ResumeInfo {
+                bytes_transferred: transfer.bytes_transferred,
+                resume_token: transfer.resume_token.clone(),
+            }))
+    }
+
     async fn update_transfer_status(
         &self,
         transfer_id: &Uuid,
@@ -721,6 +901,269 @@ async fn wait_for_thumbnail_path(storage: &MockStorage, transfer_id: &Uuid) -> S
     })
     .await
     .expect("wait for thumbnail path timeout")
+}
+
+fn partial_path_for(download_dir: &Path, file_name: &str) -> PathBuf {
+    let mut partial_name = std::ffi::OsString::from(file_name);
+    partial_name.push(".jasmine-partial");
+    download_dir.join(partial_name)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_transfer_manager_persists_bytes_transferred_on_cancellation() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_settings(&settings, 1);
+
+    let sender = Arc::new(MockSender::default());
+    let receiver = Arc::new(MockReceiver::new(temp.path().join("downloads")));
+    let storage = Arc::new(MockStorage::default());
+    let manager = TransferManager::new(
+        Arc::clone(&sender),
+        Arc::clone(&receiver),
+        settings,
+        Arc::clone(&storage),
+    )
+    .expect("create transfer manager");
+
+    let transfer_id = manager
+        .send_file(
+            device_id(),
+            write_file(&temp.path().join("resume-source.bin"), 1024 * 1024),
+            None,
+        )
+        .await
+        .expect("queue resumable send");
+    sender.wait_started(&transfer_id).await;
+
+    manager
+        .cancel_transfer(&transfer_id)
+        .await
+        .expect("cancel active transfer");
+    wait_for_transfer_status(&manager, &transfer_id, TransferStatus::Cancelled).await;
+
+    let stored = storage
+        .transfer(&Uuid::parse_str(&transfer_id).expect("transfer uuid"))
+        .expect("stored cancelled transfer exists");
+    assert_eq!(stored.status, TransferStatus::Cancelled);
+    assert_eq!(stored.bytes_transferred, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_transfer_manager_reuses_stored_offset_for_matching_offer_id() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_settings(&settings, 1);
+
+    let sender = Arc::new(MockSender::default());
+    let receiver = Arc::new(MockReceiver::new(temp.path().join("downloads")));
+    let storage = Arc::new(MockStorage::default());
+    let manager = TransferManager::new(
+        Arc::clone(&sender),
+        Arc::clone(&receiver),
+        settings,
+        Arc::clone(&storage),
+    )
+    .expect("create transfer manager");
+    let offer_id = Uuid::new_v4().to_string();
+    let resume_offset = (2 * DEFAULT_CHUNK_SIZE) as u64;
+
+    std::fs::create_dir_all(temp.path().join("downloads")).expect("create download dir");
+    std::fs::write(
+        partial_path_for(&temp.path().join("downloads"), "resume.bin"),
+        vec![0x55; resume_offset as usize],
+    )
+    .expect("write resume partial");
+    storage.seed_transfer(TransferRecord {
+        id: Uuid::parse_str(&offer_id).expect("offer uuid"),
+        peer_id: device_id(),
+        chat_id: None,
+        file_name: "resume.bin".to_string(),
+        local_path: temp.path().join("downloads").join("resume.bin"),
+        status: TransferStatus::Cancelled,
+        thumbnail_path: None,
+        folder_id: None,
+        folder_relative_path: None,
+        bytes_transferred: resume_offset,
+        resume_token: Some(test_resume_token()),
+    });
+
+    manager
+        .handle_signal_message(
+            device_id(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            ProtocolMessage::FileOffer {
+                id: offer_id.clone(),
+                filename: "resume.bin".to_string(),
+                size: 4 * DEFAULT_CHUNK_SIZE as u64,
+                sha256: "ignored".to_string(),
+                transfer_port: 4045,
+            },
+        )
+        .await
+        .expect("handle resumable offer");
+
+    manager
+        .accept_offer(&offer_id, None)
+        .await
+        .expect("accept resumable offer");
+    receiver.wait_started(&offer_id).await;
+
+    assert!(receiver
+        .resume_offsets()
+        .contains(&(offer_id.clone(), Some(resume_offset))));
+    receiver.complete(&offer_id);
+    wait_for_transfer_status(&manager, &offer_id, TransferStatus::Completed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encrypted_resume_epoch_mismatch_manager_restarts_from_byte_zero() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_settings(&settings, 1);
+
+    let sender = Arc::new(MockSender::default());
+    let receiver = Arc::new(MockReceiver::new(temp.path().join("downloads")));
+    receiver.set_current_resume_token(Some("rotated-transfer-resume-token".to_string()));
+    let storage = Arc::new(MockStorage::default());
+    let manager = TransferManager::new(
+        Arc::clone(&sender),
+        Arc::clone(&receiver),
+        settings,
+        Arc::clone(&storage),
+    )
+    .expect("create transfer manager");
+    let offer_id = Uuid::new_v4().to_string();
+    let resume_offset = (2 * DEFAULT_CHUNK_SIZE) as u64;
+    let partial_path = partial_path_for(&temp.path().join("downloads"), "epoch.bin");
+
+    std::fs::create_dir_all(temp.path().join("downloads")).expect("create download dir");
+    std::fs::write(&partial_path, vec![0x44; resume_offset as usize])
+        .expect("write stale encrypted partial");
+    storage.seed_transfer(TransferRecord {
+        id: Uuid::parse_str(&offer_id).expect("offer uuid"),
+        peer_id: device_id(),
+        chat_id: None,
+        file_name: "epoch.bin".to_string(),
+        local_path: temp.path().join("downloads").join("epoch.bin"),
+        status: TransferStatus::Cancelled,
+        thumbnail_path: None,
+        folder_id: None,
+        folder_relative_path: None,
+        bytes_transferred: resume_offset,
+        resume_token: Some(test_resume_token()),
+    });
+
+    manager
+        .handle_signal_message(
+            device_id(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            ProtocolMessage::FileOffer {
+                id: offer_id.clone(),
+                filename: "epoch.bin".to_string(),
+                size: 4 * DEFAULT_CHUNK_SIZE as u64,
+                sha256: "ignored".to_string(),
+                transfer_port: 4047,
+            },
+        )
+        .await
+        .expect("handle resumable encrypted offer");
+
+    manager
+        .accept_offer(&offer_id, None)
+        .await
+        .expect("accept epoch-mismatched offer");
+    receiver.wait_started(&offer_id).await;
+
+    assert!(receiver
+        .resume_offsets()
+        .contains(&(offer_id.clone(), None)));
+    assert!(
+        !partial_path.exists(),
+        "epoch mismatch should clear the stale partial and restart from byte 0"
+    );
+    let stored = storage
+        .transfer(&Uuid::parse_str(&offer_id).expect("offer uuid"))
+        .expect("stored transfer exists");
+    assert!(
+        stored.bytes_transferred <= 1,
+        "restarted transfer should begin from byte 0 and only advance through the initial progress tick"
+    );
+    assert_eq!(
+        stored.resume_token,
+        Some("rotated-transfer-resume-token".to_string())
+    );
+
+    receiver.complete(&offer_id);
+    wait_for_transfer_status(&manager, &offer_id, TransferStatus::Completed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_fresh_transfer_manager_different_offer_id_starts_from_zero() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_settings(&settings, 1);
+
+    let sender = Arc::new(MockSender::default());
+    let receiver = Arc::new(MockReceiver::new(temp.path().join("downloads")));
+    let storage = Arc::new(MockStorage::default());
+    let manager = TransferManager::new(
+        Arc::clone(&sender),
+        Arc::clone(&receiver),
+        settings,
+        Arc::clone(&storage),
+    )
+    .expect("create transfer manager");
+    let old_offer_id = Uuid::new_v4().to_string();
+    let new_offer_id = Uuid::new_v4().to_string();
+    let resume_offset = DEFAULT_CHUNK_SIZE as u64;
+
+    std::fs::create_dir_all(temp.path().join("downloads")).expect("create download dir");
+    std::fs::write(
+        partial_path_for(&temp.path().join("downloads"), "fresh.bin"),
+        vec![0x22; resume_offset as usize],
+    )
+    .expect("write stale partial");
+    storage.seed_transfer(TransferRecord {
+        id: Uuid::parse_str(&old_offer_id).expect("old offer uuid"),
+        peer_id: device_id(),
+        chat_id: None,
+        file_name: "fresh.bin".to_string(),
+        local_path: temp.path().join("downloads").join("fresh.bin"),
+        status: TransferStatus::Cancelled,
+        thumbnail_path: None,
+        folder_id: None,
+        folder_relative_path: None,
+        bytes_transferred: resume_offset,
+        resume_token: None,
+    });
+
+    manager
+        .handle_signal_message(
+            device_id(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            ProtocolMessage::FileOffer {
+                id: new_offer_id.clone(),
+                filename: "fresh.bin".to_string(),
+                size: 2 * DEFAULT_CHUNK_SIZE as u64,
+                sha256: "ignored".to_string(),
+                transfer_port: 4046,
+            },
+        )
+        .await
+        .expect("handle fresh offer");
+
+    manager
+        .accept_offer(&new_offer_id, None)
+        .await
+        .expect("accept fresh offer");
+    receiver.wait_started(&new_offer_id).await;
+
+    assert!(receiver
+        .resume_offsets()
+        .contains(&(new_offer_id.clone(), None)));
+    receiver.complete(&new_offer_id);
+    wait_for_transfer_status(&manager, &new_offer_id, TransferStatus::Completed).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

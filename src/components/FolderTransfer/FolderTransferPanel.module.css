@@ -175,3 +175,29 @@
   padding: 2px 4px;
   font-size: 12px;
 }
+
+.itemActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.actionBtn {
+  background: transparent;
+  border: none;
+  color: var(--primary-color, #0066cc);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+.secondaryBtn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary, #666666);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+.secondaryBtn:disabled, .actionBtn:disabled, .cancelBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

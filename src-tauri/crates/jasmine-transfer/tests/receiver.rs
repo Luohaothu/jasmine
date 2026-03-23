@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -5,9 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jasmine_core::{AppSettings, DeviceId, ProtocolMessage, SettingsService};
+use jasmine_crypto::encrypt_chunk;
 use jasmine_transfer::{
     DiskSpaceChecker, FileOfferNotification, FileOfferNotifier, FileReceiver, FileReceiverConfig,
-    FileReceiverError, FileReceiverSignal, TransferProgress, TransferProgressReporter,
+    FileReceiverError, FileReceiverSignal, ManagedTransferReceiver, TransferProgress,
+    TransferProgressReporter, DEFAULT_CHUNK_SIZE,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -43,6 +46,89 @@ fn offer_message(
     }
 }
 
+fn test_file_key() -> [u8; 32] {
+    [0x31; 32]
+}
+
+fn test_nonce_prefix() -> [u8; 8] {
+    [0x7a; 8]
+}
+
+fn derived_crypto_material(file_id: &str) -> ([u8; 32], [u8; 8]) {
+    let mut file_key = [0u8; 32];
+    let mut file_key_hasher = Sha256::new();
+    file_key_hasher.update(b"receiver-test-file-key");
+    file_key_hasher.update(file_id.as_bytes());
+    file_key.copy_from_slice(&file_key_hasher.finalize());
+
+    let mut nonce_prefix = [0u8; 8];
+    let mut nonce_hasher = Sha256::new();
+    nonce_hasher.update(b"receiver-test-nonce-prefix");
+    nonce_hasher.update(file_id.as_bytes());
+    nonce_prefix.copy_from_slice(&nonce_hasher.finalize()[..8]);
+
+    (file_key, nonce_prefix)
+}
+
+fn receiver_config() -> FileReceiverConfig {
+    FileReceiverConfig {
+        file_key: Some(test_file_key()),
+        nonce_prefix: Some(test_nonce_prefix()),
+        ..FileReceiverConfig::default()
+    }
+}
+
+fn receiver_config_with_chunk_size(chunk_size: usize) -> FileReceiverConfig {
+    FileReceiverConfig {
+        chunk_size,
+        file_key: Some(test_file_key()),
+        nonce_prefix: Some(test_nonce_prefix()),
+    }
+}
+
+fn encrypt_transfer_stream(_offer_id: &str, plaintext: &[u8], chunk_size: usize) -> Vec<u8> {
+    encrypt_transfer_stream_from_offset(0, plaintext, chunk_size)
+}
+
+fn encrypt_transfer_stream_from_offset(
+    start_offset: u64,
+    plaintext: &[u8],
+    chunk_size: usize,
+) -> Vec<u8> {
+    let file_key = test_file_key();
+    let nonce_prefix = test_nonce_prefix();
+    let mut output = Vec::new();
+    let starting_chunk_index = start_offset / chunk_size as u64;
+
+    for (chunk_index, chunk) in plaintext.chunks(chunk_size).enumerate() {
+        let encrypted = encrypt_chunk(
+            &file_key,
+            &nonce_prefix,
+            (starting_chunk_index + chunk_index as u64) as u32,
+            chunk,
+        )
+        .expect("encrypt transfer chunk");
+        output.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
+        output.extend_from_slice(&encrypted);
+    }
+
+    output
+}
+
+fn first_encrypted_frame_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    4 + u32::from_be_bytes(bytes[..4].try_into().expect("chunk prefix")) as usize
+}
+
+fn tamper_first_encrypted_chunk(bytes: &mut [u8]) {
+    if bytes.len() > 4 {
+        bytes[4] ^= 0x01;
+    }
+}
+
 fn save_download_dir(settings: &SettingsService, download_dir: &Path) {
     settings
         .save(&AppSettings {
@@ -55,6 +141,8 @@ fn save_download_dir(settings: &SettingsService, download_dir: &Path) {
 #[derive(Clone, Default)]
 struct MockSignal {
     sent_messages: Arc<Mutex<Vec<(DeviceId, ProtocolMessage)>>>,
+    response_senders: Arc<Mutex<HashMap<String, oneshot::Sender<ProtocolMessage>>>>,
+    response_receivers: Arc<Mutex<HashMap<String, oneshot::Receiver<ProtocolMessage>>>>,
 }
 
 impl MockSignal {
@@ -64,6 +152,40 @@ impl MockSignal {
             .expect("lock sent messages")
             .clone()
     }
+
+    async fn wait_for_resume_request(&self, offer_id: &str) -> (DeviceId, u64) {
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some((peer_id, offset)) =
+                    self.snapshot()
+                        .into_iter()
+                        .find_map(|(peer_id, message)| match message {
+                            ProtocolMessage::FileResumeRequest {
+                                offer_id: actual_offer_id,
+                                offset,
+                            } if actual_offer_id == offer_id => Some((peer_id, offset)),
+                            _ => None,
+                        })
+                {
+                    return (peer_id, offset);
+                }
+
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("wait for resume request timeout")
+    }
+
+    fn respond(&self, offer_id: &str, response: ProtocolMessage) {
+        let sender = self
+            .response_senders
+            .lock()
+            .expect("lock response senders")
+            .remove(offer_id)
+            .expect("response sender for offer");
+        sender.send(response).expect("deliver mocked response");
+    }
 }
 
 impl FileReceiverSignal for MockSignal {
@@ -72,11 +194,46 @@ impl FileReceiverSignal for MockSignal {
         peer_id: &DeviceId,
         message: ProtocolMessage,
     ) -> Result<(), FileReceiverError> {
+        if let ProtocolMessage::FileResumeRequest { offer_id, .. } = &message {
+            let (tx, rx) = oneshot::channel();
+            self.response_senders
+                .lock()
+                .expect("lock response senders")
+                .insert(offer_id.clone(), tx);
+            self.response_receivers
+                .lock()
+                .expect("lock response receivers")
+                .insert(offer_id.clone(), rx);
+        }
+
         self.sent_messages
             .lock()
             .expect("lock sent messages")
             .push((peer_id.clone(), message));
         Ok(())
+    }
+
+    async fn wait_for_response(
+        &self,
+        offer_id: &str,
+    ) -> Result<ProtocolMessage, FileReceiverError> {
+        let receiver = self
+            .response_receivers
+            .lock()
+            .expect("lock response receivers")
+            .remove(offer_id)
+            .expect("response receiver for offer");
+        receiver
+            .await
+            .map_err(|_| FileReceiverError::Signal("response channel closed".to_string()))
+    }
+
+    async fn file_crypto_material(
+        &self,
+        _peer_id: &DeviceId,
+        file_id: &str,
+    ) -> Result<jasmine_transfer::FileCryptoMaterial, FileReceiverError> {
+        Ok(derived_crypto_material(file_id))
     }
 }
 
@@ -305,14 +462,19 @@ async fn receiver_offer_flow_waits_for_explicit_accept_and_uses_latest_settings_
     let receiver = Arc::new(FileReceiver::with_dependencies(
         signal.clone(),
         settings.clone(),
-        FileReceiverConfig::default(),
+        receiver_config(),
         Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
         Some(offers.clone()),
     ));
-    let sender = MockTcpSender::spawn(b"first payload".to_vec()).await;
     let sender_id = peer_id();
     let sender_addr = SocketAddr::from(([127, 0, 0, 1], 9735));
     let offer_id = Uuid::new_v4().to_string();
+    let sender = MockTcpSender::spawn(encrypt_transfer_stream(
+        &offer_id,
+        &b"first payload"[..],
+        DEFAULT_CHUNK_SIZE,
+    ))
+    .await;
 
     let first_offer = receiver
         .receive_offer(
@@ -322,7 +484,7 @@ async fn receiver_offer_flow_waits_for_explicit_accept_and_uses_latest_settings_
                 &offer_id,
                 "report.pdf",
                 13,
-                &sha256_hex(b"first payload"),
+                &sha256_hex(&b"first payload"[..]),
                 sender.port(),
             ),
         )
@@ -355,7 +517,7 @@ async fn receiver_offer_flow_waits_for_explicit_accept_and_uses_latest_settings_
                 &Uuid::new_v4().to_string(),
                 "other.txt",
                 4,
-                &sha256_hex(b"next"),
+                &sha256_hex(&b"next"[..]),
                 sender.port(),
             ),
         )
@@ -396,7 +558,7 @@ async fn receiver_reject_flow_sends_reject_without_allocating_resources() {
     let receiver = FileReceiver::with_dependencies(
         signal.clone(),
         settings,
-        FileReceiverConfig::default(),
+        receiver_config(),
         Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
         None,
     );
@@ -427,17 +589,23 @@ async fn receiver_reject_flow_sends_reject_without_allocating_resources() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn receiver_integrity_accepts_writes_partial_verifies_hash_and_reports_progress() {
+async fn encrypted_transfer_receiver_writes_partial_verifies_hash_and_reports_progress() {
     let temp = tempdir().expect("tempdir");
     let download_dir = temp.path().join("downloads");
     let settings = SettingsService::new(temp.path().join("app-data"));
     save_download_dir(&settings, &download_dir);
 
     let payload = vec![0x55; 128 * 1024];
-    let sender = MockTcpSender::spawn_paused(payload.clone(), 1024).await;
     let signal = MockSignal::default();
     let progress = Arc::new(ProgressCollector::default());
-    let config = FileReceiverConfig { chunk_size: 1024 };
+    let config = receiver_config_with_chunk_size(1024);
+    let offer_id = Uuid::new_v4().to_string();
+    let encrypted_payload = encrypt_transfer_stream(&offer_id, &payload, config.chunk_size);
+    let sender = MockTcpSender::spawn_paused(
+        encrypted_payload.clone(),
+        first_encrypted_frame_len(&encrypted_payload),
+    )
+    .await;
     let receiver = Arc::new(FileReceiver::with_dependencies(
         signal.clone(),
         settings,
@@ -446,7 +614,6 @@ async fn receiver_integrity_accepts_writes_partial_verifies_hash_and_reports_pro
         None,
     ));
     let sender_id = peer_id();
-    let offer_id = Uuid::new_v4().to_string();
 
     receiver
         .receive_offer(
@@ -518,6 +685,145 @@ async fn receiver_integrity_accepts_writes_partial_verifies_hash_and_reports_pro
     assert_accept_message(&messages[0], &sender_id, &offer_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encrypted_resume_roundtrip_receiver_completes_1mb_file_after_interrupted_midpoint() {
+    let temp = tempdir().expect("tempdir");
+    let download_dir = temp.path().join("downloads");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_download_dir(&settings, &download_dir);
+
+    let payload = vec![0x77; 1024 * 1024];
+    let resume_offset = (payload.len() / 2) as u64;
+    let offer_id = Uuid::new_v4().to_string();
+    let signal = MockSignal::default();
+    let receiver = FileReceiver::with_dependencies(
+        signal.clone(),
+        settings,
+        receiver_config(),
+        Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
+        None,
+    );
+    let sender_id = peer_id();
+
+    let initial_sender = MockTcpSender::spawn(encrypt_transfer_stream_from_offset(
+        0,
+        &payload[..resume_offset as usize],
+        DEFAULT_CHUNK_SIZE,
+    ))
+    .await;
+
+    receiver
+        .receive_offer(
+            sender_id.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            offer_message(
+                &offer_id,
+                "resume.bin",
+                payload.len() as u64,
+                &sha256_hex(&payload),
+                initial_sender.port(),
+            ),
+        )
+        .await
+        .expect("receive initial offer");
+
+    let first_error = receiver
+        .accept_offer(&offer_id, None)
+        .await
+        .expect_err("interrupted transfer should fail before completion");
+    initial_sender.join().await;
+    assert!(matches!(
+        first_error,
+        FileReceiverError::SizeMismatch { .. }
+    ));
+
+    let partial_path = download_dir.join("resume.bin.jasmine-partial");
+    assert!(
+        partial_path.exists(),
+        "interrupted transfer should keep partial for resume"
+    );
+    assert_eq!(
+        std::fs::metadata(&partial_path)
+            .expect("partial metadata after interruption")
+            .len(),
+        resume_offset,
+    );
+
+    let resumed_stream = encrypt_transfer_stream_from_offset(
+        resume_offset,
+        &payload[resume_offset as usize..],
+        DEFAULT_CHUNK_SIZE,
+    );
+    let restarted_stream = encrypt_transfer_stream_from_offset(
+        0,
+        &payload[resume_offset as usize..],
+        DEFAULT_CHUNK_SIZE,
+    );
+    assert_ne!(
+        &resumed_stream[..first_encrypted_frame_len(&resumed_stream)],
+        &restarted_stream[..first_encrypted_frame_len(&restarted_stream)],
+        "resumed encrypted stream should differ from a fresh restart because nonce continuity advances chunk indices",
+    );
+
+    let resumed_sender = MockTcpSender::spawn(resumed_stream).await;
+    receiver
+        .receive_offer(
+            sender_id.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            offer_message(
+                &offer_id,
+                "resume.bin",
+                payload.len() as u64,
+                &sha256_hex(&payload),
+                resumed_sender.port(),
+            ),
+        )
+        .await
+        .expect("receive resume offer");
+
+    let resume_task = tokio::spawn({
+        let receiver = receiver;
+        let offer_id = offer_id.clone();
+        async move {
+            receiver
+                .accept_offer_with_resume_offset(&offer_id, Some(resume_offset), None)
+                .await
+        }
+    });
+
+    let (resume_peer, requested_offset) = signal.wait_for_resume_request(&offer_id).await;
+    assert_eq!(resume_peer, sender_id);
+    assert_eq!(requested_offset, resume_offset);
+    signal.respond(
+        &offer_id,
+        ProtocolMessage::FileResumeAccept {
+            offer_id: offer_id.clone(),
+            offset: resume_offset,
+        },
+    );
+
+    let saved_path = resume_task
+        .await
+        .expect("resume task join")
+        .expect("resume transfer should complete");
+    resumed_sender.join().await;
+
+    assert_eq!(saved_path, download_dir.join("resume.bin"));
+    assert_eq!(
+        std::fs::read(&saved_path).expect("read resumed file"),
+        payload
+    );
+    assert_eq!(
+        sha256_hex(&std::fs::read(&saved_path).expect("read resumed file for sha")),
+        sha256_hex(&payload),
+        "resumed encrypted transfer must preserve final plaintext integrity",
+    );
+    assert!(
+        !partial_path.exists(),
+        "partial file should be renamed away on completion"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receiver_integrity_hash_mismatch_cleans_up_partial_file() {
     let temp = tempdir().expect("tempdir");
@@ -525,18 +831,22 @@ async fn receiver_integrity_hash_mismatch_cleans_up_partial_file() {
     let settings = SettingsService::new(temp.path().join("app-data"));
     save_download_dir(&settings, &download_dir);
 
-    let payload = b"actual payload".to_vec();
-    let sender = MockTcpSender::spawn(payload).await;
     let signal = MockSignal::default();
     let receiver = FileReceiver::with_dependencies(
         signal.clone(),
         settings,
-        FileReceiverConfig::default(),
+        receiver_config(),
         Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
         None,
     );
     let sender_id = peer_id();
     let offer_id = Uuid::new_v4().to_string();
+    let sender = MockTcpSender::spawn(encrypt_transfer_stream(
+        &offer_id,
+        &b"actual payload"[..],
+        DEFAULT_CHUNK_SIZE,
+    ))
+    .await;
 
     receiver
         .receive_offer(
@@ -546,7 +856,7 @@ async fn receiver_integrity_hash_mismatch_cleans_up_partial_file() {
                 &offer_id,
                 "broken.bin",
                 14,
-                &sha256_hex(b"expected data"),
+                &sha256_hex(&b"expected data"[..]),
                 sender.port(),
             ),
         )
@@ -581,15 +891,20 @@ async fn receiver_conflict_auto_renames_conflicting_targets() {
     let receiver = FileReceiver::with_dependencies(
         signal,
         settings,
-        FileReceiverConfig::default(),
+        receiver_config(),
         Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
         None,
     );
     let sender_id = peer_id();
 
-    let first_payload = b"first conflict".to_vec();
-    let first_sender = MockTcpSender::spawn(first_payload.clone()).await;
     let first_offer_id = Uuid::new_v4().to_string();
+    let first_payload = b"first conflict".to_vec();
+    let first_sender = MockTcpSender::spawn(encrypt_transfer_stream(
+        &first_offer_id,
+        &first_payload,
+        DEFAULT_CHUNK_SIZE,
+    ))
+    .await;
     receiver
         .receive_offer(
             sender_id.clone(),
@@ -610,9 +925,14 @@ async fn receiver_conflict_auto_renames_conflicting_targets() {
         .expect("accept first conflicting offer");
     first_sender.join().await;
 
-    let second_payload = b"second conflict".to_vec();
-    let second_sender = MockTcpSender::spawn(second_payload.clone()).await;
     let second_offer_id = Uuid::new_v4().to_string();
+    let second_payload = b"second conflict".to_vec();
+    let second_sender = MockTcpSender::spawn(encrypt_transfer_stream(
+        &second_offer_id,
+        &second_payload,
+        DEFAULT_CHUNK_SIZE,
+    ))
+    .await;
     receiver
         .receive_offer(
             sender_id,
@@ -663,7 +983,7 @@ async fn receiver_disk_full_warns_on_offer_and_rejects_on_accept() {
     let receiver = FileReceiver::with_dependencies(
         signal.clone(),
         settings,
-        FileReceiverConfig::default(),
+        receiver_config(),
         Arc::new(FixedDiskSpaceChecker::new(available_bytes)),
         Some(offers.clone()),
     );
@@ -712,4 +1032,82 @@ async fn receiver_disk_full_warns_on_offer_and_rejects_on_accept() {
         !download_dir.exists(),
         "disk-full path must not create temp files or directories"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_tamper_receiver_rejects_tampered_encrypted_chunk_and_cleans_partial() {
+    let temp = tempdir().expect("tempdir");
+    let download_dir = temp.path().join("downloads");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_download_dir(&settings, &download_dir);
+
+    let signal = MockSignal::default();
+    let receiver = FileReceiver::with_dependencies(
+        signal.clone(),
+        settings,
+        receiver_config(),
+        Arc::new(FixedDiskSpaceChecker::new(u64::MAX / 4)),
+        None,
+    );
+    let sender_id = peer_id();
+    let offer_id = Uuid::new_v4().to_string();
+    let payload = b"tampered encrypted payload".to_vec();
+    let mut encrypted_payload = encrypt_transfer_stream(&offer_id, &payload, DEFAULT_CHUNK_SIZE);
+    tamper_first_encrypted_chunk(&mut encrypted_payload);
+    let sender = MockTcpSender::spawn(encrypted_payload).await;
+
+    receiver
+        .receive_offer(
+            sender_id.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 9735)),
+            offer_message(
+                &offer_id,
+                "tampered.bin",
+                payload.len() as u64,
+                &sha256_hex(&payload),
+                sender.port(),
+            ),
+        )
+        .await
+        .expect("receive tampered offer");
+
+    let error = receiver
+        .accept_offer(&offer_id, None)
+        .await
+        .expect_err("tampered chunk must fail decryption");
+    sender.join().await;
+
+    assert!(matches!(error, FileReceiverError::Crypto(_)));
+    assert!(!download_dir.join("tampered.bin").exists());
+    assert!(!download_dir.join("tampered.bin.jasmine-partial").exists());
+
+    let messages = signal.snapshot();
+    assert_eq!(messages.len(), 1);
+    assert_accept_message(&messages[0], &sender_id, &offer_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_resume_token_uses_offer_specific_crypto_material() {
+    let temp = tempdir().expect("tempdir");
+    let settings = SettingsService::new(temp.path().join("app-data"));
+    save_download_dir(&settings, &temp.path().join("downloads"));
+    let receiver = FileReceiver::new(MockSignal::default(), settings);
+    let peer = peer_id();
+
+    let first = ManagedTransferReceiver::current_resume_token(&receiver, &peer, "offer-alpha")
+        .await
+        .expect("first token")
+        .expect("resume token should be present");
+    let first_again =
+        ManagedTransferReceiver::current_resume_token(&receiver, &peer, "offer-alpha")
+            .await
+            .expect("first token repeat")
+            .expect("resume token should be present");
+    let second = ManagedTransferReceiver::current_resume_token(&receiver, &peer, "offer-beta")
+        .await
+        .expect("second token")
+        .expect("resume token should be present");
+
+    assert_eq!(first, first_again);
+    assert_ne!(first, second);
 }

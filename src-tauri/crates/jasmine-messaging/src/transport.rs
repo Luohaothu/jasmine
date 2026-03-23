@@ -1,8 +1,14 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::stream::SplitSink;
 use futures_util::{Sink, SinkExt, StreamExt};
-use jasmine_core::ProtocolMessage;
+use jasmine_core::{ProtocolMessage, StorageEngine, CURRENT_PROTOCOL_VERSION};
+use jasmine_crypto::{
+    fingerprint, public_key_from_base64, public_key_to_base64, EncryptedFrame, PublicKey, Session,
+    SessionKeyManager, StaticSecret,
+};
+use jasmine_storage::SqliteStorage;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Instant};
@@ -13,51 +19,157 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::{MessagingError, Result, WsDisconnectReason, WsPeerConnection, WsPeerIdentity};
 
+const ENCRYPTED_PROTOCOL_FRAME_TYPE: u32 = 0x01;
+const TRANSPORT_FRAME_TYPE_LEN: usize = 4;
+const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION_INCOMPATIBLE_CLOSE_REASON: &str = "protocol version incompatible";
+
 pub(crate) enum ConnectionCommand {
     Send(ProtocolMessage),
     Close,
 }
 
+pub(crate) struct HandshakeOutcome {
+    pub peer: WsPeerConnection,
+    pub session: Session,
+}
+
 pub(crate) async fn perform_client_handshake<S>(
     socket: &mut WebSocketStream<S>,
     local_peer: &WsPeerIdentity,
+    local_private_key: Option<&[u8]>,
+    peer_key_store: Option<&SqliteStorage>,
     remote_address: String,
     handshake_timeout: Duration,
-) -> Result<WsPeerConnection>
+) -> Result<HandshakeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    send_protocol_message(socket, &local_peer.to_protocol_message()).await?;
-    let message = read_handshake_message(socket, handshake_timeout).await?;
-    let identity = WsPeerIdentity::from_protocol_message(message)?;
+    let local_secret = validate_local_transport_identity(local_peer, local_private_key)?;
 
-    Ok(WsPeerConnection {
-        identity,
-        address: remote_address,
+    send_protocol_message(socket, &local_peer.to_protocol_message()).await?;
+    let message = read_handshake_message(socket, handshake_timeout, "PeerInfo").await?;
+    let (identity, peer_public_key) = match parse_handshake_peer_info(message) {
+        Ok(value) => value,
+        Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
+    };
+
+    ensure_remote_protocol_version_compatible(
+        socket,
+        local_peer.protocol_version,
+        identity.protocol_version,
+    )
+    .await?;
+
+    if let Err(error) = persist_peer_key(peer_key_store, &identity, &peer_public_key).await {
+        return fail_handshake(socket, &error.to_string(), error).await;
+    }
+
+    let (our_ephemeral_public, pending) =
+        SessionKeyManager::initiate_key_exchange(&local_secret, &peer_public_key);
+    send_protocol_message(
+        socket,
+        &ProtocolMessage::KeyExchangeInit {
+            ephemeral_public_key: public_key_to_base64(&our_ephemeral_public),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+
+    let message = read_handshake_message(socket, handshake_timeout, "KeyExchangeResponse").await?;
+    let peer_ephemeral_key = match parse_key_exchange_response(message) {
+        Ok(value) => value,
+        Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
+    };
+
+    let session =
+        match SessionKeyManager::complete_key_exchange_initiator(pending, &peer_ephemeral_key) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = MessagingError::Validation(error.to_string());
+                return fail_handshake(socket, &error.to_string(), error).await;
+            }
+        };
+
+    Ok(HandshakeOutcome {
+        peer: WsPeerConnection {
+            identity,
+            address: remote_address,
+        },
+        session,
     })
 }
 
 pub(crate) async fn perform_server_handshake<S>(
     socket: &mut WebSocketStream<S>,
     local_peer: &WsPeerIdentity,
+    local_private_key: Option<&[u8]>,
+    peer_key_store: Option<&SqliteStorage>,
     remote_address: String,
     handshake_timeout: Duration,
-) -> Result<WsPeerConnection>
+) -> Result<HandshakeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let message = read_handshake_message(socket, handshake_timeout).await?;
-    let identity = WsPeerIdentity::from_protocol_message(message)?;
+    let local_secret = validate_local_transport_identity(local_peer, local_private_key)?;
+
+    let message = read_handshake_message(socket, handshake_timeout, "PeerInfo").await?;
+    let (identity, peer_public_key) = match parse_handshake_peer_info(message) {
+        Ok(value) => value,
+        Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
+    };
+
+    ensure_remote_protocol_version_compatible(
+        socket,
+        local_peer.protocol_version,
+        identity.protocol_version,
+    )
+    .await?;
+
+    if let Err(error) = persist_peer_key(peer_key_store, &identity, &peer_public_key).await {
+        return fail_handshake(socket, &error.to_string(), error).await;
+    }
+
     send_protocol_message(socket, &local_peer.to_protocol_message()).await?;
 
-    Ok(WsPeerConnection {
-        identity,
-        address: remote_address,
+    let message = read_handshake_message(socket, handshake_timeout, "KeyExchangeInit").await?;
+    let peer_ephemeral_key = match parse_key_exchange_init(message, local_peer.protocol_version) {
+        Ok(value) => value,
+        Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
+    };
+
+    let (our_ephemeral_public, session) = match SessionKeyManager::accept_key_exchange(
+        &local_secret,
+        &peer_public_key,
+        &peer_ephemeral_key,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let error = MessagingError::Validation(error.to_string());
+            return fail_handshake(socket, &error.to_string(), error).await;
+        }
+    };
+
+    send_protocol_message(
+        socket,
+        &ProtocolMessage::KeyExchangeResponse {
+            ephemeral_public_key: public_key_to_base64(&our_ephemeral_public),
+        },
+    )
+    .await?;
+
+    Ok(HandshakeOutcome {
+        peer: WsPeerConnection {
+            identity,
+            address: remote_address,
+        },
+        session,
     })
 }
 
 pub(crate) async fn run_connection_loop<S, F>(
     socket: WebSocketStream<S>,
+    session: Arc<Mutex<Session>>,
     heartbeat_interval: Duration,
     max_missed_heartbeats: u32,
     mut command_rx: mpsc::Receiver<ConnectionCommand>,
@@ -84,7 +196,7 @@ where
             command = command_rx.recv() => {
                 match command {
                     Some(ConnectionCommand::Send(message)) => {
-                        if let Err(error) = send_protocol_message_sink(&mut writer, &message).await {
+                        if let Err(error) = send_encrypted_protocol_message_sink(&mut writer, &session, &message).await {
                             return error_to_disconnect_reason(error);
                         }
                     }
@@ -100,12 +212,12 @@ where
                     return WsDisconnectReason::HeartbeatTimedOut;
                 }
 
-                if let Err(error) = send_protocol_message_sink(&mut writer, &ProtocolMessage::Ping).await {
+                if let Err(error) = send_encrypted_protocol_message_sink(&mut writer, &session, &ProtocolMessage::Ping).await {
                     return error_to_disconnect_reason(error);
                 }
             }
             incoming = reader.next() => {
-                match handle_incoming_message(&mut writer, &mut last_seen, incoming, &mut on_message).await {
+                match handle_incoming_message(&mut writer, &session, &mut last_seen, incoming, &mut on_message).await {
                     Some(reason) => return reason,
                     None => continue,
                 }
@@ -116,6 +228,7 @@ where
 
 async fn handle_incoming_message<W, F>(
     writer: &mut SplitSink<WebSocketStream<W>, Message>,
+    session: &Arc<Mutex<Session>>,
     last_seen: &mut Instant,
     incoming: Option<std::result::Result<Message, TungsteniteError>>,
     on_message: &mut F,
@@ -125,46 +238,48 @@ where
     F: FnMut(ProtocolMessage) + Send,
 {
     match incoming {
-        Some(Ok(Message::Text(payload))) => {
+        Some(Ok(Message::Text(_payload))) => {
             *last_seen = Instant::now();
-            match ProtocolMessage::from_json(payload.as_str()) {
-                Ok(ProtocolMessage::Ping) => {
-                    if let Err(error) =
-                        send_protocol_message_sink(writer, &ProtocolMessage::Pong).await
-                    {
-                        return Some(error_to_disconnect_reason(error));
-                    }
-                }
-                Ok(ProtocolMessage::Pong) => {}
-                Ok(message) => on_message(message),
-                Err(_) => {
-                    let _ = close_socket(writer, CloseCode::Policy, "invalid protocol json").await;
-                    return Some(WsDisconnectReason::ProtocolViolation);
-                }
-            }
+            let _ = close_socket(
+                writer,
+                CloseCode::Policy,
+                "unexpected plaintext message after handshake",
+            )
+            .await;
+            return Some(WsDisconnectReason::ProtocolViolation);
         }
         Some(Ok(Message::Binary(payload))) => {
             *last_seen = Instant::now();
-            let text = match std::str::from_utf8(payload.as_ref()) {
-                Ok(text) => text,
-                Err(_) => {
-                    let _ = close_socket(writer, CloseCode::Policy, "invalid utf8 payload").await;
-                    return Some(WsDisconnectReason::ProtocolViolation);
-                }
-            };
-
-            match ProtocolMessage::from_json(text) {
+            match decrypt_protocol_message(session, payload.as_ref()) {
                 Ok(ProtocolMessage::Ping) => {
-                    if let Err(error) =
-                        send_protocol_message_sink(writer, &ProtocolMessage::Pong).await
+                    if let Err(error) = send_encrypted_protocol_message_sink(
+                        writer,
+                        session,
+                        &ProtocolMessage::Pong,
+                    )
+                    .await
                     {
                         return Some(error_to_disconnect_reason(error));
                     }
                 }
                 Ok(ProtocolMessage::Pong) => {}
+                Ok(ProtocolMessage::VersionIncompatible { .. }) => {
+                    let _ = close_socket(
+                        writer,
+                        CloseCode::Policy,
+                        PROTOCOL_VERSION_INCOMPATIBLE_CLOSE_REASON,
+                    )
+                    .await;
+                    return Some(WsDisconnectReason::ProtocolVersionIncompatible);
+                }
+                Ok(message) if is_handshake_message(&message) => {
+                    let _ = close_socket(writer, CloseCode::Policy, "unexpected handshake message")
+                        .await;
+                    return Some(WsDisconnectReason::ProtocolViolation);
+                }
                 Ok(message) => on_message(message),
-                Err(_) => {
-                    let _ = close_socket(writer, CloseCode::Policy, "invalid protocol json").await;
+                Err(error) => {
+                    let _ = close_socket(writer, CloseCode::Policy, &error.to_string()).await;
                     return Some(WsDisconnectReason::ProtocolViolation);
                 }
             }
@@ -181,7 +296,7 @@ where
         Some(Ok(Message::Close(_))) => {
             return Some(WsDisconnectReason::LocalClosed);
         }
-        None => {
+        std::option::Option::None => {
             return Some(WsDisconnectReason::RemoteClosed);
         }
         Some(Ok(Message::Frame(_))) => {}
@@ -193,37 +308,339 @@ where
     None
 }
 
+fn is_handshake_message(message: &ProtocolMessage) -> bool {
+    matches!(
+        message,
+        ProtocolMessage::PeerInfo { .. }
+            | ProtocolMessage::KeyExchangeInit { .. }
+            | ProtocolMessage::KeyExchangeResponse { .. }
+            | ProtocolMessage::VersionIncompatible { .. }
+    )
+}
+
+fn validate_local_transport_identity(
+    local_peer: &WsPeerIdentity,
+    local_private_key: Option<&[u8]>,
+) -> Result<StaticSecret> {
+    if local_peer.public_key.trim().is_empty() {
+        return Err(MessagingError::Validation(
+            "local websocket identity must advertise a public key".to_string(),
+        ));
+    }
+
+    if local_peer.protocol_version != CURRENT_PROTOCOL_VERSION {
+        return Err(MessagingError::Validation(format!(
+            "local websocket protocol version must be {}, got {}",
+            CURRENT_PROTOCOL_VERSION, local_peer.protocol_version
+        )));
+    }
+
+    let Some(local_private_key) = local_private_key else {
+        return Err(MessagingError::Validation(
+            "local websocket private key is required for key exchange".to_string(),
+        ));
+    };
+
+    let actual = local_private_key.len();
+    let local_private_key: [u8; 32] = local_private_key.try_into().map_err(|_| {
+        MessagingError::Validation(format!(
+            "local websocket private key must be 32 bytes, got {actual}"
+        ))
+    })?;
+
+    let local_secret = StaticSecret::from(local_private_key);
+    let expected_public_key = public_key_to_base64(&PublicKey::from(&local_secret));
+    if expected_public_key != local_peer.public_key {
+        return Err(MessagingError::Validation(
+            "local websocket private key does not match advertised public key".to_string(),
+        ));
+    }
+
+    Ok(local_secret)
+}
+
+fn parse_handshake_peer_info(message: ProtocolMessage) -> Result<(WsPeerIdentity, PublicKey)> {
+    match message {
+        ProtocolMessage::PeerInfo {
+            device_id,
+            display_name,
+            avatar_hash,
+            public_key,
+            protocol_version,
+        } => {
+            if device_id.trim().is_empty() {
+                return Err(MessagingError::Protocol(
+                    "peer info device_id must not be empty".to_string(),
+                ));
+            }
+
+            if display_name.trim().is_empty() {
+                return Err(MessagingError::Protocol(
+                    "peer info display_name must not be empty".to_string(),
+                ));
+            }
+
+            let public_key = public_key.ok_or_else(|| {
+                MessagingError::Protocol(
+                    "peer info missing public_key; peer does not support key exchange".to_string(),
+                )
+            })?;
+            if public_key.trim().is_empty() {
+                return Err(MessagingError::Protocol(
+                    "peer info public_key must not be empty".to_string(),
+                ));
+            }
+
+            let protocol_version = protocol_version.ok_or_else(|| {
+                MessagingError::Protocol(
+                    "peer info missing protocol_version; peer does not support key exchange"
+                        .to_string(),
+                )
+            })?;
+
+            let public_key_value = decode_public_key(&public_key, "peer info public_key")?;
+            let identity = WsPeerIdentity::from_protocol_message(ProtocolMessage::PeerInfo {
+                device_id,
+                display_name,
+                avatar_hash,
+                public_key: Some(public_key),
+                protocol_version: Some(protocol_version),
+            })?;
+
+            Ok((identity, public_key_value))
+        }
+        other => Err(MessagingError::Protocol(format!(
+            "expected PeerInfo, got {other:?}"
+        ))),
+    }
+}
+
+async fn ensure_remote_protocol_version_compatible<S>(
+    socket: &mut WebSocketStream<S>,
+    local_protocol_version: u32,
+    remote_protocol_version: u32,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if remote_protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION {
+        return reject_protocol_version_incompatible(
+            socket,
+            local_protocol_version,
+            remote_protocol_version,
+        )
+        .await;
+    }
+
+    if let Err(error) = validate_protocol_version(remote_protocol_version, local_protocol_version) {
+        return fail_handshake(socket, &error.to_string(), error).await;
+    }
+
+    Ok(())
+}
+
+fn parse_key_exchange_init(
+    message: ProtocolMessage,
+    local_protocol_version: u32,
+) -> Result<PublicKey> {
+    match message {
+        ProtocolMessage::KeyExchangeInit {
+            ephemeral_public_key,
+            protocol_version,
+        } => {
+            validate_protocol_version(protocol_version, local_protocol_version)?;
+            decode_public_key(
+                &ephemeral_public_key,
+                "key exchange init ephemeral_public_key",
+            )
+        }
+        other => Err(MessagingError::Protocol(format!(
+            "expected KeyExchangeInit, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_key_exchange_response(message: ProtocolMessage) -> Result<PublicKey> {
+    match message {
+        ProtocolMessage::KeyExchangeResponse {
+            ephemeral_public_key,
+        } => decode_public_key(
+            &ephemeral_public_key,
+            "key exchange response ephemeral_public_key",
+        ),
+        other => Err(MessagingError::Protocol(format!(
+            "expected KeyExchangeResponse, got {other:?}"
+        ))),
+    }
+}
+
+fn validate_protocol_version(protocol_version: u32, local_protocol_version: u32) -> Result<()> {
+    if protocol_version != CURRENT_PROTOCOL_VERSION {
+        return Err(MessagingError::Protocol(format!(
+            "unsupported protocol version, expected {}, got {}",
+            CURRENT_PROTOCOL_VERSION, protocol_version
+        )));
+    }
+
+    if protocol_version != local_protocol_version {
+        return Err(MessagingError::Protocol(format!(
+            "protocol version mismatch, expected {}, got {}",
+            local_protocol_version, protocol_version
+        )));
+    }
+
+    Ok(())
+}
+
+async fn reject_protocol_version_incompatible<S, T>(
+    socket: &mut WebSocketStream<S>,
+    local_version: u32,
+    remote_version: u32,
+) -> Result<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let message = format!(
+        "peer protocol version {remote_version} is incompatible; minimum supported version is {MIN_SUPPORTED_PROTOCOL_VERSION}"
+    );
+    let _ = send_protocol_message(
+        socket,
+        &ProtocolMessage::VersionIncompatible {
+            local_version,
+            remote_version,
+            message: message.clone(),
+        },
+    )
+    .await;
+    let _ = close_socket(
+        socket,
+        CloseCode::Policy,
+        PROTOCOL_VERSION_INCOMPATIBLE_CLOSE_REASON,
+    )
+    .await;
+    Err(MessagingError::ProtocolVersionIncompatible {
+        local_version,
+        remote_version,
+        message,
+    })
+}
+
+fn decode_public_key(encoded: &str, label: &str) -> Result<PublicKey> {
+    public_key_from_base64(encoded)
+        .map_err(|error| MessagingError::Validation(format!("invalid {label}: {error}")))
+}
+
+async fn persist_peer_key(
+    peer_key_store: Option<&SqliteStorage>,
+    peer: &WsPeerIdentity,
+    public_key: &PublicKey,
+) -> Result<()> {
+    let Some(peer_key_store) = peer_key_store else {
+        return Ok(());
+    };
+
+    let public_key_bytes = public_key.to_bytes();
+    let stored = peer_key_store
+        .get_peer_key(&peer.device_id)
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))?;
+
+    if let Some(stored) = stored {
+        if stored.public_key.as_slice() != public_key_bytes.as_slice() {
+            return Err(MessagingError::Validation(format!(
+                "peer public key mismatch for {}",
+                peer.device_id
+            )));
+        }
+
+        peer_key_store
+            .update_peer_key_last_seen(&peer.device_id)
+            .await
+            .map_err(|error| MessagingError::Storage(error.to_string()))?;
+        return Ok(());
+    }
+
+    peer_key_store
+        .save_peer_key(&peer.device_id, &public_key_bytes, &fingerprint(public_key))
+        .await
+        .map_err(|error| MessagingError::Storage(error.to_string()))
+}
+
+async fn fail_handshake<S, T>(
+    socket: &mut WebSocketStream<S>,
+    reason: &str,
+    error: MessagingError,
+) -> Result<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _ = close_socket(socket, CloseCode::Policy, reason).await;
+    Err(error)
+}
+
 async fn read_handshake_message<S>(
     socket: &mut WebSocketStream<S>,
     handshake_timeout: Duration,
+    expected_message: &str,
 ) -> Result<ProtocolMessage>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let incoming = time::timeout(handshake_timeout, socket.next())
-        .await
-        .map_err(|_| MessagingError::Protocol("peer handshake timed out".to_string()))?;
+    let incoming = match time::timeout(handshake_timeout, socket.next()).await {
+        Ok(value) => value,
+        Err(_) => {
+            let reason = format!("{expected_message} timed out");
+            let _ = close_socket(socket, CloseCode::Policy, &reason).await;
+            return Err(MessagingError::Protocol(reason));
+        }
+    };
 
     match incoming {
-        Some(Ok(Message::Text(payload))) => ProtocolMessage::from_json(payload.as_str())
-            .map_err(|error| MessagingError::Protocol(error.to_string())),
+        Some(Ok(Message::Text(payload))) => {
+            parse_handshake_protocol_message(payload.as_str(), expected_message)
+        }
         Some(Ok(Message::Binary(payload))) => {
             let text = std::str::from_utf8(payload.as_ref()).map_err(|_| {
-                MessagingError::Protocol("peer handshake payload must be utf-8 json".to_string())
+                MessagingError::Protocol(format!("{expected_message} payload must be utf-8 json"))
             })?;
-            ProtocolMessage::from_json(text)
-                .map_err(|error| MessagingError::Protocol(error.to_string()))
+            parse_handshake_protocol_message(text, expected_message)
         }
+        Some(Ok(Message::Close(frame))) => Err(MessagingError::Protocol(
+            frame
+                .as_ref()
+                .map(|frame| frame.reason.to_string())
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| format!("connection closed during {expected_message}")),
+        )),
         Some(Ok(_)) => {
-            let _ = close_socket(socket, CloseCode::Policy, "first message must be PeerInfo").await;
-            Err(MessagingError::Protocol(
-                "first message must be PeerInfo".to_string(),
-            ))
+            let reason = format!("expected {expected_message} during handshake");
+            let _ = close_socket(socket, CloseCode::Policy, &reason).await;
+            Err(MessagingError::Protocol(reason))
         }
         Some(Err(error)) => Err(MessagingError::Transport(error.to_string())),
-        None => Err(MessagingError::Transport(
-            "connection closed before peer authentication".to_string(),
-        )),
+        std::option::Option::None => Err(MessagingError::Transport(format!(
+            "connection closed before {expected_message}"
+        ))),
+    }
+}
+
+fn parse_handshake_protocol_message(
+    payload: &str,
+    expected_message: &str,
+) -> Result<ProtocolMessage> {
+    match ProtocolMessage::from_json(payload).map_err(|error| {
+        MessagingError::Protocol(format!("invalid {expected_message} json: {error}"))
+    })? {
+        ProtocolMessage::VersionIncompatible {
+            local_version,
+            remote_version,
+            message,
+        } => Err(MessagingError::ProtocolVersionIncompatible {
+            local_version,
+            remote_version,
+            message,
+        }),
+        message => Ok(message),
     }
 }
 
@@ -249,8 +666,9 @@ where
         .map_err(|error| MessagingError::Transport(error.to_string()))
 }
 
-async fn send_protocol_message_sink<W>(
+async fn send_encrypted_protocol_message_sink<W>(
     writer: &mut SplitSink<WebSocketStream<W>, Message>,
+    session: &Arc<Mutex<Session>>,
     message: &ProtocolMessage,
 ) -> Result<()>
 where
@@ -259,10 +677,62 @@ where
     let payload = message
         .to_json()
         .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+    let frame_bytes = encrypt_protocol_message(session, payload.as_bytes())?;
     writer
-        .send(Message::Text(payload.into()))
+        .send(Message::Binary(frame_bytes.into()))
         .await
         .map_err(|error| MessagingError::Transport(error.to_string()))
+}
+
+fn encrypt_protocol_message(session: &Arc<Mutex<Session>>, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let frame = session
+        .lock()
+        .expect("lock websocket session for encrypt")
+        .encrypt_message(plaintext)
+        .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+    let frame_bytes = frame.to_bytes();
+    let mut output = Vec::with_capacity(TRANSPORT_FRAME_TYPE_LEN + frame_bytes.len());
+    output.extend_from_slice(&ENCRYPTED_PROTOCOL_FRAME_TYPE.to_be_bytes());
+    output.extend_from_slice(&frame_bytes);
+    Ok(output)
+}
+
+fn decrypt_protocol_message(
+    session: &Arc<Mutex<Session>>,
+    payload: &[u8],
+) -> Result<ProtocolMessage> {
+    let frame_payload = parse_encrypted_protocol_frame(payload)?;
+    let frame = EncryptedFrame::from_bytes(frame_payload)
+        .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+    let plaintext = session
+        .lock()
+        .expect("lock websocket session for decrypt")
+        .decrypt_message(&frame)
+        .map_err(|error| MessagingError::Protocol(error.to_string()))?;
+    let text = std::str::from_utf8(&plaintext).map_err(|_| {
+        MessagingError::Protocol("decrypted payload must be utf-8 json".to_string())
+    })?;
+    ProtocolMessage::from_json(text).map_err(|error| {
+        MessagingError::Protocol(format!("invalid decrypted protocol json: {error}"))
+    })
+}
+
+fn parse_encrypted_protocol_frame(payload: &[u8]) -> Result<&[u8]> {
+    if payload.len() < TRANSPORT_FRAME_TYPE_LEN {
+        return Err(MessagingError::Protocol(format!(
+            "encrypted transport frame missing type prefix: {} bytes",
+            payload.len()
+        )));
+    }
+
+    let frame_type = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if frame_type != ENCRYPTED_PROTOCOL_FRAME_TYPE {
+        return Err(MessagingError::Protocol(format!(
+            "unexpected encrypted transport frame type: {frame_type:#010x}"
+        )));
+    }
+
+    Ok(&payload[TRANSPORT_FRAME_TYPE_LEN..])
 }
 
 async fn close_socket<W>(
@@ -283,6 +753,9 @@ where
 
 fn error_to_disconnect_reason(error: MessagingError) -> WsDisconnectReason {
     match error {
+        MessagingError::ProtocolVersionIncompatible { .. } => {
+            WsDisconnectReason::ProtocolVersionIncompatible
+        }
         MessagingError::Protocol(_) => WsDisconnectReason::ProtocolViolation,
         MessagingError::Validation(_) => WsDisconnectReason::ProtocolViolation,
         MessagingError::Transport(message) => {
@@ -299,4 +772,22 @@ fn error_to_disconnect_reason(error: MessagingError) -> WsDisconnectReason {
 
 fn transport_error_to_disconnect_reason(error: TungsteniteError) -> WsDisconnectReason {
     error_to_disconnect_reason(MessagingError::Transport(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_to_disconnect_reason;
+    use crate::{MessagingError, WsDisconnectReason};
+
+    #[test]
+    fn protocol_version_incompatible_maps_to_dedicated_disconnect_reason() {
+        let reason = error_to_disconnect_reason(MessagingError::ProtocolVersionIncompatible {
+            local_version: 2,
+            remote_version: 1,
+            message: "peer protocol version 1 is incompatible; minimum supported version is 2"
+                .to_string(),
+        });
+
+        assert_eq!(reason, WsDisconnectReason::ProtocolVersionIncompatible);
+    }
 }

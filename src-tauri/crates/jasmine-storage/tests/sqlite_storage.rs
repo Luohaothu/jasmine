@@ -13,9 +13,10 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 const V1_MIGRATION_SQL: &str = include_str!("../migrations/V1__initial.sql");
+const V2_MIGRATION_SQL: &str = include_str!("../migrations/V2__edit_delete_richtext.sql");
 
 #[test]
-fn migration_creates_database_and_records_v2_schema() {
+fn migration_creates_database_and_records_v5_schema() {
     let (_temp_dir, db_path) = temp_db_path("create");
 
     let _storage = SqliteStorage::open(&db_path).expect("storage opens");
@@ -32,12 +33,16 @@ fn migration_creates_database_and_records_v2_schema() {
             "chat_members",
             "peers",
             "transfers",
+            "transfer_context",
+            "peer_keys",
+            "sender_keys",
+            "folder_file_status",
         ],
     );
 
     let versions = applied_versions(&conn);
-    assert_eq!(versions, vec![1, 2]);
-    assert_eq!(user_version(&conn), 2);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(user_version(&conn), 5);
     assert_columns_exist(
         &conn,
         "messages",
@@ -53,12 +58,18 @@ fn migration_creates_database_and_records_v2_schema() {
     assert_columns_exist(
         &conn,
         "transfers",
-        &["thumbnail_path", "folder_id", "folder_relative_path"],
+        &[
+            "thumbnail_path",
+            "folder_id",
+            "folder_relative_path",
+            "bytes_transferred",
+            "resume_token",
+        ],
     );
 }
 
 #[test]
-fn migration_upgrades_v0_database_to_v2() {
+fn migration_upgrades_v0_database_to_v5() {
     let (_temp_dir, db_path) = temp_db_path("upgrade");
     Connection::open(&db_path)
         .expect("create empty v0 db")
@@ -77,15 +88,19 @@ fn migration_upgrades_v0_database_to_v2() {
             "chat_members",
             "peers",
             "transfers",
+            "transfer_context",
+            "peer_keys",
+            "sender_keys",
+            "folder_file_status",
         ],
     );
-    assert_eq!(applied_versions(&conn), vec![1, 2]);
-    assert_eq!(user_version(&conn), 2);
+    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
+    assert_eq!(user_version(&conn), 5);
 }
 
 #[test]
-fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
-    let (_temp_dir, db_path) = temp_db_path("upgrade-v1-to-v2");
+fn migration_upgrades_existing_v2_database_to_v5_and_preserves_data() {
+    let (_temp_dir, db_path) = temp_db_path("upgrade-v2-to-v3");
     let message_id = Uuid::new_v4();
     let chat_id = Uuid::new_v4();
     let sender_id = Uuid::new_v4();
@@ -95,9 +110,13 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
     let conn = Connection::open(&db_path).expect("create v1 db");
     conn.execute_batch(V1_MIGRATION_SQL)
         .expect("apply v1 schema manually");
+    conn.execute_batch(V2_MIGRATION_SQL)
+        .expect("apply v2 schema manually");
     conn.execute(
-        "INSERT INTO messages (id, chat_id, sender_id, content, timestamp, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages (
+            id, chat_id, sender_id, content, timestamp, status, created_at,
+            edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             message_id.to_string(),
             chat_id.to_string(),
@@ -105,14 +124,21 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
             "legacy message",
             1_234_i64,
             "sent",
-            1_234_i64
+            1_234_i64,
+            2_i64,
+            1_500_i64,
+            0_i64,
+            Option::<i64>::None,
+            Some(Uuid::new_v4().to_string()),
+            Some("legacy preview".to_string())
         ],
     )
     .expect("insert legacy message");
     conn.execute(
         "INSERT INTO transfers (
-            id, peer_id, filename, size, direction, status, sha256, created_at, completed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            id, peer_id, filename, size, direction, status, sha256, created_at, completed_at,
+            thumbnail_path, folder_id, folder_relative_path
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             transfer_id.to_string(),
             peer_id.to_string(),
@@ -122,7 +148,10 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
             "pending",
             Option::<String>::None,
             2_000_i64,
-            Option::<i64>::None
+            Option::<i64>::None,
+            Some("/tmp/thumb.webp".to_string()),
+            Some("folder-1".to_string()),
+            Some("docs/legacy.bin".to_string())
         ],
     )
     .expect("insert legacy transfer");
@@ -135,8 +164,8 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
         ],
     )
     .expect("insert legacy transfer context");
-    conn.execute_batch("PRAGMA user_version = 1;")
-        .expect("mark db as v1");
+    conn.execute_batch("PRAGMA user_version = 2;")
+        .expect("mark db as v2");
     drop(conn);
 
     let storage = SqliteStorage::open(&db_path).expect("storage opens and migrates");
@@ -154,20 +183,21 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
     assert_eq!(loaded.sender_id, UserId(sender_id));
     assert_eq!(loaded.content, "legacy message");
     assert_eq!(loaded.status, MessageStatus::Sent);
-    assert_eq!(loaded.edit_version, 0);
-    assert_eq!(loaded.edited_at, None);
+    assert_eq!(loaded.edit_version, 2);
+    assert_eq!(loaded.edited_at, Some(1_500));
     assert!(!loaded.is_deleted);
     assert_eq!(loaded.deleted_at, None);
-    assert_eq!(loaded.reply_to_id, None);
-    assert_eq!(loaded.reply_to_preview, None);
+    assert!(loaded.reply_to_id.is_some());
+    assert_eq!(loaded.reply_to_preview.as_deref(), Some("legacy preview"));
 
     let conn = Connection::open(&db_path).expect("open migrated db");
-    assert_eq!(applied_versions(&conn), vec![1, 2]);
-    assert_eq!(user_version(&conn), 2);
+    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
+    assert_eq!(user_version(&conn), 5);
 
     let transfer_row = conn
         .query_row(
-            "SELECT filename, thumbnail_path, folder_id, folder_relative_path
+            "SELECT filename, thumbnail_path, folder_id, folder_relative_path,
+                    bytes_transferred, resume_token
              FROM transfers WHERE id = ?1",
             params![transfer_id.to_string()],
             |row| {
@@ -176,14 +206,18 @@ fn migration_upgrades_existing_v1_database_to_v2_and_preserves_data() {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .expect("query migrated transfer row");
     assert_eq!(transfer_row.0, "legacy.bin");
-    assert_eq!(transfer_row.1, None);
-    assert_eq!(transfer_row.2, None);
-    assert_eq!(transfer_row.3, None);
+    assert_eq!(transfer_row.1.as_deref(), Some("/tmp/thumb.webp"));
+    assert_eq!(transfer_row.2.as_deref(), Some("folder-1"));
+    assert_eq!(transfer_row.3.as_deref(), Some("docs/legacy.bin"));
+    assert_eq!(transfer_row.4, 0);
+    assert_eq!(transfer_row.5, None);
 }
 
 #[test]
@@ -582,6 +616,336 @@ async fn peer_upsert_updates_existing_row() {
 }
 
 #[tokio::test]
+async fn peer_key_crud_saves_gets_and_verifies_rows() {
+    let (_temp_dir, db_path) = temp_db_path("peer-key-crud");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let device_id = Uuid::new_v4().to_string();
+
+    storage
+        .save_peer_key(&device_id, &[1, 2, 3, 4], "AA11 BB22")
+        .await
+        .expect("save peer key");
+
+    let saved = storage
+        .get_peer_key(&device_id)
+        .await
+        .expect("get peer key")
+        .expect("peer key exists");
+    assert_eq!(saved.device_id, device_id);
+    assert_eq!(saved.public_key, vec![1, 2, 3, 4]);
+    assert_eq!(saved.fingerprint, "AA11 BB22");
+    assert!(!saved.verified);
+    assert!(saved.first_seen > 0);
+    assert_eq!(saved.first_seen, saved.last_seen);
+
+    storage
+        .set_peer_verified(&saved.device_id, true)
+        .await
+        .expect("verify peer key");
+
+    let verified = storage
+        .get_peer_key(&saved.device_id)
+        .await
+        .expect("reload peer key")
+        .expect("verified peer key exists");
+    assert!(verified.verified);
+    assert_eq!(verified.public_key, vec![1, 2, 3, 4]);
+    assert_eq!(verified.fingerprint, "AA11 BB22");
+}
+
+#[tokio::test]
+async fn peer_key_get_missing_returns_none() {
+    let (_temp_dir, db_path) = temp_db_path("peer-key-missing");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+
+    let missing = storage
+        .get_peer_key("missing-device")
+        .await
+        .expect("lookup missing peer key");
+
+    assert!(missing.is_none());
+}
+
+#[tokio::test]
+async fn peer_key_list_returns_all_keys_in_last_seen_order() {
+    let (_temp_dir, db_path) = temp_db_path("peer-key-list");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let first = Uuid::new_v4().to_string();
+    let second = Uuid::new_v4().to_string();
+    let third = Uuid::new_v4().to_string();
+
+    storage
+        .save_peer_key(&first, &[1, 2, 3], "FP-1")
+        .await
+        .expect("save first peer key");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    storage
+        .save_peer_key(&second, &[4, 5, 6], "FP-2")
+        .await
+        .expect("save second peer key");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    storage
+        .save_peer_key(&third, &[7, 8, 9], "FP-3")
+        .await
+        .expect("save third peer key");
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    storage
+        .update_peer_key_last_seen(&second)
+        .await
+        .expect("refresh second peer key");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    storage
+        .update_peer_key_last_seen(&third)
+        .await
+        .expect("refresh third peer key");
+
+    let keys = storage
+        .get_all_peer_keys()
+        .await
+        .expect("list all peer keys");
+
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0].device_id, third);
+    assert_eq!(keys[1].device_id, second);
+    assert_eq!(keys[2].device_id, first);
+}
+
+#[tokio::test]
+async fn peer_key_last_seen_updates_without_mutating_first_seen() {
+    let (_temp_dir, db_path) = temp_db_path("peer-key-last-seen");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let device_id = Uuid::new_v4().to_string();
+
+    storage
+        .save_peer_key(&device_id, &[1, 2, 3, 4], "AA11 BB22")
+        .await
+        .expect("save peer key");
+    let original = storage
+        .get_peer_key(&device_id)
+        .await
+        .expect("load original peer key")
+        .expect("peer key exists");
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    storage
+        .update_peer_key_last_seen(&device_id)
+        .await
+        .expect("update peer key last seen");
+
+    let updated = storage
+        .get_peer_key(&device_id)
+        .await
+        .expect("load updated peer key")
+        .expect("updated peer key exists");
+
+    assert_eq!(updated.device_id, device_id);
+    assert_eq!(updated.public_key, vec![1, 2, 3, 4]);
+    assert_eq!(updated.fingerprint, "AA11 BB22");
+    assert_eq!(updated.verified, original.verified);
+    assert_eq!(updated.first_seen, original.first_seen);
+    assert!(updated.last_seen >= original.last_seen);
+}
+
+#[tokio::test]
+async fn peer_key_save_updates_existing_row_and_last_seen() {
+    let (_temp_dir, db_path) = temp_db_path("peer-key-update");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let device_id = Uuid::new_v4().to_string();
+
+    storage
+        .save_peer_key(&device_id, &[1, 2, 3], "OLD FP")
+        .await
+        .expect("save original peer key");
+    let original = storage
+        .get_peer_key(&device_id)
+        .await
+        .expect("load original peer key")
+        .expect("original peer key exists");
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    storage
+        .save_peer_key(&device_id, &[9, 8, 7], "NEW FP")
+        .await
+        .expect("update peer key");
+    let updated = storage
+        .get_peer_key(&device_id)
+        .await
+        .expect("load updated peer key")
+        .expect("updated peer key exists");
+
+    assert_eq!(updated.device_id, device_id);
+    assert_eq!(updated.public_key, vec![9, 8, 7]);
+    assert_eq!(updated.fingerprint, "NEW FP");
+    assert_eq!(updated.first_seen, original.first_seen);
+    assert!(updated.last_seen >= original.last_seen);
+}
+
+#[tokio::test]
+async fn sender_key_save_latest_get_by_epoch_and_delete_group() {
+    let (_temp_dir, db_path) = temp_db_path("sender-key-epochs");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let original_key_id = Uuid::new_v4();
+    let rotated_key_id = Uuid::new_v4();
+    let original_created_at = 1_700_000_000_000_u64;
+    let rotated_created_at = original_created_at + 500;
+
+    storage
+        .save_sender_key(
+            "group-1",
+            "device-a",
+            &original_key_id,
+            &[4, 5, 6],
+            0,
+            original_created_at,
+        )
+        .await
+        .expect("save sender key");
+
+    let original = storage
+        .get_sender_key("group-1", "device-a")
+        .await
+        .expect("get sender key")
+        .expect("sender key exists");
+    assert_eq!(original.group_id, "group-1");
+    assert_eq!(original.sender_device_id, "device-a");
+    assert_eq!(original.key_id, original_key_id);
+    assert_eq!(original.key_data, vec![4, 5, 6]);
+    assert_eq!(original.epoch, 0);
+    assert_eq!(original.created_at, original_created_at);
+
+    storage
+        .save_sender_key(
+            "group-1",
+            "device-a",
+            &rotated_key_id,
+            &[7, 8, 9, 10],
+            3,
+            rotated_created_at,
+        )
+        .await
+        .expect("rotate sender key");
+
+    let rotated = storage
+        .get_sender_key("group-1", "device-a")
+        .await
+        .expect("reload sender key")
+        .expect("rotated sender key exists");
+    assert_eq!(rotated.group_id, "group-1");
+    assert_eq!(rotated.sender_device_id, "device-a");
+    assert_eq!(rotated.key_id, rotated_key_id);
+    assert_eq!(rotated.key_data, vec![7, 8, 9, 10]);
+    assert_eq!(rotated.epoch, 3);
+    assert_eq!(rotated.created_at, rotated_created_at);
+
+    let epoch_zero = storage
+        .get_sender_key_by_epoch("group-1", "device-a", 0)
+        .await
+        .expect("get sender key by epoch 0")
+        .expect("epoch 0 sender key exists");
+    assert_eq!(epoch_zero.key_id, original_key_id);
+    assert_eq!(epoch_zero.key_data, vec![4, 5, 6]);
+    assert_eq!(epoch_zero.epoch, 0);
+
+    let epoch_three = storage
+        .get_sender_key_by_epoch("group-1", "device-a", 3)
+        .await
+        .expect("get sender key by epoch 3")
+        .expect("epoch 3 sender key exists");
+    assert_eq!(epoch_three.key_id, rotated_key_id);
+    assert_eq!(epoch_three.key_data, vec![7, 8, 9, 10]);
+    assert_eq!(epoch_three.epoch, 3);
+
+    storage
+        .save_sender_key(
+            "group-1",
+            "device-b",
+            &Uuid::new_v4(),
+            &[11, 12, 13],
+            1,
+            rotated_created_at + 100,
+        )
+        .await
+        .expect("save sender key for second sender");
+
+    storage
+        .delete_sender_keys_for_group("group-1")
+        .await
+        .expect("delete sender keys for group");
+
+    assert!(storage
+        .get_sender_key("group-1", "device-a")
+        .await
+        .expect("reload sender key after delete")
+        .is_none());
+    assert!(storage
+        .get_sender_key_by_epoch("group-1", "device-a", 0)
+        .await
+        .expect("reload sender key by epoch after delete")
+        .is_none());
+}
+
+#[tokio::test]
+async fn bytes_transferred_update_and_resume_info_round_trip() {
+    let (temp_dir, db_path) = temp_db_path("bytes-transferred");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let payload_path = write_transfer_file(temp_dir.path(), "resume.bin", 2_048);
+    let mut transfer = transfer_record(&payload_path, TransferStatus::Pending);
+    transfer.resume_token = Some("resume-token-1".to_string());
+
+    storage
+        .save_transfer(&transfer)
+        .await
+        .expect("save transfer with resume token");
+
+    let initial = storage
+        .get_transfer_resume_info(&transfer.id.to_string())
+        .await
+        .expect("query initial resume info")
+        .expect("resume info exists");
+    assert_eq!(initial.bytes_transferred, 0);
+    assert_eq!(initial.resume_token.as_deref(), Some("resume-token-1"));
+
+    storage
+        .update_bytes_transferred(&transfer.id.to_string(), 512)
+        .await
+        .expect("update bytes transferred");
+
+    let updated = storage
+        .get_transfer_resume_info(&transfer.id.to_string())
+        .await
+        .expect("query updated resume info")
+        .expect("updated resume info exists");
+    assert_eq!(updated.bytes_transferred, 512);
+    assert_eq!(updated.resume_token.as_deref(), Some("resume-token-1"));
+
+    let stored_transfer = storage
+        .get_transfers(10, 0)
+        .await
+        .expect("load transfers")
+        .into_iter()
+        .find(|candidate| candidate.id == transfer.id)
+        .expect("stored transfer exists");
+    assert_eq!(stored_transfer.bytes_transferred, 512);
+    assert_eq!(
+        stored_transfer.resume_token.as_deref(),
+        Some("resume-token-1")
+    );
+
+    let conn = Connection::open(&db_path).expect("open sqlite db");
+    let row = conn
+        .query_row(
+            "SELECT bytes_transferred, resume_token FROM transfers WHERE id = ?1",
+            params![transfer.id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .expect("query transfer resume row");
+    assert_eq!(row.0, 512);
+    assert_eq!(row.1.as_deref(), Some("resume-token-1"));
+}
+
+#[tokio::test]
 async fn chat_crud_saves_and_loads_direct_chat() {
     let (_temp_dir, db_path) = temp_db_path("chat-direct");
     let storage = SqliteStorage::open(&db_path).expect("storage opens");
@@ -792,6 +1156,8 @@ fn transfer_record(path: &Path, status: TransferStatus) -> TransferRecord {
         thumbnail_path: None,
         folder_id: None,
         folder_relative_path: None,
+        bytes_transferred: 0,
+        resume_token: None,
     }
 }
 

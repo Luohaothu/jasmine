@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jasmine_core::ProtocolMessage;
+use jasmine_crypto::Session;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -30,6 +31,7 @@ pub enum WsServerEvent {
 
 struct ServerPeerHandle {
     peer: WsPeerConnection,
+    session: Arc<Mutex<Session>>,
     command_tx: mpsc::Sender<ConnectionCommand>,
 }
 
@@ -118,6 +120,46 @@ impl WsServer {
             .map_err(|_| MessagingError::PeerNotConnected(peer_device_id.to_string()))
     }
 
+    pub fn file_crypto_material(
+        &self,
+        peer_device_id: &str,
+        file_id: &str,
+    ) -> Result<([u8; 32], [u8; 8])> {
+        let session = self
+            .inner
+            .peers
+            .lock()
+            .expect("lock ws server peers")
+            .get(peer_device_id)
+            .map(|handle| Arc::clone(&handle.session))
+            .ok_or_else(|| MessagingError::PeerNotConnected(peer_device_id.to_string()))?;
+
+        let material = session
+            .lock()
+            .expect("lock ws server session")
+            .derive_file_crypto_material(file_id);
+
+        Ok(material)
+    }
+
+    pub fn sender_key_distribution_material(&self, peer_device_id: &str) -> Result<[u8; 32]> {
+        let session = self
+            .inner
+            .peers
+            .lock()
+            .expect("lock ws server peers")
+            .get(peer_device_id)
+            .map(|handle| Arc::clone(&handle.session))
+            .ok_or_else(|| MessagingError::PeerNotConnected(peer_device_id.to_string()))?;
+
+        let material = session
+            .lock()
+            .expect("lock ws server session")
+            .sender_key_distribution_material();
+
+        Ok(material)
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -204,19 +246,24 @@ async fn handle_connection(
     let mut socket = accept_async(stream)
         .await
         .map_err(|error| MessagingError::Transport(error.to_string()))?;
-    let peer = perform_server_handshake(
+    let handshake = perform_server_handshake(
         &mut socket,
         &config.local_peer,
+        config.local_private_key.as_deref(),
+        config.peer_key_store.as_deref(),
         address.to_string(),
         config.handshake_timeout,
     )
     .await?;
+    let peer = handshake.peer;
+    let session = Arc::new(Mutex::new(handshake.session));
     let (command_tx, command_rx) = mpsc::channel(64);
 
     let previous = inner.peers.lock().expect("lock ws server peers").insert(
         peer.identity.device_id.clone(),
         ServerPeerHandle {
             peer: peer.clone(),
+            session: Arc::clone(&session),
             command_tx: command_tx.clone(),
         },
     );
@@ -233,6 +280,7 @@ async fn handle_connection(
     let peer_for_messages = peer.clone();
     let reason = run_connection_loop(
         socket,
+        Arc::clone(&session),
         config.heartbeat_interval,
         config.max_missed_heartbeats,
         command_rx,

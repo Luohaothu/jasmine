@@ -1,27 +1,33 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use jasmine_core::{
-    AppSettings, ChatId, DeviceId, DeviceIdentity, GroupInfo, Message, MessageStatus, PeerInfo,
+    AppSettings, ChatId, DeviceId, DeviceIdentity, Message, MessageStatus, PeerInfo,
     TransferRecord, TransferStatus, UserId,
 };
+use jasmine_crypto::{fingerprint, public_key_from_base64, public_key_to_base64, PublicKey};
 use jasmine_transfer::{ManagedTransfer, TransferDirection, TransferProgress};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use super::{
-    accept_file_impl, accept_folder_transfer_impl, cancel_folder_transfer_impl,
-    cancel_transfer_impl, create_group_impl, delete_message_impl, edit_message_impl,
-    get_identity_impl, get_messages_impl, get_peers_impl, get_settings_impl, get_transfers_impl,
-    reject_file_impl, reject_folder_transfer_impl, send_file_impl, send_folder_impl,
-    send_group_message_impl, send_message_impl, setup_app_state_with_factory, start_discovery_impl,
-    stop_discovery_impl, transfer_payload_from_managed, transfer_payload_from_record,
+    accept_file_impl, accept_folder_transfer_impl, add_group_members_impl,
+    cancel_folder_transfer_impl, cancel_transfer_impl, create_group_impl, delete_message_impl,
+    edit_message_impl, get_group_info_impl, get_identity_impl, get_messages_impl,
+    get_own_fingerprint_impl, get_peer_fingerprint_impl, get_peers_impl, get_settings_impl,
+    get_transfers_impl, leave_group_impl, list_groups_impl, reject_file_impl,
+    reject_folder_transfer_impl, remove_group_members_impl, resume_transfer_impl,
+    retry_transfer_impl, send_file_impl, send_folder_impl, send_group_message_impl,
+    send_message_impl, setup_app_state_with_factory, start_discovery_impl, stop_discovery_impl,
+    toggle_peer_verified_impl, transfer_payload_from_managed, transfer_payload_from_record,
     update_avatar_impl, update_display_name_impl, update_settings_impl, AppSetupFactory, AppState,
-    ChatMessagePayload, DiscoveryServiceHandle, FrontendEmitter, IdentityServiceHandle,
-    MessagingServiceHandle, PeerPayload, SettingsServiceHandle, SetupContext, TransferPayload,
-    TransferServiceHandle,
+    ChatMessagePayload, DiscoveryServiceHandle, FrontendEmitter, GroupInfoResponse,
+    GroupMemberInfo, IdentityServiceHandle, MessagingServiceHandle, OwnFingerprintInfo,
+    PeerFingerprintInfo, PeerPayload, SettingsServiceHandle, SetupContext, StoredGroupInfo,
+    TransferPayload, TransferServiceHandle,
 };
 
 fn device_id(seed: u128) -> DeviceId {
@@ -75,6 +81,8 @@ fn identity() -> DeviceIdentity {
         display_name: "Local Device".to_string(),
         avatar_path: Some("/tmp/avatar.png".to_string()),
         created_at: 42,
+        public_key: public_key_to_base64(&PublicKey::from([7_u8; 32])),
+        protocol_version: 2,
     }
 }
 
@@ -93,12 +101,27 @@ fn transfer(id: &str, state: &str) -> TransferPayload {
         progress: 0.5,
         speed: 512,
         state: state.to_string(),
+        resumable: false,
         sender_id: Some(Uuid::from_u128(9).to_string()),
         local_path: Some(format!("/tmp/{id}.bin")),
         thumbnail_path: None,
         direction: None,
         folder_id: None,
         folder_relative_path: None,
+    }
+}
+
+fn stored_group(
+    seed: u128,
+    name: &str,
+    member_ids: Vec<String>,
+    created_at: i64,
+) -> StoredGroupInfo {
+    StoredGroupInfo {
+        id: Uuid::from_u128(seed).to_string(),
+        name: name.to_string(),
+        member_ids,
+        created_at,
     }
 }
 
@@ -146,10 +169,14 @@ impl DiscoveryServiceHandle for MockDiscoveryService {
 struct MockMessagingService {
     sent_messages: Mutex<Vec<(String, String)>>,
     group_creations: Mutex<Vec<(String, Vec<String>)>>,
+    group_additions: Mutex<Vec<(String, Vec<String>)>>,
+    group_removals: Mutex<Vec<(String, Vec<String>)>>,
+    group_leaves: Mutex<Vec<String>>,
     group_messages: Mutex<Vec<(String, String)>>,
     edit_calls: Mutex<Vec<(String, String, String)>>,
     delete_calls: Mutex<Vec<(String, String)>>,
     messages: Mutex<Vec<Message>>,
+    groups: Mutex<HashMap<String, StoredGroupInfo>>,
     send_error: Mutex<Option<String>>,
 }
 
@@ -162,6 +189,25 @@ impl MockMessagingService {
     fn with_send_error(self, error: &str) -> Self {
         *self.send_error.lock().expect("lock send error") = Some(error.to_string());
         self
+    }
+
+    fn with_groups(self, groups: Vec<StoredGroupInfo>) -> Self {
+        *self.groups.lock().expect("lock groups") = groups
+            .into_iter()
+            .map(|group| (group.id.clone(), group))
+            .collect();
+        self
+    }
+
+    fn group_info_by_id(&self, group_id: &str) -> Result<StoredGroupInfo, String> {
+        let _ = Uuid::parse_str(group_id)
+            .map_err(|error| format!("invalid group_id {group_id}: {error}"))?;
+        self.groups
+            .lock()
+            .expect("lock groups")
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown group {group_id}"))
     }
 }
 
@@ -194,17 +240,115 @@ impl MessagingServiceHandle for MockMessagingService {
         Ok(self.messages.lock().expect("lock messages").clone())
     }
 
-    async fn create_group(&self, name: &str, members: &[String]) -> Result<GroupInfo, String> {
+    async fn create_group(
+        &self,
+        name: &str,
+        members: &[String],
+    ) -> Result<StoredGroupInfo, String> {
         self.group_creations
             .lock()
             .expect("lock group creations")
             .push((name.to_string(), members.to_vec()));
 
-        Ok(GroupInfo {
-            id: chat_id(77),
+        let mut member_ids = Vec::with_capacity(members.len() + 1);
+        member_ids.push(identity().device_id);
+        member_ids.extend(members.iter().cloned());
+        let group = StoredGroupInfo {
+            id: Uuid::from_u128(77).to_string(),
             name: name.to_string(),
-            member_ids: vec![user_id(1), user_id(2)],
-        })
+            member_ids,
+            created_at: 7_777,
+        };
+        self.groups
+            .lock()
+            .expect("lock groups")
+            .insert(group.id.clone(), group.clone());
+
+        Ok(group)
+    }
+
+    async fn add_group_members(
+        &self,
+        group_id: &str,
+        member_ids: &[String],
+    ) -> Result<StoredGroupInfo, String> {
+        let _ = Uuid::parse_str(group_id)
+            .map_err(|error| format!("invalid group_id {group_id}: {error}"))?;
+        self.group_additions
+            .lock()
+            .expect("lock group additions")
+            .push((group_id.to_string(), member_ids.to_vec()));
+        let mut groups = self.groups.lock().expect("lock groups");
+        let group = groups
+            .get_mut(group_id)
+            .ok_or_else(|| format!("unknown group {group_id}"))?;
+
+        for member_id in member_ids {
+            if !group.member_ids.contains(member_id) {
+                group.member_ids.push(member_id.clone());
+            }
+        }
+
+        Ok(group.clone())
+    }
+
+    async fn remove_group_members(
+        &self,
+        group_id: &str,
+        member_ids: &[String],
+    ) -> Result<StoredGroupInfo, String> {
+        let _ = Uuid::parse_str(group_id)
+            .map_err(|error| format!("invalid group_id {group_id}: {error}"))?;
+        self.group_removals
+            .lock()
+            .expect("lock group removals")
+            .push((group_id.to_string(), member_ids.to_vec()));
+        let mut groups = self.groups.lock().expect("lock groups");
+        let group = groups
+            .get_mut(group_id)
+            .ok_or_else(|| format!("unknown group {group_id}"))?;
+        group
+            .member_ids
+            .retain(|member_id| !member_ids.contains(member_id));
+        Ok(group.clone())
+    }
+
+    async fn get_group_info(&self, group_id: &str) -> Result<StoredGroupInfo, String> {
+        self.group_info_by_id(group_id)
+    }
+
+    async fn list_groups(&self) -> Result<Vec<StoredGroupInfo>, String> {
+        let mut groups = self
+            .groups
+            .lock()
+            .expect("lock groups")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(right.id.cmp(&left.id))
+        });
+        Ok(groups)
+    }
+
+    async fn leave_group(&self, group_id: &str) -> Result<(), String> {
+        let _ = Uuid::parse_str(group_id)
+            .map_err(|error| format!("invalid group_id {group_id}: {error}"))?;
+        self.group_leaves
+            .lock()
+            .expect("lock group leaves")
+            .push(group_id.to_string());
+        let mut groups = self.groups.lock().expect("lock groups");
+        let group = groups
+            .get_mut(group_id)
+            .ok_or_else(|| format!("unknown group {group_id}"))?;
+        group
+            .member_ids
+            .retain(|member_id| member_id != &identity().device_id);
+        Ok(())
     }
 
     async fn send_group_message(
@@ -257,6 +401,8 @@ struct MockTransferService {
     rejected_offers: Mutex<Vec<(String, Option<String>)>>,
     rejected_folders: Mutex<Vec<String>>,
     cancelled_transfers: Mutex<Vec<String>>,
+    resumed_transfers: Mutex<Vec<String>>,
+    retried_transfers: Mutex<Vec<String>>,
     cancelled_folders: Mutex<Vec<String>>,
     transfers: Mutex<Vec<TransferPayload>>,
     reject_error: Mutex<Option<String>>,
@@ -321,6 +467,22 @@ impl TransferServiceHandle for MockTransferService {
         Ok(())
     }
 
+    async fn resume_transfer(&self, transfer_id: &str) -> Result<String, String> {
+        self.resumed_transfers
+            .lock()
+            .expect("lock resumed transfers")
+            .push(transfer_id.to_string());
+        Ok(format!("resumed-{transfer_id}"))
+    }
+
+    async fn retry_transfer(&self, transfer_id: &str) -> Result<String, String> {
+        self.retried_transfers
+            .lock()
+            .expect("lock retried transfers")
+            .push(transfer_id.to_string());
+        Ok(format!("retried-{transfer_id}"))
+    }
+
     async fn accept_folder_transfer(
         &self,
         _folder_id: &str,
@@ -358,6 +520,17 @@ impl TransferServiceHandle for MockTransferService {
 struct MockIdentityService {
     update_names: Mutex<Vec<String>>,
     update_avatars: Mutex<Vec<String>>,
+    peer_fingerprints: Mutex<HashMap<String, PeerFingerprintInfo>>,
+}
+
+impl MockIdentityService {
+    fn with_peer_fingerprint(self, info: PeerFingerprintInfo) -> Self {
+        self.peer_fingerprints
+            .lock()
+            .expect("lock peer fingerprints")
+            .insert(info.peer_id.clone(), info);
+        self
+    }
 }
 
 impl IdentityServiceHandle for MockIdentityService {
@@ -385,6 +558,36 @@ impl IdentityServiceHandle for MockIdentityService {
             avatar_path: Some(path.to_string()),
             ..identity()
         })
+    }
+
+    fn get_own_fingerprint(&self) -> Result<OwnFingerprintInfo, String> {
+        let public_key =
+            public_key_from_base64(&identity().public_key).map_err(|error| error.to_string())?;
+        Ok(OwnFingerprintInfo {
+            device_id: identity().device_id,
+            fingerprint: fingerprint(&public_key),
+        })
+    }
+
+    fn get_peer_fingerprint(&self, peer_id: &str) -> Result<PeerFingerprintInfo, String> {
+        self.peer_fingerprints
+            .lock()
+            .expect("lock peer fingerprints")
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown peer fingerprint for {peer_id}"))
+    }
+
+    fn toggle_peer_verified(&self, peer_id: &str, verified: bool) -> Result<(), String> {
+        let mut peer_fingerprints = self
+            .peer_fingerprints
+            .lock()
+            .expect("lock peer fingerprints");
+        let fingerprint = peer_fingerprints
+            .get_mut(peer_id)
+            .ok_or_else(|| format!("unknown peer fingerprint for {peer_id}"))?;
+        fingerprint.verified = verified;
+        Ok(())
     }
 }
 
@@ -504,6 +707,7 @@ mod commands {
                 id: Uuid::from_u128(2).to_string(),
                 name: "Alice".to_string(),
                 status: "online".to_string(),
+                warning: None,
             }]
         );
     }
@@ -595,6 +799,7 @@ mod commands {
                     receiver_id: peer_uuid.to_string(),
                     content: "from local".to_string(),
                     timestamp: 1_000,
+                    encrypted: None,
                     status: "sent".to_string(),
                     edit_version: 0,
                     edited_at: None,
@@ -609,6 +814,7 @@ mod commands {
                     receiver_id: "local".to_string(),
                     content: "from peer".to_string(),
                     timestamp: 2_000,
+                    encrypted: None,
                     status: "delivered".to_string(),
                     edit_version: 0,
                     edited_at: None,
@@ -622,17 +828,17 @@ mod commands {
     }
 
     #[tokio::test]
-    async fn create_group_returns_group_id() {
+    async fn create_group_returns_rich_group_info_response() {
         let messaging = Arc::new(MockMessagingService::default());
         let state = app_state(
-            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockDiscoveryService::default().with_peers(vec![peer(2, "Alice")])),
             messaging.clone(),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
         );
 
-        let group_id = create_group_impl(
+        let group = create_group_impl(
             &state,
             "Project Room".to_string(),
             vec![Uuid::from_u128(2).to_string()],
@@ -640,7 +846,26 @@ mod commands {
         .await
         .expect("create group command");
 
-        assert_eq!(group_id, Uuid::from_u128(77).to_string());
+        assert_eq!(
+            group,
+            GroupInfoResponse {
+                id: Uuid::from_u128(77).to_string(),
+                name: "Project Room".to_string(),
+                members: vec![
+                    GroupMemberInfo {
+                        device_id: identity().device_id,
+                        name: "Local Device".to_string(),
+                        status: "online".to_string(),
+                    },
+                    GroupMemberInfo {
+                        device_id: Uuid::from_u128(2).to_string(),
+                        name: "Alice".to_string(),
+                        status: "online".to_string(),
+                    },
+                ],
+                created_at: 7_777,
+            }
+        );
         assert_eq!(
             messaging
                 .group_creations
@@ -652,6 +877,126 @@ mod commands {
                 vec![Uuid::from_u128(2).to_string()]
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn group_commands_return_frontend_ready_group_shapes_and_dispatch() {
+        let engineering = stored_group(
+            77,
+            "Engineering",
+            vec![identity().device_id, Uuid::from_u128(2).to_string()],
+            7_777,
+        );
+        let support = stored_group(
+            88,
+            "Support",
+            vec![identity().device_id, Uuid::from_u128(3).to_string()],
+            8_888,
+        );
+        let messaging = Arc::new(
+            MockMessagingService::default().with_groups(vec![engineering.clone(), support.clone()]),
+        );
+        let state = app_state(
+            Arc::new(
+                MockDiscoveryService::default().with_peers(vec![peer(2, "Alice"), peer(3, "Bob")]),
+            ),
+            messaging.clone(),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let group_id = Uuid::from_u128(77).to_string();
+        add_group_members_impl(
+            &state,
+            group_id.clone(),
+            vec![Uuid::from_u128(4).to_string()],
+        )
+        .await
+        .expect("add group members command");
+        remove_group_members_impl(
+            &state,
+            group_id.clone(),
+            vec![Uuid::from_u128(4).to_string()],
+        )
+        .await
+        .expect("remove group members command");
+
+        let group = get_group_info_impl(&state, group_id.clone())
+            .await
+            .expect("get group info command");
+        assert_eq!(
+            group,
+            GroupInfoResponse {
+                id: group_id.clone(),
+                name: "Engineering".to_string(),
+                members: vec![
+                    GroupMemberInfo {
+                        device_id: identity().device_id,
+                        name: "Local Device".to_string(),
+                        status: "online".to_string(),
+                    },
+                    GroupMemberInfo {
+                        device_id: Uuid::from_u128(2).to_string(),
+                        name: "Alice".to_string(),
+                        status: "online".to_string(),
+                    },
+                ],
+                created_at: engineering.created_at,
+            }
+        );
+
+        let groups = list_groups_impl(&state).await.expect("list groups command");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].id, support.id);
+        assert_eq!(groups[1].id, engineering.id);
+        assert_eq!(groups[0].members[1].name, "Bob");
+
+        leave_group_impl(&state, group_id.clone())
+            .await
+            .expect("leave group command");
+        assert_eq!(
+            messaging
+                .group_additions
+                .lock()
+                .expect("lock group additions")
+                .clone(),
+            vec![(group_id.clone(), vec![Uuid::from_u128(4).to_string()])]
+        );
+        assert_eq!(
+            messaging
+                .group_removals
+                .lock()
+                .expect("lock group removals")
+                .clone(),
+            vec![(group_id.clone(), vec![Uuid::from_u128(4).to_string()])]
+        );
+        assert_eq!(
+            messaging
+                .group_leaves
+                .lock()
+                .expect("lock group leaves")
+                .clone(),
+            vec![group_id]
+        );
+    }
+
+    #[test]
+    fn group_commands_are_registered_in_generate_handler() {
+        let lib_rs = include_str!("../lib.rs");
+        for command in [
+            "commands::create_group",
+            "commands::add_group_members",
+            "commands::remove_group_members",
+            "commands::get_group_info",
+            "commands::list_groups",
+            "commands::leave_group",
+        ] {
+            assert!(
+                lib_rs.contains(command),
+                "expected `{command}` to be registered in generate_handler!"
+            );
+        }
     }
 
     #[tokio::test]
@@ -953,6 +1298,58 @@ mod commands {
     }
 
     #[tokio::test]
+    async fn resume_transfer_dispatches_to_transfer_service() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let resumed = resume_transfer_impl(&state, "transfer-10".to_string())
+            .await
+            .expect("resume transfer command");
+
+        assert_eq!(resumed, "resumed-transfer-10");
+        assert_eq!(
+            transfers
+                .resumed_transfers
+                .lock()
+                .expect("lock resumed transfers")
+                .clone(),
+            vec!["transfer-10".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_transfer_dispatches_to_transfer_service() {
+        let transfers = Arc::new(MockTransferService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            transfers.clone(),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let retried = retry_transfer_impl(&state, "transfer-11".to_string())
+            .await
+            .expect("retry transfer command");
+
+        assert_eq!(retried, "retried-transfer-11");
+        assert_eq!(
+            transfers
+                .retried_transfers
+                .lock()
+                .expect("lock retried transfers")
+                .clone(),
+            vec!["transfer-11".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn get_transfers_returns_payloads() {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
@@ -991,6 +1388,7 @@ mod commands {
             }),
             folder_id: Some("folder-1".to_string()),
             folder_relative_path: Some("docs/report.txt".to_string()),
+            resume_token: None,
         };
 
         let payload = transfer_payload_from_managed(&transfer);
@@ -1003,6 +1401,7 @@ mod commands {
         assert_eq!(payload.direction.as_deref(), Some("send"));
         assert_eq!(payload.progress, 0.25);
         assert_eq!(payload.speed, 25);
+        assert!(!payload.resumable);
     }
 
     #[test]
@@ -1021,6 +1420,8 @@ mod commands {
             thumbnail_path: None,
             folder_id: Some("folder-1".to_string()),
             folder_relative_path: Some("docs/report.txt".to_string()),
+            bytes_transferred: 0,
+            resume_token: None,
         };
 
         let payload = transfer_payload_from_record(&record);
@@ -1032,6 +1433,36 @@ mod commands {
         );
         assert_eq!(payload.progress, 1.0);
         assert_eq!(payload.size, 64);
+        assert!(!payload.resumable);
+    }
+
+    #[test]
+    fn transfer_payload_marks_failed_receive_with_resume_token_as_resumable() {
+        let transfer = ManagedTransfer {
+            id: "transfer-resume".to_string(),
+            peer_id: device_id(9),
+            chat_id: None,
+            file_name: "resume.bin".to_string(),
+            local_path: PathBuf::from("/tmp/resume.bin"),
+            direction: TransferDirection::Receive,
+            status: TransferStatus::Failed,
+            total_bytes: 100,
+            progress: Some(TransferProgress {
+                transfer_id: "transfer-resume".to_string(),
+                bytes_sent: 40,
+                total_bytes: 100,
+                speed_bps: 0,
+            }),
+            folder_id: None,
+            folder_relative_path: None,
+            resume_token: Some("resume-token".to_string()),
+        };
+
+        let payload = transfer_payload_from_managed(&transfer);
+
+        assert!(payload.resumable);
+        assert_eq!(payload.direction.as_deref(), Some("receive"));
+        assert_eq!(payload.progress, 0.4);
     }
 
     #[test]
@@ -1095,6 +1526,90 @@ mod commands {
                 .expect("lock update avatars")
                 .clone(),
             vec!["/tmp/new-avatar.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn fingerprint_get_own_returns_expected_shape() {
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let public_key = public_key_from_base64(&identity().public_key)
+            .expect("identity public key should decode");
+        assert_eq!(
+            get_own_fingerprint_impl(&state).expect("get own fingerprint command"),
+            OwnFingerprintInfo {
+                device_id: identity().device_id,
+                fingerprint: fingerprint(&public_key),
+            }
+        );
+    }
+
+    #[test]
+    fn fingerprint_get_peer_returns_stored_fingerprint_info() {
+        let identities = Arc::new(MockIdentityService::default().with_peer_fingerprint(
+            PeerFingerprintInfo {
+                peer_id: Uuid::from_u128(2).to_string(),
+                fingerprint: "AA11 BB22 CC33 DD44".to_string(),
+                verified: false,
+                first_seen: 1_234,
+            },
+        ));
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            Arc::new(MockTransferService::default()),
+            identities,
+            Arc::new(MockSettingsService::default()),
+        );
+
+        assert_eq!(
+            get_peer_fingerprint_impl(&state, Uuid::from_u128(2).to_string())
+                .expect("get peer fingerprint command"),
+            PeerFingerprintInfo {
+                peer_id: Uuid::from_u128(2).to_string(),
+                fingerprint: "AA11 BB22 CC33 DD44".to_string(),
+                verified: false,
+                first_seen: 1_234,
+            }
+        );
+    }
+
+    #[test]
+    fn fingerprint_toggle_peer_verified_persists_and_round_trips() {
+        let identities = Arc::new(MockIdentityService::default().with_peer_fingerprint(
+            PeerFingerprintInfo {
+                peer_id: Uuid::from_u128(9).to_string(),
+                fingerprint: "EE55 FF66 7788 9900".to_string(),
+                verified: false,
+                first_seen: 9_999,
+            },
+        ));
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            Arc::new(MockTransferService::default()),
+            identities,
+            Arc::new(MockSettingsService::default()),
+        );
+
+        toggle_peer_verified_impl(&state, Uuid::from_u128(9).to_string(), true)
+            .expect("toggle peer verified command");
+
+        assert_eq!(
+            get_peer_fingerprint_impl(&state, Uuid::from_u128(9).to_string())
+                .expect("reload toggled peer fingerprint"),
+            PeerFingerprintInfo {
+                peer_id: Uuid::from_u128(9).to_string(),
+                fingerprint: "EE55 FF66 7788 9900".to_string(),
+                verified: true,
+                first_seen: 9_999,
+            }
         );
     }
 
@@ -1219,6 +1734,48 @@ mod commands_error {
             .expect_err("start discovery should fail");
 
         assert!(error.contains("mdns unavailable"));
+    }
+}
+
+mod group_error_handling {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_group_info_propagates_unknown_group_errors() {
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let error = get_group_info_impl(&state, Uuid::from_u128(404).to_string())
+            .await
+            .expect_err("missing group should fail");
+
+        assert!(error.contains("unknown group"));
+    }
+
+    #[tokio::test]
+    async fn remove_group_members_propagates_invalid_group_id_errors() {
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let error = remove_group_members_impl(
+            &state,
+            "not-a-uuid".to_string(),
+            vec![Uuid::from_u128(2).to_string()],
+        )
+        .await
+        .expect_err("invalid group id should fail");
+
+        assert!(error.contains("invalid group_id"));
     }
 }
 
@@ -1409,6 +1966,116 @@ mod chat_bridge {
                         "senderName": "Alice"
                     })
                 )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_chat_service_event_bridges_group_message_and_group_state_payloads() {
+        let dir = tempdir().expect("create temp dir");
+        let storage =
+            SqliteStorage::open(dir.path().join("commands-group.db")).expect("open sqlite storage");
+        let emitter = RecordingEmitter::new();
+        let mut group_message = message(20, 77, 2, "group hello", MessageStatus::Delivered);
+        group_message.reply_to_id = Some(Uuid::from_u128(21).to_string());
+        group_message.reply_to_preview = Some("preview text".to_string());
+
+        emit_chat_service_event(
+            ChatServiceEvent::MessageReceived {
+                peer_id: Uuid::from_u128(2).to_string(),
+                message: group_message.clone(),
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::GroupCreated {
+                group_id: chat_id(77),
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::GroupMembersAdded {
+                group_id: chat_id(77),
+                member_ids: vec![Uuid::from_u128(3).to_string()],
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::GroupMembersRemoved {
+                group_id: chat_id(77),
+                member_ids: vec![Uuid::from_u128(4).to_string()],
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+        emit_chat_service_event(
+            ChatServiceEvent::GroupUpdated {
+                group_id: chat_id(77),
+            },
+            &storage,
+            &emitter,
+            &identity().device_id,
+        )
+        .await;
+
+        assert_eq!(
+            emitter.snapshot(),
+            vec![
+                (
+                    "group-message-received".to_string(),
+                    json!({
+                        "groupId": chat_id(77).0.to_string(),
+                        "id": group_message.id.to_string(),
+                        "senderId": Uuid::from_u128(2).to_string(),
+                        "senderName": null,
+                        "content": "group hello",
+                        "timestamp": 1234,
+                        "encrypted": true,
+                        "isOwn": false,
+                        "status": "delivered",
+                        "isDeleted": false,
+                        "editedAt": null,
+                        "replyToId": group_message.reply_to_id,
+                        "replyToPreview": group_message.reply_to_preview,
+                    })
+                ),
+                (
+                    "group-created".to_string(),
+                    json!({
+                        "groupId": chat_id(77).0.to_string()
+                    })
+                ),
+                (
+                    "group-member-added".to_string(),
+                    json!({
+                        "groupId": chat_id(77).0.to_string(),
+                        "memberIds": [Uuid::from_u128(3).to_string()]
+                    })
+                ),
+                (
+                    "group-member-removed".to_string(),
+                    json!({
+                        "groupId": chat_id(77).0.to_string(),
+                        "memberIds": [Uuid::from_u128(4).to_string()]
+                    })
+                ),
+                (
+                    "group-updated".to_string(),
+                    json!({
+                        "groupId": chat_id(77).0.to_string()
+                    })
+                ),
             ]
         );
     }

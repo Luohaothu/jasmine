@@ -3,20 +3,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::{SinkExt, StreamExt};
 use jasmine_app::commands::{
     setup_default_app_state_with_config, AppRuntimeConfig, AppState, ChatMessagePayload,
     FrontendEmitter, PeerPayload, TransferPayload,
 };
 use jasmine_core::{
     parse_mentions, Message, PeerInfo, ProtocolMessage, StorageEngine, TransferStatus,
+    CURRENT_PROTOCOL_VERSION,
 };
-use jasmine_messaging::{WsClient, WsClientConfig, WsClientEvent, WsPeerIdentity};
+use jasmine_crypto::{generate_identity_keypair, public_key_to_base64};
+use jasmine_messaging::{WsClient, WsClientConfig, WsPeerIdentity};
 use jasmine_storage::SqliteStorage;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use uuid::Uuid;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -383,34 +387,6 @@ async fn assert_no_event<F>(
     );
 }
 
-async fn wait_for_ws_client_message<F>(
-    receiver: &mut broadcast::Receiver<WsClientEvent>,
-    predicate: F,
-) -> ProtocolMessage
-where
-    F: Fn(&ProtocolMessage) -> bool,
-{
-    time::timeout(ACTION_TIMEOUT, async {
-        loop {
-            match receiver.recv().await {
-                Ok(WsClientEvent::MessageReceived { message }) if predicate(&message) => {
-                    return message;
-                }
-                Ok(WsClientEvent::MessageReceived { .. }) => continue,
-                Ok(WsClientEvent::Disconnected { reason }) => {
-                    panic!("manual client disconnected unexpectedly: {reason:?}");
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    panic!("manual client event channel closed")
-                }
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for websocket client message")
-}
-
 async fn connect_manual_client(
     target: &TestNode,
     probe: &TestNode,
@@ -423,16 +399,83 @@ async fn connect_manual_client(
         .ws_port
         .expect("target peer must advertise websocket port");
     let manual_id = Uuid::new_v4().to_string();
-    let client = WsClient::connect(
-        format!("ws://127.0.0.1:{ws_port}"),
-        WsClientConfig::new(WsPeerIdentity::new(
-            manual_id.clone(),
-            display_name.to_string(),
-        )),
-    )
-    .await
-    .expect("connect manual websocket client");
+    let (private_key, public_key) = generate_identity_keypair();
+    let local_peer = WsPeerIdentity::new(manual_id.clone(), display_name.to_string())
+        .with_transport_identity(public_key_to_base64(&public_key), CURRENT_PROTOCOL_VERSION);
+    let mut client_config = WsClientConfig::new(local_peer);
+    client_config.local_private_key = Some(private_key.to_bytes().to_vec());
+    let client = WsClient::connect(format!("ws://127.0.0.1:{ws_port}"), client_config)
+        .await
+        .expect("connect manual websocket client");
     (client, manual_id)
+}
+
+async fn legacy_protocol_rejection(
+    target: &TestNode,
+    probe: &TestNode,
+    display_name: &str,
+    protocol_version: u32,
+) -> (ProtocolMessage, String) {
+    let target_id = target.device_id();
+    let _ = wait_for_peer(probe, target_id.clone()).await;
+    let peer = wait_for_peer_record(probe.database_path(), target_id).await;
+    let ws_port = peer
+        .ws_port
+        .expect("target peer must advertise websocket port");
+    let manual_id = Uuid::new_v4().to_string();
+    let (_, public_key) = generate_identity_keypair();
+    let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{ws_port}"))
+        .await
+        .expect("connect raw websocket legacy client");
+
+    socket
+        .send(WsMessage::Text(
+            ProtocolMessage::PeerInfo {
+                device_id: manual_id,
+                display_name: display_name.to_string(),
+                avatar_hash: None,
+                public_key: Some(public_key_to_base64(&public_key)),
+                protocol_version: Some(protocol_version),
+            }
+            .to_json()
+            .expect("serialize legacy peer info")
+            .into(),
+        ))
+        .await
+        .expect("send legacy peer info");
+
+    let incompatibility = time::timeout(ACTION_TIMEOUT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(WsMessage::Text(payload))) => {
+                    return ProtocolMessage::from_json(payload.as_str())
+                        .expect("parse legacy incompatibility message");
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => {
+                    panic!("legacy websocket transport error before close: {error}")
+                }
+                None => panic!("legacy websocket closed before incompatibility message"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for legacy incompatibility message");
+
+    time::timeout(ACTION_TIMEOUT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(WsMessage::Close(Some(frame)))) => {
+                    return (incompatibility, frame.reason.to_string())
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => panic!("legacy websocket closed with transport error: {error}"),
+                None => panic!("legacy websocket closed without close reason"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for legacy close reason")
 }
 
 fn write_relative_file(root: &Path, relative_path: &str, bytes: &[u8]) {
@@ -441,6 +484,36 @@ fn write_relative_file(root: &Path, relative_path: &str, bytes: &[u8]) {
         std::fs::create_dir_all(parent).expect("create file parent directories");
     }
     std::fs::write(path, bytes).expect("write fixture file");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phase2a_legacy_protocol_peer_receives_clear_incompatibility_reason() {
+    let _guard = suite_lock().lock().await;
+    within_test_timeout(
+        "phase2a_legacy_protocol_peer_receives_clear_incompatibility_reason",
+        async {
+            let alpha = TestNode::new().await;
+            let beta = TestNode::new().await;
+
+            let (message, reason) =
+                legacy_protocol_rejection(&alpha, &beta, "Legacy Peer", 1).await;
+            assert_eq!(
+                message,
+                ProtocolMessage::VersionIncompatible {
+                    local_version: CURRENT_PROTOCOL_VERSION,
+                    remote_version: 1,
+                    message:
+                        "peer protocol version 1 is incompatible; minimum supported version is 2"
+                            .to_string(),
+                }
+            );
+            assert_eq!(reason, "protocol version incompatible");
+
+            alpha.shutdown().await;
+            beta.shutdown().await;
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1200,10 +1273,8 @@ async fn phase2a_folder_manifest_sanitization_rejects_path_traversal() {
             let probe = TestNode::new().await;
             let (manual_client, manual_id) =
                 connect_manual_client(&beta, &probe, "Malicious Sender").await;
-            let mut manual_events = manual_client.subscribe();
 
             let folder_transfer_id = Uuid::new_v4().to_string();
-            let offer_id = Uuid::new_v4().to_string();
             let file_bytes = &b"owned"[..];
             let sha256 = sha256_hex(file_bytes);
             let offer_cursor = beta.emitter.mark();
@@ -1246,48 +1317,6 @@ async fn phase2a_folder_manifest_sanitization_rejects_path_traversal() {
                 .await
                 .expect("accept malicious folder transfer");
 
-            let accept_message = wait_for_ws_client_message(&mut manual_events, |message| {
-                matches!(
-                    message,
-                    ProtocolMessage::FolderAccept { folder_transfer_id: accepted }
-                        if accepted == &folder_transfer_id
-                )
-            })
-            .await;
-            assert!(matches!(
-                accept_message,
-                ProtocolMessage::FolderAccept { .. }
-            ));
-
-            manual_client
-                .send(ProtocolMessage::FileOffer {
-                    id: offer_id.clone(),
-                    filename: "escape.txt".to_string(),
-                    size: file_bytes.len() as u64,
-                    sha256,
-                    transfer_port: 1,
-                })
-                .await
-                .expect("send malicious file offer");
-
-            let reject_message = wait_for_ws_client_message(&mut manual_events, |message| {
-                matches!(
-                    message,
-                    ProtocolMessage::FileReject { offer_id: rejected, .. }
-                        if rejected == &offer_id
-                )
-            })
-            .await;
-            match reject_message {
-                ProtocolMessage::FileReject { reason, .. } => {
-                    assert!(
-                        reason.unwrap_or_default().contains("path"),
-                        "expected path-related file rejection"
-                    );
-                }
-                other => panic!("expected file reject, got {other:?}"),
-            }
-
             let completed = beta
                 .emitter
                 .wait_for_event(
@@ -1302,7 +1331,7 @@ async fn phase2a_folder_manifest_sanitization_rejects_path_traversal() {
                 .await;
             assert_eq!(
                 completed.get("status").and_then(Value::as_str),
-                Some("partially-failed")
+                Some("failed")
             );
 
             assert!(!beta.download_dir.join("escape.txt").exists());

@@ -1,10 +1,10 @@
-import React, { useState } from "react";
-import styles from "./GroupChat.module.css";
-import { MemberPanel } from "./MemberPanel";
-import { Peer } from "../../types/peer";
-import { MessageBubble } from "../ChatView/MessageBubble";
-import { MessageInput } from "../MessageInput/MessageInput";
-import { useChatStore } from "../../stores/chatStore";
+import React, { useState } from 'react';
+import styles from './GroupChat.module.css';
+import { MemberPanel } from './MemberPanel';
+import { Peer } from '../../types/peer';
+import { MessageBubble } from '../ChatView/MessageBubble';
+import { MessageInput } from '../MessageInput/MessageInput';
+import { useChatStore } from '../../stores/chatStore';
 
 export interface GroupMessage {
   id: string;
@@ -12,27 +12,35 @@ export interface GroupMessage {
   senderName?: string;
   content: string;
   timestamp: number;
+  encrypted?: boolean;
   isOwn: boolean;
-  status?: "sent" | "delivered" | "failed";
+  status?: 'sent' | 'delivered' | 'failed';
   isDeleted?: boolean;
   editedAt?: number;
   replyToId?: string;
   replyToPreview?: string;
 }
 
+/* eslint-disable no-unused-vars */
 export interface GroupChatProps {
   groupName: string;
   members: Peer[];
   messages: GroupMessage[];
-  // eslint-disable-next-line no-unused-vars
-  onSendMessage: (content: string, replyToId?: string) => void;
+  onSendMessage: (content: string, replyToId?: string) => void | Promise<void>;
+  onAddMembers?: (memberIds: string[]) => void | Promise<void>;
+  onRemoveMember?: (memberId: string) => void | Promise<void>;
+  onLeaveGroup?: () => void | Promise<void>;
 }
+/* eslint-enable no-unused-vars */
 
 export const GroupChat: React.FC<GroupChatProps> = ({
   groupName,
   members,
   messages,
   onSendMessage,
+  onAddMembers,
+  onRemoveMember,
+  onLeaveGroup,
 }) => {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const setReplyingTo = useChatStore((state) => state.setReplyingTo);
@@ -46,7 +54,8 @@ export const GroupChat: React.FC<GroupChatProps> = ({
             <p className={styles.subtitle}>{members.length} members</p>
           </div>
           <button
-            className={`${styles.manageBtn} ${isPanelOpen ? styles.activeManageBtn : ""}`}
+            type="button"
+            className={`${styles.manageBtn} ${isPanelOpen ? styles.activeManageBtn : ''}`}
             onClick={() => setIsPanelOpen(!isPanelOpen)}
           >
             管理 / Manage
@@ -73,6 +82,7 @@ export const GroupChat: React.FC<GroupChatProps> = ({
                   content={msg.content}
                   timestamp={msg.timestamp}
                   isOwn={msg.isOwn}
+                  encrypted={msg.encrypted}
                   status={msg.status}
                   isDeleted={msg.isDeleted}
                   editedAt={msg.editedAt}
@@ -85,11 +95,17 @@ export const GroupChat: React.FC<GroupChatProps> = ({
             ))
           )}
         </div>
-        
+
         <MessageInput onSend={onSendMessage} disabled={false} />
       </div>
 
-      <MemberPanel isOpen={isPanelOpen} members={members} />
+      <MemberPanel
+        isOpen={isPanelOpen}
+        members={members}
+        onAddMembers={onAddMembers}
+        onRemoveMember={onRemoveMember}
+        onLeaveGroup={onLeaveGroup}
+      />
     </div>
   );
 };

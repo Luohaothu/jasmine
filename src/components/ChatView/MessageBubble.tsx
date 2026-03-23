@@ -1,26 +1,27 @@
-import React, { useState } from "react";
-import { RichTextRenderer } from "../RichTextRenderer";
-import { ImageThumbnail } from "../ImageThumbnail/ImageThumbnail";
-import styles from "./MessageBubble.module.css";
+import React, { useState } from 'react';
+import { RichTextRenderer } from '../RichTextRenderer';
+import { ImageThumbnail } from '../ImageThumbnail/ImageThumbnail';
+import styles from './MessageBubble.module.css';
 
 export interface MessageBubbleProps {
   id: string;
   content: string;
   timestamp: number;
   isOwn: boolean;
+  encrypted?: boolean;
   senderName?: string;
-  status?: "sent" | "delivered" | "failed";
+  status?: 'sent' | 'delivered' | 'failed';
   isDeleted?: boolean;
   editedAt?: number;
   replyToId?: string;
   replyToPreview?: string;
-  type?: "text" | "image" | "file";
+  type?: 'text' | 'image' | 'file';
   metadata?: {
     fileName?: string;
     size?: number;
     originalPath?: string;
     thumbnailPath?: string;
-    thumbnailState?: "pending" | "ready" | "failed";
+    thumbnailState?: 'pending' | 'ready' | 'failed';
   };
   // eslint-disable-next-line no-unused-vars
   onEdit?: (id: string, newContent: string) => void;
@@ -35,6 +36,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   content,
   timestamp,
   isOwn,
+  encrypted,
   senderName,
   status,
   isDeleted,
@@ -51,18 +53,18 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   const [editContent, setEditContent] = useState(content);
 
   const date = new Date(timestamp);
-  const hours = date.getHours().toString().padStart(2, "0");
-  const minutes = date.getMinutes().toString().padStart(2, "0");
+  const hours = date.getHours().toString().padStart(2, '0');
+  const minutes = date.getMinutes().toString().padStart(2, '0');
   const timeString = `${hours}:${minutes}`;
 
   const renderStatus = () => {
     if (!isOwn || !status || isDeleted) return null;
     switch (status) {
-      case "sent":
+      case 'sent':
         return <span className={styles.status}>✓</span>;
-      case "delivered":
+      case 'delivered':
         return <span className={styles.status}>✓✓</span>;
-      case "failed":
+      case 'failed':
         return <span className={styles.status}>❌</span>;
       default:
         return null;
@@ -82,7 +84,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   };
 
   const handleDelete = () => {
-    if (window.confirm("Are you sure you want to delete this message?")) {
+    if (window.confirm('Are you sure you want to delete this message?')) {
       onDelete?.(id);
     }
   };
@@ -107,7 +109,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
   if (isDeleted) {
     return (
-      <div id={`message-${id}`} className={`${styles.container} ${isOwn ? styles.own : styles.peer}`}>
+      <div
+        id={`message-${id}`}
+        className={`${styles.container} ${isOwn ? styles.own : styles.peer}`}
+      >
         <div className={`${styles.bubble} ${styles.tombstone}`}>
           <div className={styles.content}>This message was deleted</div>
         </div>
@@ -119,22 +124,15 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     <div id={`message-${id}`} className={`${styles.container} ${isOwn ? styles.own : styles.peer}`}>
       <div className={`${styles.bubble} ${isOwn ? styles.ownBubble : styles.peerBubble}`}>
         {replyToId && replyToPreview && (
-          <div 
-            className={styles.quoteBubble} 
+          <button
+            type="button"
+            className={styles.quoteBubble}
             data-testid="quote-bubble"
             onClick={handleQuoteClick}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                handleQuoteClick();
-              }
-            }}
-            role="button"
-            tabIndex={0}
             aria-label={`Jump to replied message: ${replyToPreview}`}
           >
             <span className={styles.quotePreview}>{replyToPreview}</span>
-          </div>
+          </button>
         )}
         {isEditing ? (
           <div className={styles.editContainer}>
@@ -143,28 +141,31 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
               value={editContent}
               onChange={(e) => setEditContent(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   handleSave();
-                } else if (e.key === "Escape") {
+                } else if (e.key === 'Escape') {
                   e.preventDefault();
                   handleCancel();
                 }
               }}
-              autoFocus
             />
             <div className={styles.editActions}>
-              <button className={styles.saveButton} onClick={handleSave}>Save</button>
-              <button className={styles.cancelButton} onClick={handleCancel}>Cancel</button>
+              <button type="button" className={styles.saveButton} onClick={handleSave}>
+                Save
+              </button>
+              <button type="button" className={styles.cancelButton} onClick={handleCancel}>
+                Cancel
+              </button>
             </div>
           </div>
         ) : (
           <div className={styles.content}>
-            {type === "image" ? (
+            {type === 'image' ? (
               <ImageThumbnail
                 filePath={metadata?.originalPath}
                 thumbnailPath={metadata?.thumbnailPath}
-                thumbnailState={metadata?.thumbnailState || "pending"}
+                thumbnailState={metadata?.thumbnailState || 'pending'}
                 fileName={metadata?.fileName || content}
               />
             ) : (
@@ -172,21 +173,53 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             )}
           </div>
         )}
-        
+
         <div className={`${styles.meta} ${isOwn ? styles.ownMeta : styles.peerMeta}`}>
           {editedAt && !isEditing && <span className={styles.editedMark}>(edited)</span>}
+          {encrypted === true && (
+            <span
+              className={styles.encryptedBadge}
+              data-testid="encrypted-badge"
+              role="img"
+              aria-label="Encrypted message"
+              title="Encrypted message"
+            >
+              🔒
+            </span>
+          )}
           <span className={styles.time}>{timeString}</span>
           {renderStatus()}
         </div>
 
         {!isEditing && (
           <div className={styles.actions} data-testid="message-actions">
-            <button className={styles.actionButton} onClick={handleReply} data-testid="action-reply">Reply</button>
+            <button
+              type="button"
+              className={styles.actionButton}
+              onClick={handleReply}
+              data-testid="action-reply"
+            >
+              Reply
+            </button>
             {isOwn && onEdit && (
-              <button className={styles.actionButton} onClick={() => setIsEditing(true)} data-testid="action-edit">Edit</button>
+              <button
+                type="button"
+                className={styles.actionButton}
+                onClick={() => setIsEditing(true)}
+                data-testid="action-edit"
+              >
+                Edit
+              </button>
             )}
             {isOwn && onDelete && (
-              <button className={styles.actionButton} onClick={handleDelete} data-testid="action-delete">Delete</button>
+              <button
+                type="button"
+                className={styles.actionButton}
+                onClick={handleDelete}
+                data-testid="action-delete"
+              >
+                Delete
+              </button>
             )}
           </div>
         )}

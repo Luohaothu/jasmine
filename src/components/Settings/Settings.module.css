@@ -95,6 +95,10 @@
   align-items: center;
 }
 
+.row > *:not(button) {
+  min-width: 0;
+}
+
 .row .input {
   flex: 1;
 }
@@ -123,4 +127,24 @@
 
 .iconButton:hover {
   background-color: var(--border-color);
+}
+
+.fingerprintValue {
+  flex: 1;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  letter-spacing: 0.08em;
+  word-break: break-word;
+}
+
+.securityHint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
 }

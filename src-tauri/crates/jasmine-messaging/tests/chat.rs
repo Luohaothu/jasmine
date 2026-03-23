@@ -1,17 +1,29 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jasmine_core::{AckStatus, Message, MessageStatus, ProtocolMessage, StorageEngine};
+use jasmine_core::{
+    AckStatus, Message, MessageStatus, ProtocolMessage, StorageEngine, CURRENT_PROTOCOL_VERSION,
+};
+use jasmine_crypto::{
+    create_distribution_message, generate_sender_key, public_key_to_base64, PublicKey, StaticSecret,
+};
 use jasmine_messaging::{
     ChatService, ChatServiceConfig, ChatServiceEvent, WsClient, WsClientConfig, WsClientEvent,
     WsPeerIdentity, WsServer, WsServerConfig, WsServerEvent,
 };
 use jasmine_storage::SqliteStorage;
+use serde::Serialize;
 use tempfile::TempDir;
 use tokio::time;
 use uuid::Uuid;
 
 const TEST_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Serialize)]
+struct SenderKeyDistributionPayload {
+    key_id: String,
+    encrypted_key_material: Vec<u8>,
+}
 
 struct Node {
     identity: WsPeerIdentity,
@@ -72,12 +84,37 @@ impl Node {
 }
 
 fn peer(seed: u128, display_name: &str) -> WsPeerIdentity {
-    WsPeerIdentity::new(Uuid::from_u128(seed).to_string(), display_name)
+    let device_id = Uuid::from_u128(seed).to_string();
+    let secret = StaticSecret::from(deterministic_private_key_bytes(&device_id));
+    let public_key = PublicKey::from(&secret);
+    WsPeerIdentity::new(device_id, display_name)
+        .with_transport_identity(public_key_to_base64(&public_key), CURRENT_PROTOCOL_VERSION)
+}
+
+fn deterministic_private_key_bytes(device_id: &str) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in device_id.as_bytes().iter().enumerate() {
+        let slot = index % 32;
+        bytes[slot] = bytes[slot]
+            .wrapping_add(*byte)
+            .wrapping_add((index as u8).wrapping_mul(17));
+    }
+    if bytes.iter().all(|value| *value == 0) {
+        bytes[0] = 1;
+    }
+    bytes
+}
+
+fn local_private_key(device_id: &str) -> Vec<u8> {
+    StaticSecret::from(deterministic_private_key_bytes(device_id))
+        .to_bytes()
+        .to_vec()
 }
 
 fn server_config(identity: WsPeerIdentity) -> WsServerConfig {
     let mut config = WsServerConfig::new(identity);
     config.bind_addr = "127.0.0.1:0".to_string();
+    config.local_private_key = Some(local_private_key(&config.local_peer.device_id));
     config.heartbeat_interval = Duration::from_millis(100);
     config.max_missed_heartbeats = 3;
     config.handshake_timeout = Duration::from_secs(1);
@@ -86,6 +123,7 @@ fn server_config(identity: WsPeerIdentity) -> WsServerConfig {
 
 fn client_config(identity: WsPeerIdentity) -> WsClientConfig {
     let mut config = WsClientConfig::new(identity);
+    config.local_private_key = Some(local_private_key(&config.local_peer.device_id));
     config.heartbeat_interval = Duration::from_millis(100);
     config.max_missed_heartbeats = 3;
     config.handshake_timeout = Duration::from_secs(1);
@@ -245,6 +283,51 @@ async fn wait_for_message(storage: &Arc<SqliteStorage>, message_id: Uuid) -> Mes
     })
     .await
     .expect("message should be persisted")
+}
+
+async fn wait_for_sender_key(
+    storage: &Arc<SqliteStorage>,
+    group_id: &str,
+    sender_device_id: &str,
+) -> jasmine_core::SenderKeyInfo {
+    time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(sender_key) = storage
+                .get_sender_key(group_id, sender_device_id)
+                .await
+                .expect("load sender key")
+            {
+                return sender_key;
+            }
+
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sender key should be persisted")
+}
+
+async fn wait_for_no_sender_key(
+    storage: &Arc<SqliteStorage>,
+    group_id: &str,
+    sender_device_id: &str,
+) {
+    time::timeout(Duration::from_millis(250), async {
+        loop {
+            if storage
+                .get_sender_key(group_id, sender_device_id)
+                .await
+                .expect("load sender key absence")
+                .is_none()
+            {
+                return;
+            }
+
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sender key should remain absent")
 }
 
 fn truncated_reply_preview(content: &str) -> String {
@@ -941,6 +1024,195 @@ async fn chat_send_reply_message_snapshots_preview_and_preserves_it_after_origin
         receiver_reply_after_delete.reply_to_preview,
         Some("Original quoted message".to_string())
     );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn chat_sender_key_distribution_first_group_send_stores_local_and_remote_sender_keys() {
+    let sender = Node::new(57, "Group Sender").await;
+    let receiver = Node::new(58, "Group Receiver").await;
+    let mut receiver_server_events = receiver.server.subscribe();
+    let _client = sender.connect_to(&receiver).await;
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::PeerConnected { peer } => {
+            assert_eq!(peer.identity.device_id, sender.identity.device_id)
+        }
+        other => panic!("expected receiver peer connection, got {other:?}"),
+    }
+
+    let group = sender
+        .chat
+        .create_group("Study Group", vec![receiver.identity.device_id.clone()])
+        .await
+        .expect("create group");
+    let group_id = group.id.0.to_string();
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { peer, message } => {
+            assert_eq!(peer.identity.device_id, sender.identity.device_id);
+            match message {
+                ProtocolMessage::GroupCreate { group_id: id, .. } => assert_eq!(id, group_id),
+                other => panic!("expected group create, got {other:?}"),
+            }
+        }
+        other => panic!("expected group create event, got {other:?}"),
+    }
+
+    let sent = sender
+        .chat
+        .send_to_group(&group.id, "hello encrypted setup")
+        .await
+        .expect("send first group message");
+    assert_eq!(sent.status, MessageStatus::Delivered);
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { peer, message } => {
+            assert_eq!(peer.identity.device_id, sender.identity.device_id);
+            match message {
+                ProtocolMessage::SenderKeyDistribution {
+                    group_id: id,
+                    sender_key_data,
+                    epoch,
+                } => {
+                    assert_eq!(id, group_id);
+                    assert_eq!(epoch, 0);
+                    assert!(!sender_key_data.is_empty());
+                }
+                other => panic!("expected sender key distribution, got {other:?}"),
+            }
+        }
+        other => panic!("expected sender key distribution event, got {other:?}"),
+    }
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { peer, message } => {
+            assert_eq!(peer.identity.device_id, sender.identity.device_id);
+            match message {
+                ProtocolMessage::GroupMessage {
+                    group_id: id,
+                    sender_key_id,
+                    epoch,
+                    nonce,
+                    encrypted_content,
+                } => {
+                    assert_eq!(id, group_id);
+                    assert_eq!(epoch, 0);
+                    assert_ne!(sender_key_id, Uuid::nil());
+                    assert_eq!(nonce.len(), 12);
+                    assert!(!encrypted_content.is_empty());
+                }
+                other => {
+                    panic!("expected encrypted group message after distribution, got {other:?}")
+                }
+            }
+        }
+        other => panic!("expected plaintext group message event, got {other:?}"),
+    }
+
+    let local_sender_key =
+        wait_for_sender_key(&sender._storage, &group_id, &sender.identity.device_id).await;
+    let remote_sender_key =
+        wait_for_sender_key(&receiver._storage, &group_id, &sender.identity.device_id).await;
+
+    assert_eq!(local_sender_key.group_id, group_id);
+    assert_eq!(local_sender_key.sender_device_id, sender.identity.device_id);
+    assert_eq!(local_sender_key.epoch, 0);
+    assert_eq!(remote_sender_key.key_id, local_sender_key.key_id);
+    assert_eq!(remote_sender_key.key_data, local_sender_key.key_data);
+    assert_eq!(remote_sender_key.created_at, local_sender_key.created_at);
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn chat_sender_key_wrong_session_rejects_distribution_without_storing_key() {
+    let sender = Node::new(59, "Wrong Session Sender").await;
+    let receiver = Node::new(60, "Wrong Session Receiver").await;
+    let mut receiver_server_events = receiver.server.subscribe();
+    let client = sender.connect_to(&receiver).await;
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::PeerConnected { peer } => {
+            assert_eq!(peer.identity.device_id, sender.identity.device_id)
+        }
+        other => panic!("expected receiver peer connection, got {other:?}"),
+    }
+
+    let group = sender
+        .chat
+        .create_group("Bad Key Group", vec![receiver.identity.device_id.clone()])
+        .await
+        .expect("create group");
+    let group_id = group.id.0.to_string();
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { message, .. } => match message {
+            ProtocolMessage::GroupCreate { group_id: id, .. } => assert_eq!(id, group_id),
+            other => panic!("expected group create, got {other:?}"),
+        },
+        other => panic!("expected group create event, got {other:?}"),
+    }
+
+    let distribution = create_distribution_message(
+        group_id.clone(),
+        sender.identity.device_id.clone(),
+        &generate_sender_key(),
+        &[0x44; 32],
+    )
+    .expect("create invalid sender key distribution");
+    let payload = SenderKeyDistributionPayload {
+        key_id: distribution.key_id.to_string(),
+        encrypted_key_material: distribution.encrypted_key_material.clone(),
+    };
+    client
+        .send(ProtocolMessage::SenderKeyDistribution {
+            group_id: group_id.clone(),
+            sender_key_data: serde_json::to_string(&payload)
+                .expect("serialize invalid sender key payload"),
+            epoch: distribution.epoch,
+        })
+        .await
+        .expect("send invalid sender key distribution");
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { message, .. } => match message {
+            ProtocolMessage::SenderKeyDistribution { group_id: id, .. } => assert_eq!(id, group_id),
+            other => panic!("expected sender key distribution, got {other:?}"),
+        },
+        other => panic!("expected sender key distribution event, got {other:?}"),
+    }
+
+    wait_for_no_sender_key(&receiver._storage, &group_id, &sender.identity.device_id).await;
+
+    let direct = sender
+        .chat
+        .send_message(&receiver.identity.device_id, "connection still alive")
+        .await
+        .expect("send direct message after rejected sender key");
+
+    match expect_server_event(&mut receiver_server_events).await {
+        WsServerEvent::MessageReceived { message, .. } => match message {
+            ProtocolMessage::TextMessage { id, content, .. } => {
+                assert_eq!(id, direct.id.to_string());
+                assert_eq!(content, "connection still alive");
+            }
+            other => panic!("expected follow-up text message, got {other:?}"),
+        },
+        other => panic!("expected direct message event after rejected sender key, got {other:?}"),
+    }
+
+    let delivered = wait_for_status(
+        &sender.chat,
+        &receiver.identity.device_id,
+        direct.id,
+        MessageStatus::Delivered,
+    )
+    .await;
+    assert_eq!(delivered.content, "connection still alive");
 
     sender.shutdown().await;
     receiver.shutdown().await;

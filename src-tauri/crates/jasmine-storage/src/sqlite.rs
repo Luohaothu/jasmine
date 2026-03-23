@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jasmine_core::{
-    ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, Result, StorageEngine,
-    TransferRecord, TransferStatus, UserId,
+    ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, PeerKeyInfo, Result, ResumeInfo,
+    SenderKeyInfo, StorageEngine, TransferRecord, TransferStatus, UserId,
 };
 use r2d2::{ManageConnection, Pool};
 use rusqlite::types::Type;
@@ -30,6 +30,18 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: include_str!("../migrations/V2__edit_delete_richtext.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../migrations/V3__crypto_and_resume.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/V4__sender_key_epochs.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../migrations/V5__folder_file_status.sql"),
     },
 ];
 
@@ -76,6 +88,10 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    pub const FOLDER_FILE_STATUS_PENDING: &str = "pending";
+    pub const FOLDER_FILE_STATUS_COMPLETED: &str = "completed";
+    pub const FOLDER_FILE_STATUS_FAILED: &str = "failed";
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
 
@@ -110,6 +126,66 @@ impl SqliteStorage {
 
     pub fn pool_size(&self) -> u32 {
         POOL_SIZE
+    }
+
+    pub async fn save_folder_file_status(
+        &self,
+        folder_id: &str,
+        file_path: &str,
+        status: &str,
+        bytes_transferred: u64,
+    ) -> Result<()> {
+        validate_folder_file_status(status)?;
+
+        let folder_id = folder_id.to_string();
+        let file_path = file_path.to_string();
+        let status = status.to_string();
+        let bytes_transferred = u64_to_db_i64(bytes_transferred, "bytes_transferred")?;
+
+        self.with_connection("sqlite save folder file status failed", move |conn| {
+            conn.execute(
+                "INSERT INTO folder_file_status (folder_id, file_path, status, bytes_transferred)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(folder_id, file_path) DO UPDATE SET
+                     status = excluded.status,
+                     bytes_transferred = excluded.bytes_transferred",
+                params![folder_id, file_path, status, bytes_transferred],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_folder_file_statuses(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, String, u64)>> {
+        let folder_id = folder_id.to_string();
+
+        self.with_connection("sqlite get folder file statuses failed", move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT file_path, status, bytes_transferred
+                 FROM folder_file_status
+                 WHERE folder_id = ?1
+                 ORDER BY file_path ASC",
+            )?;
+            let rows = statement.query_map(params![folder_id], |row| {
+                let bytes_transferred: i64 = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    db_i64_to_u64(bytes_transferred, 2)?,
+                ))
+            })?;
+
+            let mut statuses = Vec::new();
+            for row in rows {
+                statuses.push(row?);
+            }
+
+            Ok(statuses)
+        })
+        .await
     }
 
     pub async fn save_chat(&self, chat: &ChatRecord) -> Result<()> {
@@ -424,6 +500,201 @@ impl StorageEngine for SqliteStorage {
         .await
     }
 
+    async fn save_peer_key(
+        &self,
+        device_id: &str,
+        public_key: &[u8],
+        fingerprint: &str,
+    ) -> Result<()> {
+        let device_id = device_id.to_string();
+        let public_key = public_key.to_vec();
+        let fingerprint = fingerprint.to_string();
+        let seen_at = now_ms();
+
+        self.with_connection("sqlite save peer key failed", move |conn| {
+            conn.execute(
+                "INSERT INTO peer_keys (
+                    device_id, public_key, fingerprint, verified, first_seen, last_seen
+                 ) VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                     public_key = excluded.public_key,
+                     fingerprint = excluded.fingerprint,
+                     last_seen = excluded.last_seen",
+                params![device_id, public_key, fingerprint, seen_at, seen_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_peer_key(&self, device_id: &str) -> Result<Option<PeerKeyInfo>> {
+        let device_id = device_id.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT device_id, public_key, fingerprint, verified, first_seen, last_seen
+                 FROM peer_keys
+                 WHERE device_id = ?1",
+                params![device_id],
+                map_peer_key_row,
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get peer key failed", error))
+        })
+        .await
+    }
+
+    async fn get_all_peer_keys(&self) -> Result<Vec<PeerKeyInfo>> {
+        self.with_connection("sqlite list peer keys failed", move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT device_id, public_key, fingerprint, verified, first_seen, last_seen
+                 FROM peer_keys
+                 ORDER BY last_seen DESC, device_id ASC",
+            )?;
+            let rows = statement.query_map([], map_peer_key_row)?;
+
+            let mut keys = Vec::new();
+            for row in rows {
+                keys.push(row?);
+            }
+
+            Ok(keys)
+        })
+        .await
+    }
+
+    async fn set_peer_verified(&self, device_id: &str, verified: bool) -> Result<()> {
+        let device_id = device_id.to_string();
+        let verified = bool_to_db(verified);
+
+        self.with_connection_result(move |conn| {
+            let rows_updated = conn
+                .execute(
+                    "UPDATE peer_keys SET verified = ?2 WHERE device_id = ?1",
+                    params![device_id.clone(), verified],
+                )
+                .map_err(|error| sqlite_persistence("sqlite set peer verified failed", error))?;
+            if rows_updated == 0 {
+                return Err(not_found_error("peer key", &device_id));
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn update_peer_key_last_seen(&self, device_id: &str) -> Result<()> {
+        let device_id = device_id.to_string();
+        let seen_at = now_ms();
+
+        self.with_connection("sqlite update peer key last seen failed", move |conn| {
+            conn.execute(
+                "UPDATE peer_keys SET last_seen = ?2 WHERE device_id = ?1",
+                params![device_id, seen_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn save_sender_key(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+        key_id: &Uuid,
+        key_data: &[u8],
+        epoch: u32,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+        let key_id = key_id.to_string();
+        let key_data = key_data.to_vec();
+        let created_at = u64_to_db_i64(created_at_ms, "created_at_ms")?;
+
+        self.with_connection("sqlite save sender key failed", move |conn| {
+            conn.execute(
+                "INSERT INTO sender_keys (
+                    group_id, sender_device_id, epoch, key_id, key_data, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(group_id, sender_device_id, epoch) DO UPDATE SET
+                     key_id = excluded.key_id,
+                     key_data = excluded.key_data,
+                     created_at = excluded.created_at",
+                params![
+                    group_id,
+                    sender_device_id,
+                    i64::from(epoch),
+                    key_id,
+                    key_data,
+                    created_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_sender_key(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+    ) -> Result<Option<SenderKeyInfo>> {
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT group_id, sender_device_id, epoch, key_id, key_data, created_at
+                 FROM sender_keys
+                 WHERE group_id = ?1 AND sender_device_id = ?2
+                 ORDER BY epoch DESC, created_at DESC
+                 LIMIT 1",
+                params![group_id, sender_device_id],
+                map_sender_key_row,
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get sender key failed", error))
+        })
+        .await
+    }
+
+    async fn get_sender_key_by_epoch(
+        &self,
+        group_id: &str,
+        sender_device_id: &str,
+        epoch: u32,
+    ) -> Result<Option<SenderKeyInfo>> {
+        let group_id = group_id.to_string();
+        let sender_device_id = sender_device_id.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT group_id, sender_device_id, epoch, key_id, key_data, created_at
+                 FROM sender_keys
+                 WHERE group_id = ?1 AND sender_device_id = ?2 AND epoch = ?3",
+                params![group_id, sender_device_id, i64::from(epoch)],
+                map_sender_key_row,
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get sender key by epoch failed", error))
+        })
+        .await
+    }
+
+    async fn delete_sender_keys_for_group(&self, group_id: &str) -> Result<()> {
+        let group_id = group_id.to_string();
+
+        self.with_connection("sqlite delete sender keys for group failed", move |conn| {
+            conn.execute(
+                "DELETE FROM sender_keys WHERE group_id = ?1",
+                params![group_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn update_message_status(&self, msg_id: &Uuid, status: MessageStatus) -> Result<()> {
         let msg_id = *msg_id;
 
@@ -507,6 +778,7 @@ impl StorageEngine for SqliteStorage {
                 ))
             }
         };
+        let bytes_transferred = u64_to_db_i64(transfer.bytes_transferred, "bytes_transferred")?;
 
         self.with_connection("sqlite save transfer failed", move |conn| {
             let created_at = now_ms();
@@ -517,8 +789,8 @@ impl StorageEngine for SqliteStorage {
             transaction.execute(
                 "INSERT INTO transfers (
                     id, peer_id, filename, size, direction, status, sha256, created_at, completed_at,
-                    thumbnail_path, folder_id, folder_relative_path
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11)
+                    thumbnail_path, folder_id, folder_relative_path, bytes_transferred, resume_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                      peer_id = excluded.peer_id,
                      filename = excluded.filename,
@@ -530,7 +802,9 @@ impl StorageEngine for SqliteStorage {
                      completed_at = excluded.completed_at,
                      thumbnail_path = COALESCE(excluded.thumbnail_path, transfers.thumbnail_path),
                      folder_id = COALESCE(excluded.folder_id, transfers.folder_id),
-                     folder_relative_path = COALESCE(excluded.folder_relative_path, transfers.folder_relative_path)",
+                     folder_relative_path = COALESCE(excluded.folder_relative_path, transfers.folder_relative_path),
+                     bytes_transferred = MAX(transfers.bytes_transferred, excluded.bytes_transferred),
+                     resume_token = COALESCE(excluded.resume_token, transfers.resume_token)",
                 params![
                     transfer.id.to_string(),
                     transfer.peer_id.0.to_string(),
@@ -542,7 +816,9 @@ impl StorageEngine for SqliteStorage {
                     completed_at,
                     transfer.thumbnail_path,
                     transfer.folder_id,
-                    transfer.folder_relative_path
+                    transfer.folder_relative_path,
+                    bytes_transferred,
+                    transfer.resume_token
                 ],
             )?;
             transaction.execute(
@@ -578,7 +854,9 @@ impl StorageEngine for SqliteStorage {
                     t.status,
                     t.thumbnail_path,
                     t.folder_id,
-                    t.folder_relative_path
+                    t.folder_relative_path,
+                    t.bytes_transferred,
+                    t.resume_token
                  FROM transfers t
                  LEFT JOIN transfer_context tc ON tc.id = t.id
                  ORDER BY t.created_at DESC, t.id DESC
@@ -594,6 +872,8 @@ impl StorageEngine for SqliteStorage {
                 let thumbnail_path: Option<String> = row.get(6)?;
                 let folder_id: Option<String> = row.get(7)?;
                 let folder_relative_path: Option<String> = row.get(8)?;
+                let bytes_transferred: i64 = row.get(9)?;
+                let resume_token: Option<String> = row.get(10)?;
 
                 Ok(TransferRecord {
                     id: parse_uuid(&transfer_id)?,
@@ -607,6 +887,8 @@ impl StorageEngine for SqliteStorage {
                     thumbnail_path,
                     folder_id,
                     folder_relative_path,
+                    bytes_transferred: db_i64_to_u64(bytes_transferred, 9)?,
+                    resume_token,
                 })
             })?;
 
@@ -677,6 +959,50 @@ impl StorageEngine for SqliteStorage {
             .optional()
             .map(|value| value.flatten())
             .map_err(|error| sqlite_persistence("sqlite get thumbnail path failed", error))
+        })
+        .await
+    }
+
+    async fn update_bytes_transferred(&self, transfer_id: &str, bytes: u64) -> Result<()> {
+        let transfer_id = parse_uuid_arg(transfer_id, "transfer_id")?.to_string();
+        let bytes = u64_to_db_i64(bytes, "bytes")?;
+
+        self.with_connection_result(move |conn| {
+            let rows_updated = conn
+                .execute(
+                    "UPDATE transfers SET bytes_transferred = ?2 WHERE id = ?1",
+                    params![transfer_id.clone(), bytes],
+                )
+                .map_err(|error| {
+                    sqlite_persistence("sqlite update bytes transferred failed", error)
+                })?;
+            if rows_updated == 0 {
+                return Err(not_found_error("transfer", &transfer_id));
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_transfer_resume_info(&self, transfer_id: &str) -> Result<Option<ResumeInfo>> {
+        let transfer_id = parse_uuid_arg(transfer_id, "transfer_id")?.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT bytes_transferred, resume_token FROM transfers WHERE id = ?1",
+                params![transfer_id],
+                |row| {
+                    let bytes_transferred: i64 = row.get(0)?;
+
+                    Ok(ResumeInfo {
+                        bytes_transferred: db_i64_to_u64(bytes_transferred, 0)?,
+                        resume_token: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get transfer resume info failed", error))
         })
         .await
     }
@@ -799,6 +1125,36 @@ fn map_chat_row(row: &Row<'_>) -> rusqlite::Result<ChatRecord> {
     })
 }
 
+fn map_peer_key_row(row: &Row<'_>) -> rusqlite::Result<PeerKeyInfo> {
+    let verified: i64 = row.get(3)?;
+    let first_seen: i64 = row.get(4)?;
+    let last_seen: i64 = row.get(5)?;
+
+    Ok(PeerKeyInfo {
+        device_id: row.get(0)?,
+        public_key: row.get(1)?,
+        fingerprint: row.get(2)?,
+        verified: db_to_bool(verified),
+        first_seen: db_i64_to_u64(first_seen, 4)?,
+        last_seen: db_i64_to_u64(last_seen, 5)?,
+    })
+}
+
+fn map_sender_key_row(row: &Row<'_>) -> rusqlite::Result<SenderKeyInfo> {
+    let epoch: i64 = row.get(2)?;
+    let key_id: String = row.get(3)?;
+    let created_at: i64 = row.get(5)?;
+
+    Ok(SenderKeyInfo {
+        group_id: row.get(0)?,
+        sender_device_id: row.get(1)?,
+        epoch: db_i64_to_u32(epoch, 2)?,
+        key_id: parse_uuid(&key_id)?,
+        key_data: row.get(4)?,
+        created_at: db_i64_to_u64(created_at, 5)?,
+    })
+}
+
 fn map_message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
     let message_id: String = row.get(0)?;
     let chat_id: String = row.get(1)?;
@@ -828,6 +1184,17 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
 fn parse_uuid(raw: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(raw)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
+}
+
+fn validate_folder_file_status(status: &str) -> Result<()> {
+    match status {
+        SqliteStorage::FOLDER_FILE_STATUS_PENDING
+        | SqliteStorage::FOLDER_FILE_STATUS_COMPLETED
+        | SqliteStorage::FOLDER_FILE_STATUS_FAILED => Ok(()),
+        _ => Err(CoreError::Validation(format!(
+            "invalid folder file status: {status}"
+        ))),
+    }
 }
 
 fn message_status_to_db(status: &MessageStatus) -> &'static str {

@@ -1,8 +1,8 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { create } from "zustand";
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { create } from 'zustand';
 
-import { TransferState } from "./transferStore";
+import { TransferState } from './transferStore';
 
 export interface FolderTransferFile {
   id: string;
@@ -24,6 +24,7 @@ export interface FolderTransfer {
   transferredFiles: number;
   speed: number;
   state: TransferState;
+  resumable?: boolean;
   senderName?: string;
   currentFile?: string;
   files: FolderTransferFile[];
@@ -68,6 +69,7 @@ interface TransferPayload {
   state: string;
   folderId?: string;
   folderRelativePath?: string;
+  resumable?: boolean;
 }
 
 function upsertFolderTransfer(
@@ -85,36 +87,36 @@ function upsertFolderTransfer(
 
 function folderStatusToTransferState(status: string): TransferState {
   switch (status) {
-    case "pending":
-      return "queued";
-    case "sending":
-      return "active";
-    case "completed":
-      return "completed";
-    case "cancelled":
-      return "cancelled";
-    case "rejected":
-      return "rejected";
-    case "partially-failed":
-      return "partially-failed";
-    case "failed":
+    case 'pending':
+      return 'queued';
+    case 'sending':
+      return 'active';
+    case 'completed':
+      return 'completed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'rejected':
+      return 'rejected';
+    case 'partially-failed':
+      return 'partially-failed';
+    case 'failed':
     default:
-      return "failed";
+      return 'failed';
   }
 }
 
 function transferStatusToTransferState(status: string): TransferState {
   switch (status) {
-    case "queued":
-    case "active":
-    case "completed":
-    case "failed":
-    case "cancelled":
-    case "rejected":
-    case "partially-failed":
+    case 'queued':
+    case 'active':
+    case 'completed':
+    case 'failed':
+    case 'cancelled':
+    case 'rejected':
+    case 'partially-failed':
       return status as TransferState;
     default:
-      return "failed";
+      return 'failed';
   }
 }
 
@@ -159,17 +161,17 @@ function buildFolderFilesByTransferId(
 
 function nextCurrentFile(files: FolderTransferFile[]): string | undefined {
   return (
-    files.find((file) => file.state === "active")?.relativePath ||
-    files.find((file) => file.state === "queued")?.relativePath
+    files.find((file) => file.state === 'active')?.relativePath ||
+    files.find((file) => file.state === 'queued')?.relativePath
   );
 }
 
 async function refreshFolderTransferFiles() {
   try {
-    const transfers = (await invoke<TransferPayload[]>("get_transfers")) || [];
+    const transfers = (await invoke<TransferPayload[]>('get_transfers')) || [];
     useFolderTransferStore.getState().syncFolderTransferFiles(transfers);
   } catch (error) {
-    console.warn("Failed to sync folder transfer files:", error);
+    console.warn('Failed to sync folder transfer files:', error);
   }
 }
 
@@ -189,7 +191,10 @@ interface FolderTransferStore {
     currentFile?: string
   ): void;
   updateFolderState(id: string, state: TransferState): void;
+  resetFolderProgress(id: string): void;
   cancelFolderTransfer(id: string): void;
+  resumeFolderTransfer(id: string): Promise<string>;
+  retryFolderTransfer(id: string): Promise<string>;
   addFolderOffer(offer: FolderOffer): void;
   removeFolderOffer(id: string): void;
   syncFolderTransferFiles(transfers: TransferPayload[]): void;
@@ -199,13 +204,23 @@ interface FolderTransferStore {
 export const useFolderTransferStore = create<FolderTransferStore>((set) => ({
   folderTransfers: [],
   activeFolderOffers: [],
-  addFolderTransfer: (transfer) => set((state) => ({
-    folderTransfers: upsertFolderTransfer(state.folderTransfers, transfer),
-  })),
-  removeFolderTransfer: (id) => set((state) => ({
-    folderTransfers: state.folderTransfers.filter((transfer) => transfer.id !== id),
-  })),
-  updateFolderProgress: (id, totalSize, totalFiles, transferredBytes, transferredFiles, speed, currentFile) =>
+  addFolderTransfer: (transfer) =>
+    set((state) => ({
+      folderTransfers: upsertFolderTransfer(state.folderTransfers, transfer),
+    })),
+  removeFolderTransfer: (id) =>
+    set((state) => ({
+      folderTransfers: state.folderTransfers.filter((transfer) => transfer.id !== id),
+    })),
+  updateFolderProgress: (
+    id,
+    totalSize,
+    totalFiles,
+    transferredBytes,
+    transferredFiles,
+    speed,
+    currentFile
+  ) =>
     set((state) => {
       const existingTransfer = state.folderTransfers.find((transfer) => transfer.id === id);
       return {
@@ -217,45 +232,62 @@ export const useFolderTransferStore = create<FolderTransferStore>((set) => ({
           transferredBytes,
           transferredFiles,
           speed,
-          state: "active",
+          state: 'active',
           currentFile,
           senderName: existingTransfer?.senderName,
           files: existingTransfer?.files || [],
         }),
       };
     }),
-  updateFolderState: (id, transferState) => set((state) => ({
-    folderTransfers: state.folderTransfers.map((transfer) =>
-      transfer.id === id ? { ...transfer, state: transferState } : transfer
-    ),
-  })),
-  cancelFolderTransfer: (id) => set((state) => ({
-    folderTransfers: state.folderTransfers.map((transfer) =>
-      transfer.id === id ? { ...transfer, state: "cancelled" } : transfer
-    ),
-  })),
-  addFolderOffer: (offer) => set((state) => ({
-    activeFolderOffers: [...state.activeFolderOffers, offer],
-  })),
-  removeFolderOffer: (id) => set((state) => ({
-    activeFolderOffers: state.activeFolderOffers.filter((offer) => offer.id !== id),
-  })),
-  syncFolderTransferFiles: (transfers) => set((state) => {
-    const filesByTransferId = buildFolderFilesByTransferId(transfers);
+  updateFolderState: (id, transferState) =>
+    set((state) => ({
+      folderTransfers: state.folderTransfers.map((transfer) =>
+        transfer.id === id ? { ...transfer, state: transferState } : transfer
+      ),
+    })),
+  resetFolderProgress: (id) =>
+    set((state) => ({
+      folderTransfers: state.folderTransfers.map((transfer) =>
+        transfer.id === id
+          ? { ...transfer, transferredBytes: 0, transferredFiles: 0, speed: 0 }
+          : transfer
+      ),
+    })),
+  cancelFolderTransfer: (id) =>
+    set((state) => ({
+      folderTransfers: state.folderTransfers.map((transfer) =>
+        transfer.id === id ? { ...transfer, state: 'cancelled' } : transfer
+      ),
+    })),
+  resumeFolderTransfer: async (id) => invoke<string>('resume_transfer', { transferId: id }),
+  retryFolderTransfer: async (id) => invoke<string>('retry_transfer', { transferId: id }),
+  addFolderOffer: (offer) =>
+    set((state) => ({
+      activeFolderOffers: [...state.activeFolderOffers, offer],
+    })),
+  removeFolderOffer: (id) =>
+    set((state) => ({
+      activeFolderOffers: state.activeFolderOffers.filter((offer) => offer.id !== id),
+    })),
+  syncFolderTransferFiles: (transfers) =>
+    set((state) => {
+      const filesByTransferId = buildFolderFilesByTransferId(transfers);
 
-    return {
-      folderTransfers: state.folderTransfers.map((transfer) => {
-        const files = filesByTransferId.get(transfer.id) || transfer.files;
-        const currentFile = nextCurrentFile(files);
+      return {
+        folderTransfers: state.folderTransfers.map((transfer) => {
+          const folderPayload = transfers.find((t) => t.id === transfer.id);
+          const files = filesByTransferId.get(transfer.id) || transfer.files;
+          const currentFile = nextCurrentFile(files);
 
-        return {
-          ...transfer,
-          currentFile: currentFile ?? (files.length === 0 ? transfer.currentFile : undefined),
-          files,
-        };
-      }),
-    };
-  }),
+          return {
+            ...transfer,
+            resumable: folderPayload?.resumable ?? transfer.resumable,
+            currentFile: currentFile ?? (files.length === 0 ? transfer.currentFile : undefined),
+            files,
+          };
+        }),
+      };
+    }),
 }));
 
 export async function setupFolderTransferListeners(): Promise<() => void> {
@@ -265,7 +297,7 @@ export async function setupFolderTransferListeners(): Promise<() => void> {
 
   await refreshFolderTransferFiles();
 
-  const unlistenOffer = await listen<FolderOfferEventPayload>("folder-offer-received", (event) => {
+  const unlistenOffer = await listen<FolderOfferEventPayload>('folder-offer-received', (event) => {
     useFolderTransferStore.getState().addFolderOffer({
       id: event.payload.folderTransferId,
       folderName: event.payload.folderName,
@@ -275,32 +307,50 @@ export async function setupFolderTransferListeners(): Promise<() => void> {
     });
   });
 
-  const unlistenProgress = await listen<FolderProgressEventPayload>("folder-progress", (event) => {
-    useFolderTransferStore.getState().updateFolderProgress(
-      event.payload.folderTransferId,
-      event.payload.totalBytes,
-      event.payload.totalFiles,
-      event.payload.sentBytes,
-      event.payload.completedFiles,
-      0,
-      undefined
-    );
+  const unlistenProgress = await listen<FolderProgressEventPayload>('folder-progress', (event) => {
+    useFolderTransferStore
+      .getState()
+      .updateFolderProgress(
+        event.payload.folderTransferId,
+        event.payload.totalBytes,
+        event.payload.totalFiles,
+        event.payload.sentBytes,
+        event.payload.completedFiles,
+        0,
+        undefined
+      );
     refreshFiles();
   });
 
-  const unlistenCompleted = await listen<FolderCompletedEventPayload>("folder-completed", (event) => {
-    useFolderTransferStore.getState().updateFolderState(
-      event.payload.folderTransferId,
-      folderStatusToTransferState(event.payload.status)
-    );
+  const unlistenCompleted = await listen<FolderCompletedEventPayload>(
+    'folder-completed',
+    (event) => {
+      useFolderTransferStore
+        .getState()
+        .updateFolderState(
+          event.payload.folderTransferId,
+          folderStatusToTransferState(event.payload.status)
+        );
+      refreshFiles();
+    }
+  );
+
+  const unlistenTransferProgress = await listen('transfer-progress', () => {
     refreshFiles();
   });
 
-  const unlistenTransferProgress = await listen("transfer-progress", () => {
+  const unlistenTransferState = await listen('transfer-state-changed', () => {
     refreshFiles();
   });
 
-  const unlistenTransferState = await listen("transfer-state-changed", () => {
+  const unlistenResumed = await listen<{ id: string }>('transfer-resumed', (event) => {
+    useFolderTransferStore.getState().updateFolderState(event.payload.id, 'active');
+    refreshFiles();
+  });
+
+  const unlistenRetried = await listen<{ id: string }>('transfer-retried', (event) => {
+    useFolderTransferStore.getState().resetFolderProgress(event.payload.id);
+    useFolderTransferStore.getState().updateFolderState(event.payload.id, 'active');
     refreshFiles();
   });
 
@@ -310,5 +360,7 @@ export async function setupFolderTransferListeners(): Promise<() => void> {
     unlistenCompleted();
     unlistenTransferProgress();
     unlistenTransferState();
+    unlistenResumed();
+    unlistenRetried();
   };
 }

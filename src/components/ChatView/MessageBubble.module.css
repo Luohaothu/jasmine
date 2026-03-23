@@ -35,6 +35,7 @@
 }
 
 .quoteBubble {
+  border: none;
   background-color: rgba(0, 0, 0, 0.05);
   border-left: 3px solid rgba(0, 0, 0, 0.2);
   padding: 6px 8px;
@@ -49,6 +50,7 @@
   text-overflow: ellipsis;
   cursor: pointer;
   transition: opacity 0.2s;
+  text-align: left;
 }
 
 .quoteBubble:hover {
@@ -107,9 +109,17 @@
 }
 
 @keyframes flashHighlight {
-  0% { opacity: 1; filter: brightness(1); }
-  50% { filter: brightness(1.5); }
-  100% { opacity: 1; filter: brightness(1); }
+  0% {
+    opacity: 1;
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.5);
+  }
+  100% {
+    opacity: 1;
+    filter: brightness(1);
+  }
 }
 
 .highlight {
@@ -119,6 +129,14 @@
 .editedMark {
   font-size: 0.65rem;
   opacity: 0.7;
+}
+
+.encryptedBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  opacity: 0.9;
 }
 
 .actions {
@@ -131,7 +149,7 @@
   border: 1px solid var(--border-color, #e0e0e0);
   border-radius: 4px;
   padding: 2px 4px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
 }
 
 .bubble:hover .actions {
@@ -176,7 +194,8 @@
   gap: 8px;
 }
 
-.saveButton, .cancelButton {
+.saveButton,
+.cancelButton {
   border: none;
   padding: 4px 8px;
   border-radius: 4px;
