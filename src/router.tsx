@@ -8,6 +8,7 @@ import { FileTransferPanel } from './components/FileTransfer/FileTransferPanel';
 import { FileReceiveDialog } from './components/FileTransfer/FileReceiveDialog';
 import { FolderTransferPanel } from './components/FolderTransfer/FolderTransferPanel';
 import { FolderReceiveDialog } from './components/FolderTransfer/FolderReceiveDialog';
+import { CallManager } from './components/Call/CallManager';
 import { setupChatEventListeners } from './stores/chatStore';
 import { setupFolderTransferListeners } from './stores/folderTransferStore';
 import { setupGroupListeners } from './stores/groupStore';
@@ -61,6 +62,7 @@ export const AppShell = () => {
       <FileReceiveDialog />
       <FolderTransferPanel />
       <FolderReceiveDialog />
+      <CallManager />
     </div>
   );
 };
