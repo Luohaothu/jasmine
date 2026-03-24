@@ -1,22 +1,25 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jasmine_core::{
-    ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, PeerKeyInfo, Result, ResumeInfo,
-    SenderKeyInfo, StorageEngine, TransferRecord, TransferStatus, UserId,
+    ChatId, CoreError, DeviceId, Message, MessageStatus, OgMetadata, PeerInfo, PeerKeyInfo, Result,
+    ResumeInfo, SenderKeyInfo, StorageEngine, TransferRecord, TransferStatus, UserId,
 };
 use r2d2::{ManageConnection, Pool};
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use tokio::task;
 use uuid::Uuid;
 
 const POOL_SIZE: u32 = 4;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
+const SQLITE_MAX_VARIABLES: usize = 900;
 const TRANSFER_DIRECTION_SEND: &str = "send";
 const MESSAGE_SELECT_COLUMNS: &str =
-    "id, chat_id, sender_id, content, timestamp, status, edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview";
+    "id, chat_id, sender_id, content, timestamp, status, edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview, created_at, vector_clock";
 const MESSAGE_EDIT_WINNER_EXPR: &str =
     "excluded.edit_version > messages.edit_version OR (excluded.edit_version = messages.edit_version AND COALESCE(excluded.edited_at, -1) > COALESCE(messages.edited_at, -1))";
 const MESSAGE_DELETE_WINNER_EXPR: &str =
@@ -42,6 +45,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: include_str!("../migrations/V5__folder_file_status.sql"),
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("../migrations/V6__vector_clock_og_cache_reply_index.sql"),
     },
 ];
 
@@ -79,6 +86,37 @@ pub struct ChatRecord {
     pub chat_type: ChatType,
     pub name: Option<String>,
     pub created_at_ms: i64,
+}
+
+struct StoredMessageRecord {
+    message: Message,
+    created_at_ms: i64,
+    vector_clock: Option<HashMap<String, u64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedOgMetadata {
+    metadata: OgMetadata,
+    pub fetched_at_ms: i64,
+    pub ttl_seconds: i64,
+}
+
+impl CachedOgMetadata {
+    pub fn new(metadata: OgMetadata, fetched_at_ms: i64, ttl_seconds: i64) -> Self {
+        Self {
+            metadata,
+            fetched_at_ms,
+            ttl_seconds,
+        }
+    }
+
+    pub fn metadata(&self) -> &OgMetadata {
+        &self.metadata
+    }
+
+    pub fn into_metadata(self) -> OgMetadata {
+        self.metadata
+    }
 }
 
 #[derive(Clone)]
@@ -126,6 +164,112 @@ impl SqliteStorage {
 
     pub fn pool_size(&self) -> u32 {
         POOL_SIZE
+    }
+
+    pub async fn save_message_with_vector_clock(
+        &self,
+        message: &Message,
+        vector_clock: Option<&HashMap<String, u64>>,
+    ) -> Result<()> {
+        let vector_clock_json = vector_clock.map(serialize_vector_clock);
+        self.save_message_record(message.clone(), vector_clock_json)
+            .await
+    }
+
+    pub async fn get_message_vector_clock(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<HashMap<String, u64>>> {
+        let message_id = parse_uuid_arg(message_id, "message_id")?.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT vector_clock FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten().as_deref().and_then(parse_vector_clock))
+            .map_err(|error| sqlite_persistence("sqlite get message vector clock failed", error))
+        })
+        .await
+    }
+
+    pub async fn get_reply_count(&self, message_id: &str) -> Result<i64> {
+        let message_id = parse_uuid_arg(message_id, "message_id")?.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE reply_to_id = ?1",
+                params![message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| sqlite_persistence("sqlite get reply count failed", error))
+        })
+        .await
+    }
+
+    pub async fn get_reply_counts(&self, message_ids: &[String]) -> Result<HashMap<String, i64>> {
+        let message_ids = message_ids
+            .iter()
+            .map(|message_id| parse_uuid_arg(message_id, "message_id").map(|id| id.to_string()))
+            .collect::<Result<Vec<_>>>()?;
+
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.with_connection_result(move |conn| load_reply_counts(conn, &message_ids))
+            .await
+    }
+
+    pub async fn get_cached_og_metadata(&self, url: &str) -> Result<Option<CachedOgMetadata>> {
+        let url = url.to_string();
+
+        self.with_connection_result(move |conn| {
+            conn.query_row(
+                "SELECT url, title, description, image_url, site_name, fetched_at, ttl_seconds
+                 FROM og_cache
+                 WHERE url = ?1",
+                params![url],
+                map_og_cache_row,
+            )
+            .optional()
+            .map_err(|error| sqlite_persistence("sqlite get cached og metadata failed", error))
+        })
+        .await
+    }
+
+    pub async fn save_og_metadata(&self, metadata: &OgMetadata, ttl_seconds: u64) -> Result<()> {
+        let metadata = metadata.clone();
+        let ttl_seconds = u64_to_db_i64(ttl_seconds, "ttl_seconds")?;
+        let fetched_at = now_ms();
+
+        self.with_connection("sqlite save og metadata failed", move |conn| {
+            conn.execute(
+                "INSERT INTO og_cache (
+                    url, title, description, image_url, site_name, fetched_at, ttl_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(url) DO UPDATE SET
+                    title = excluded.title,
+                    description = excluded.description,
+                    image_url = excluded.image_url,
+                    site_name = excluded.site_name,
+                    fetched_at = excluded.fetched_at,
+                    ttl_seconds = excluded.ttl_seconds",
+                params![
+                    metadata.url,
+                    metadata.title,
+                    metadata.description,
+                    metadata.image_url,
+                    metadata.site_name,
+                    fetched_at,
+                    ttl_seconds
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn save_folder_file_status(
@@ -360,19 +504,21 @@ impl SqliteStorage {
         .await
         .map_err(|_| CoreError::NotImplemented("sqlite task join failed"))?
     }
-}
 
-impl StorageEngine for SqliteStorage {
-    async fn save_message(&self, message: &Message) -> Result<()> {
-        let message = message.clone();
+    async fn save_message_record(
+        &self,
+        message: Message,
+        vector_clock_json: Option<String>,
+    ) -> Result<()> {
         let edited_at = option_u64_to_db_i64(message.edited_at, "edited_at")?;
         let deleted_at = option_u64_to_db_i64(message.deleted_at, "deleted_at")?;
         let is_deleted = bool_to_db(message.is_deleted);
         let upsert_sql = format!(
             "INSERT INTO messages (
                 id, chat_id, sender_id, content, timestamp, status, created_at,
-                edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                edit_version, edited_at, is_deleted, deleted_at, reply_to_id, reply_to_preview,
+                vector_clock
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                  chat_id = excluded.chat_id,
                  sender_id = excluded.sender_id,
@@ -403,7 +549,8 @@ impl StorageEngine for SqliteStorage {
                  reply_to_preview = CASE
                      WHEN {MESSAGE_EDIT_WINNER_EXPR} THEN COALESCE(excluded.reply_to_preview, messages.reply_to_preview)
                      ELSE messages.reply_to_preview
-                 END"
+                 END,
+                 vector_clock = COALESCE(excluded.vector_clock, messages.vector_clock)"
         );
 
         self.with_connection("sqlite save message failed", move |conn| {
@@ -422,12 +569,19 @@ impl StorageEngine for SqliteStorage {
                     is_deleted,
                     deleted_at,
                     message.reply_to_id,
-                    message.reply_to_preview
+                    message.reply_to_preview,
+                    vector_clock_json
                 ],
             )?;
             Ok(())
         })
         .await
+    }
+}
+
+impl StorageEngine for SqliteStorage {
+    async fn save_message(&self, message: &Message) -> Result<()> {
+        self.save_message_record(message.clone(), None).await
     }
 
     async fn get_message(&self, message_id: &str) -> Result<Option<Message>> {
@@ -458,20 +612,24 @@ impl StorageEngine for SqliteStorage {
                 "SELECT {MESSAGE_SELECT_COLUMNS}
                  FROM messages
                  WHERE chat_id = ?1
-                 ORDER BY timestamp DESC, created_at DESC, id DESC
-                 LIMIT ?2 OFFSET ?3"
+                 ORDER BY timestamp DESC, created_at DESC, id DESC"
             ))?;
-            let rows = statement.query_map(
-                params![chat_id.0.to_string(), limit as i64, offset as i64],
-                map_message_row,
-            )?;
+            let rows =
+                statement.query_map(params![chat_id.0.to_string()], map_stored_message_row)?;
 
-            let mut messages = Vec::new();
+            let mut records = Vec::new();
             for row in rows {
-                messages.push(row?);
+                records.push(row?);
             }
 
-            Ok(messages)
+            records.sort_by(compare_stored_messages_for_query);
+
+            Ok(records
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|record| record.message)
+                .collect())
         })
         .await
     }
@@ -1179,6 +1337,135 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<Message> {
         reply_to_id: row.get(10)?,
         reply_to_preview: row.get(11)?,
     })
+}
+
+fn map_stored_message_row(row: &Row<'_>) -> rusqlite::Result<StoredMessageRecord> {
+    let vector_clock_json: Option<String> = row.get(13)?;
+
+    Ok(StoredMessageRecord {
+        message: map_message_row(row)?,
+        created_at_ms: row.get(12)?,
+        vector_clock: vector_clock_json.as_deref().and_then(parse_vector_clock),
+    })
+}
+
+fn map_og_cache_row(row: &Row<'_>) -> rusqlite::Result<CachedOgMetadata> {
+    Ok(CachedOgMetadata {
+        metadata: OgMetadata {
+            url: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            image_url: row.get(3)?,
+            site_name: row.get(4)?,
+        },
+        fetched_at_ms: row.get(5)?,
+        ttl_seconds: row.get(6)?,
+    })
+}
+
+fn compare_stored_messages_for_query(
+    left: &StoredMessageRecord,
+    right: &StoredMessageRecord,
+) -> Ordering {
+    if let (Some(left_clock), Some(right_clock)) = (&left.vector_clock, &right.vector_clock) {
+        if let Some(ordering) = compare_vector_clocks(left_clock, right_clock) {
+            if ordering != Ordering::Equal {
+                return ordering.reverse();
+            }
+        }
+    }
+
+    compare_messages_by_timestamp(left, right)
+}
+
+fn compare_messages_by_timestamp(
+    left: &StoredMessageRecord,
+    right: &StoredMessageRecord,
+) -> Ordering {
+    right
+        .message
+        .timestamp_ms
+        .cmp(&left.message.timestamp_ms)
+        .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        .then_with(|| right.message.id.as_bytes().cmp(left.message.id.as_bytes()))
+}
+
+fn compare_vector_clocks(
+    left: &HashMap<String, u64>,
+    right: &HashMap<String, u64>,
+) -> Option<Ordering> {
+    let mut left_is_less = false;
+    let mut left_is_greater = false;
+
+    for key in left.keys().chain(right.keys()) {
+        let left_value = left.get(key).copied().unwrap_or(0);
+        let right_value = right.get(key).copied().unwrap_or(0);
+
+        left_is_less |= left_value < right_value;
+        left_is_greater |= left_value > right_value;
+
+        if left_is_less && left_is_greater {
+            return None;
+        }
+    }
+
+    match (left_is_less, left_is_greater) {
+        (true, false) => Some(Ordering::Less),
+        (false, true) => Some(Ordering::Greater),
+        (false, false) => Some(Ordering::Equal),
+        (true, true) => None,
+    }
+}
+
+fn serialize_vector_clock(clock: &HashMap<String, u64>) -> String {
+    let sorted_clock = clock
+        .iter()
+        .map(|(device_id, counter)| (device_id.clone(), *counter))
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&sorted_clock).expect("vector clock serialization should succeed")
+}
+
+fn parse_vector_clock(json: &str) -> Option<HashMap<String, u64>> {
+    serde_json::from_str(json).ok()
+}
+
+fn load_reply_counts(conn: &Connection, message_ids: &[String]) -> Result<HashMap<String, i64>> {
+    let mut reply_counts = message_ids
+        .iter()
+        .cloned()
+        .map(|message_id| (message_id, 0))
+        .collect::<HashMap<_, _>>();
+
+    for chunk in message_ids.chunks(SQLITE_MAX_VARIABLES) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT reply_to_id, COUNT(*) \
+             FROM messages \
+             WHERE reply_to_id IN ({placeholders}) \
+             GROUP BY reply_to_id"
+        );
+        let mut statement = conn.prepare(&sql).map_err(|error| {
+            sqlite_persistence("sqlite prepare reply count query failed", error)
+        })?;
+        let rows = statement
+            .query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| sqlite_persistence("sqlite query reply counts failed", error))?;
+
+        for row in rows {
+            let (reply_to_id, count) = row
+                .map_err(|error| sqlite_persistence("sqlite read reply count row failed", error))?;
+            reply_counts.insert(reply_to_id, count);
+        }
+    }
+
+    Ok(reply_counts)
 }
 
 fn parse_uuid(raw: &str) -> rusqlite::Result<Uuid> {

@@ -1,22 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jasmine_core::{
-    ChatId, CoreError, DeviceId, Message, MessageStatus, PeerInfo, StorageEngine, TransferRecord,
-    TransferStatus, UserId,
+    ChatId, CoreError, DeviceId, Message, MessageStatus, OgMetadata, PeerInfo, StorageEngine,
+    TransferRecord, TransferStatus, UserId,
 };
-use jasmine_storage::{ChatRecord, ChatType, SqliteStorage};
-use rusqlite::{params, Connection};
+use jasmine_storage::{CachedOgMetadata, ChatRecord, ChatType, SqliteStorage};
+use rusqlite::{params, Connection, OptionalExtension};
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 const V1_MIGRATION_SQL: &str = include_str!("../migrations/V1__initial.sql");
 const V2_MIGRATION_SQL: &str = include_str!("../migrations/V2__edit_delete_richtext.sql");
+const V3_MIGRATION_SQL: &str = include_str!("../migrations/V3__crypto_and_resume.sql");
+const V4_MIGRATION_SQL: &str = include_str!("../migrations/V4__sender_key_epochs.sql");
+const V5_MIGRATION_SQL: &str = include_str!("../migrations/V5__folder_file_status.sql");
 
 #[test]
-fn migration_creates_database_and_records_v5_schema() {
+fn migration_creates_database_and_records_v6_schema() {
     let (_temp_dir, db_path) = temp_db_path("create");
 
     let _storage = SqliteStorage::open(&db_path).expect("storage opens");
@@ -37,12 +41,13 @@ fn migration_creates_database_and_records_v5_schema() {
             "peer_keys",
             "sender_keys",
             "folder_file_status",
+            "og_cache",
         ],
     );
 
     let versions = applied_versions(&conn);
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
-    assert_eq!(user_version(&conn), 5);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(user_version(&conn), 6);
     assert_columns_exist(
         &conn,
         "messages",
@@ -53,8 +58,23 @@ fn migration_creates_database_and_records_v5_schema() {
             "deleted_at",
             "reply_to_id",
             "reply_to_preview",
+            "vector_clock",
         ],
     );
+    assert_columns_exist(
+        &conn,
+        "og_cache",
+        &[
+            "url",
+            "title",
+            "description",
+            "image_url",
+            "site_name",
+            "fetched_at",
+            "ttl_seconds",
+        ],
+    );
+    assert_index_exists(&conn, "idx_messages_reply_to_id", "messages");
     assert_columns_exist(
         &conn,
         "transfers",
@@ -69,7 +89,7 @@ fn migration_creates_database_and_records_v5_schema() {
 }
 
 #[test]
-fn migration_upgrades_v0_database_to_v5() {
+fn migration_upgrades_v0_database_to_v6() {
     let (_temp_dir, db_path) = temp_db_path("upgrade");
     Connection::open(&db_path)
         .expect("create empty v0 db")
@@ -92,14 +112,15 @@ fn migration_upgrades_v0_database_to_v5() {
             "peer_keys",
             "sender_keys",
             "folder_file_status",
+            "og_cache",
         ],
     );
-    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
-    assert_eq!(user_version(&conn), 5);
+    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(user_version(&conn), 6);
 }
 
 #[test]
-fn migration_upgrades_existing_v2_database_to_v5_and_preserves_data() {
+fn migration_upgrades_existing_v2_database_to_v6_and_preserves_data() {
     let (_temp_dir, db_path) = temp_db_path("upgrade-v2-to-v3");
     let message_id = Uuid::new_v4();
     let chat_id = Uuid::new_v4();
@@ -191,8 +212,9 @@ fn migration_upgrades_existing_v2_database_to_v5_and_preserves_data() {
     assert_eq!(loaded.reply_to_preview.as_deref(), Some("legacy preview"));
 
     let conn = Connection::open(&db_path).expect("open migrated db");
-    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5]);
-    assert_eq!(user_version(&conn), 5);
+    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(user_version(&conn), 6);
+    assert_columns_exist(&conn, "messages", &["vector_clock"]);
 
     let transfer_row = conn
         .query_row(
@@ -230,6 +252,286 @@ fn migration_rejects_corrupted_database() {
     assert!(result.is_err(), "corrupted db should be rejected");
 }
 
+#[tokio::test]
+async fn migration_adds_reply_to_id_index_in_v6_upgrade() {
+    let (_temp_dir, db_path) = temp_db_path("reply-to-index-v6");
+
+    let conn = Connection::open(&db_path).expect("create v5 db");
+    conn.execute_batch(V1_MIGRATION_SQL)
+        .expect("apply v1 schema manually");
+    conn.execute_batch(V2_MIGRATION_SQL)
+        .expect("apply v2 schema manually");
+    conn.execute_batch(V3_MIGRATION_SQL)
+        .expect("apply v3 schema manually");
+    conn.execute_batch(V4_MIGRATION_SQL)
+        .expect("apply v4 schema manually");
+    conn.execute_batch(V5_MIGRATION_SQL)
+        .expect("apply v5 schema manually");
+    conn.execute_batch("PRAGMA user_version = 5;")
+        .expect("set v5 user version");
+    drop(conn);
+
+    let _storage = SqliteStorage::open(&db_path).expect("storage opens and upgrades to v6");
+
+    let conn = Connection::open(&db_path).expect("open migrated db");
+    assert_eq!(applied_versions(&conn), vec![1, 2, 3, 4, 5, 6]);
+    assert_index_exists(&conn, "idx_messages_reply_to_id", "messages");
+}
+
+#[tokio::test]
+async fn og_cache_and_vector_clock_crud_and_nullability() {
+    let (_temp_dir, db_path) = temp_db_path("og-cache-v6");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let message = message(chat_id, 1_000, MessageStatus::Sent, "hello");
+
+    storage
+        .save_message(&message)
+        .await
+        .expect("save message for cache CRUD");
+
+    let message_id = message.id.to_string();
+    let conn = Connection::open(&db_path).expect("open db");
+    let cache_url = "https://example.org/og-cache-test";
+
+    conn.execute(
+        "UPDATE messages SET vector_clock = ?1 WHERE id = ?2",
+        params!["1-2-3", message_id],
+    )
+    .expect("set vector clock");
+
+    conn.execute(
+        "INSERT INTO og_cache (url, title, description, image_url, site_name, fetched_at, ttl_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            cache_url,
+            "title one",
+            "description one",
+            "https://example.org/image.png",
+            "site",
+            1_700_000_000_000_i64,
+            86_400_i64,
+        ],
+    )
+    .expect("insert cache row");
+
+    let vector_clock: Option<String> = conn
+        .query_row(
+            "SELECT vector_clock FROM messages WHERE id = ?1",
+            params![message.id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("read vector clock");
+    let (title, description, image_url, site_name, fetched_at, ttl_seconds): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT title, description, image_url, site_name, fetched_at, ttl_seconds FROM og_cache WHERE url = ?1",
+            params![cache_url],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .expect("read cache row");
+    assert_eq!(vector_clock.as_deref(), Some("1-2-3"));
+    assert_eq!(title, "title one");
+    assert_eq!(description, "description one");
+    assert_eq!(image_url, "https://example.org/image.png");
+    assert_eq!(site_name, "site");
+    assert_eq!(fetched_at, 1_700_000_000_000);
+    assert_eq!(ttl_seconds, 86_400);
+
+    conn.execute(
+        "UPDATE messages SET vector_clock = ?1 WHERE id = ?2",
+        params!["4-5-6", message_id],
+    )
+    .expect("update vector clock");
+
+    conn.execute(
+        "UPDATE og_cache
+         SET title = ?2, description = ?3, image_url = ?4, site_name = ?5, fetched_at = ?6, ttl_seconds = ?7
+         WHERE url = ?1",
+        params![
+            cache_url,
+            "title two",
+            "description two",
+            "https://example.org/image2.png",
+            "site 2",
+            1_700_000_000_600_i64,
+            43_200_i64,
+        ],
+    )
+    .expect("update cache fields");
+
+    let vector_clock: Option<String> = conn
+        .query_row(
+            "SELECT vector_clock FROM messages WHERE id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .expect("read updated vector clock");
+    let (title, description, image_url, site_name, fetched_at, ttl_seconds): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT title, description, image_url, site_name, fetched_at, ttl_seconds FROM og_cache WHERE url = ?1",
+            params![cache_url],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .expect("read updated cache row");
+    assert_eq!(vector_clock.as_deref(), Some("4-5-6"));
+    assert_eq!(title, "title two");
+    assert_eq!(description, "description two");
+    assert_eq!(image_url, "https://example.org/image2.png");
+    assert_eq!(site_name, "site 2");
+    assert_eq!(fetched_at, 1_700_000_000_600);
+    assert_eq!(ttl_seconds, 43_200);
+
+    conn.execute(
+        "UPDATE messages SET vector_clock = ?1 WHERE id = ?2",
+        params![Option::<String>::None, message_id],
+    )
+    .expect("nullify vector clock");
+
+    conn.execute("DELETE FROM og_cache WHERE url = ?1", params![cache_url])
+        .expect("delete cache row");
+
+    let vector_clock: Option<String> = conn
+        .query_row(
+            "SELECT vector_clock FROM messages WHERE id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .expect("read nullified vector clock");
+    assert!(vector_clock.is_none());
+
+    let deleted: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM og_cache WHERE url = ?1",
+            params![cache_url],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("check deleted cache row");
+    assert!(deleted.is_none());
+}
+
+#[tokio::test]
+async fn og_cache_helpers_round_trip_metadata_with_ttl() {
+    let (_temp_dir, db_path) = temp_db_path("og-cache-helpers-roundtrip");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let metadata = OgMetadata {
+        url: "https://example.org/preview".to_string(),
+        title: Some("Preview title".to_string()),
+        description: Some("Preview description".to_string()),
+        image_url: Some("https://example.org/preview.png".to_string()),
+        site_name: Some("Example".to_string()),
+    };
+
+    storage
+        .save_og_metadata(&metadata, 86_400)
+        .await
+        .expect("save og metadata through helper");
+
+    let cached = storage
+        .get_cached_og_metadata(&metadata.url)
+        .await
+        .expect("load cached og metadata");
+    assert_eq!(
+        cached,
+        Some(CachedOgMetadata::new(
+            metadata.clone(),
+            cached.as_ref().expect("cached row exists").fetched_at_ms,
+            86_400,
+        ))
+    );
+
+    let conn = Connection::open(&db_path).expect("open sqlite db");
+    let (stored_url, fetched_at, ttl_seconds): (String, i64, i64) = conn
+        .query_row(
+            "SELECT url, fetched_at, ttl_seconds FROM og_cache WHERE url = ?1",
+            params![metadata.url],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query cached og row");
+    assert_eq!(stored_url, "https://example.org/preview");
+    assert!(fetched_at > 0);
+    assert_eq!(ttl_seconds, 86_400);
+}
+
+#[tokio::test]
+async fn og_cache_helpers_return_expired_rows_without_filtering_ttl() {
+    let (_temp_dir, db_path) = temp_db_path("og-cache-helpers-expired");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let conn = Connection::open(&db_path).expect("open sqlite db");
+    let expired_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("current time")
+        .as_millis() as i64
+        - 86_401_000;
+
+    conn.execute(
+        "INSERT INTO og_cache (url, title, description, image_url, site_name, fetched_at, ttl_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            "https://example.org/expired",
+            "Expired title",
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            expired_at,
+            86_400_i64,
+        ],
+    )
+    .expect("insert expired og cache row");
+
+    let cached = storage
+        .get_cached_og_metadata("https://example.org/expired")
+        .await
+        .expect("query expired og cache row");
+
+    assert_eq!(
+        cached,
+        Some(CachedOgMetadata::new(
+            OgMetadata {
+                url: "https://example.org/expired".to_string(),
+                title: Some("Expired title".to_string()),
+                description: None,
+                image_url: None,
+                site_name: None,
+            },
+            expired_at,
+            86_400,
+        ))
+    );
+}
+
 #[test]
 fn wal_mode_is_enabled_for_new_connections() {
     let (_temp_dir, db_path) = temp_db_path("wal");
@@ -264,6 +566,135 @@ async fn message_crud_persists_and_orders_descending() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].id, newer.id);
     assert_eq!(messages[1].id, older.id);
+}
+
+#[tokio::test]
+async fn message_vector_clock_roundtrip_persists_json_and_preserves_legacy_reads() {
+    let (_temp_dir, db_path) = temp_db_path("message-vector-clock-roundtrip");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let message = message(chat_id, 1_000, MessageStatus::Sent, "clocked");
+    let clock = vector_clock(&[("alice", 2), ("bob", 1)]);
+
+    storage
+        .save_message_with_vector_clock(&message, Some(&clock))
+        .await
+        .expect("save message with vector clock");
+
+    let loaded = storage
+        .get_message(&message.id.to_string())
+        .await
+        .expect("load message")
+        .expect("message exists");
+    assert_eq!(loaded, message);
+
+    let stored_clock = storage
+        .get_message_vector_clock(&message.id.to_string())
+        .await
+        .expect("load vector clock");
+    assert_eq!(stored_clock, Some(clock.clone()));
+
+    let conn = Connection::open(&db_path).expect("open sqlite db");
+    let stored_json: Option<String> = conn
+        .query_row(
+            "SELECT vector_clock FROM messages WHERE id = ?1",
+            params![message.id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("query vector clock json");
+    assert_eq!(stored_json.as_deref(), Some(r#"{"alice":2,"bob":1}"#));
+
+    storage
+        .save_message(&message)
+        .await
+        .expect("legacy save should preserve clock");
+
+    let preserved_clock = storage
+        .get_message_vector_clock(&message.id.to_string())
+        .await
+        .expect("reload vector clock");
+    assert_eq!(preserved_clock, Some(clock));
+}
+
+#[tokio::test]
+async fn message_vector_clock_ordering_prefers_causal_order_over_timestamp() {
+    let (_temp_dir, db_path) = temp_db_path("message-vector-clock-ordering");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+
+    let first = message(
+        chat_id.clone(),
+        8_000,
+        MessageStatus::Sent,
+        "first by timestamp",
+    );
+    let second = message(
+        chat_id.clone(),
+        1_000,
+        MessageStatus::Sent,
+        "second by clock",
+    );
+    let first_clock = vector_clock(&[("alice", 1)]);
+    let second_clock = vector_clock(&[("alice", 2)]);
+
+    storage
+        .save_message_with_vector_clock(&first, Some(&first_clock))
+        .await
+        .expect("save first clocked message");
+    storage
+        .save_message_with_vector_clock(&second, Some(&second_clock))
+        .await
+        .expect("save second clocked message");
+
+    let messages = storage
+        .get_messages(&chat_id, 10, 0)
+        .await
+        .expect("query messages");
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].id, second.id);
+    assert_eq!(messages[1].id, first.id);
+}
+
+#[tokio::test]
+async fn message_vector_clock_ordering_uses_timestamp_fallback_for_mixed_rows() {
+    let (_temp_dir, db_path) = temp_db_path("message-vector-clock-mixed-ordering");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+
+    let legacy = message(chat_id.clone(), 3_000, MessageStatus::Sent, "legacy");
+    let clocked_first = message(chat_id.clone(), 2_000, MessageStatus::Sent, "clocked first");
+    let clocked_second = message(
+        chat_id.clone(),
+        1_000,
+        MessageStatus::Sent,
+        "clocked second",
+    );
+    let first_clock = vector_clock(&[("alice", 1)]);
+    let second_clock = vector_clock(&[("alice", 2)]);
+
+    storage
+        .save_message(&legacy)
+        .await
+        .expect("save legacy message");
+    storage
+        .save_message_with_vector_clock(&clocked_first, Some(&first_clock))
+        .await
+        .expect("save first clocked message");
+    storage
+        .save_message_with_vector_clock(&clocked_second, Some(&second_clock))
+        .await
+        .expect("save second clocked message");
+
+    let messages = storage
+        .get_messages(&chat_id, 10, 0)
+        .await
+        .expect("query mixed messages");
+
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].id, legacy.id);
+    assert_eq!(messages[1].id, clocked_second.id);
+    assert_eq!(messages[2].id, clocked_first.id);
 }
 
 #[tokio::test]
@@ -323,6 +754,82 @@ async fn message_crud_filters_by_chat() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].chat_id, primary_chat);
     assert_eq!(messages[0].content, "hello");
+}
+
+#[tokio::test]
+async fn reply_count_returns_zero_for_messages_without_replies() {
+    let (_temp_dir, db_path) = temp_db_path("reply-count-zero");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let parent = message(chat_id, 1_000, MessageStatus::Sent, "parent");
+
+    storage.save_message(&parent).await.expect("save parent");
+
+    let reply_count = storage
+        .get_reply_count(&parent.id.to_string())
+        .await
+        .expect("query reply count");
+
+    assert_eq!(reply_count, 0);
+}
+
+#[tokio::test]
+async fn reply_count_batch_returns_counts_for_multiple_parent_messages() {
+    let (_temp_dir, db_path) = temp_db_path("reply-count-batch");
+    let storage = SqliteStorage::open(&db_path).expect("storage opens");
+    let chat_id = chat_id();
+    let parent_one = message(chat_id.clone(), 1_000, MessageStatus::Sent, "parent one");
+    let parent_two = message(chat_id.clone(), 2_000, MessageStatus::Sent, "parent two");
+    let missing_parent = Uuid::new_v4().to_string();
+
+    storage
+        .save_message(&parent_one)
+        .await
+        .expect("save first parent");
+    storage
+        .save_message(&parent_two)
+        .await
+        .expect("save second parent");
+
+    for index in 0..3 {
+        let mut reply = message(
+            chat_id.clone(),
+            3_000 + i64::from(index),
+            MessageStatus::Delivered,
+            &format!("reply-one-{index}"),
+        );
+        reply.reply_to_id = Some(parent_one.id.to_string());
+        storage
+            .save_message(&reply)
+            .await
+            .expect("save first parent reply");
+    }
+
+    let mut reply = message(chat_id, 4_000, MessageStatus::Delivered, "reply-two");
+    reply.reply_to_id = Some(parent_two.id.to_string());
+    storage
+        .save_message(&reply)
+        .await
+        .expect("save second parent reply");
+
+    let single_count = storage
+        .get_reply_count(&parent_one.id.to_string())
+        .await
+        .expect("query single reply count");
+    assert_eq!(single_count, 3);
+
+    let reply_counts = storage
+        .get_reply_counts(&[
+            parent_one.id.to_string(),
+            parent_two.id.to_string(),
+            missing_parent.clone(),
+        ])
+        .await
+        .expect("query reply counts");
+
+    assert_eq!(reply_counts.get(&parent_one.id.to_string()), Some(&3));
+    assert_eq!(reply_counts.get(&parent_two.id.to_string()), Some(&1));
+    assert_eq!(reply_counts.get(&missing_parent), Some(&0));
 }
 
 #[tokio::test]
@@ -1124,6 +1631,13 @@ fn device_id() -> DeviceId {
     DeviceId(Uuid::new_v4())
 }
 
+fn vector_clock(entries: &[(&str, u64)]) -> HashMap<String, u64> {
+    entries
+        .iter()
+        .map(|(device_id, counter)| ((*device_id).to_string(), *counter))
+        .collect()
+}
+
 fn message(chat_id: ChatId, timestamp_ms: i64, status: MessageStatus, content: &str) -> Message {
     Message {
         id: Uuid::new_v4(),
@@ -1199,6 +1713,20 @@ fn assert_columns_exist(conn: &Connection, table: &str, expected_columns: &[&str
             "expected column {expected} in table {table}, got {column_names:?}"
         );
     }
+}
+
+fn assert_index_exists(conn: &Connection, index_name: &str, table_name: &str) {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1 AND tbl_name = ?2",
+            params![index_name, table_name],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master for index");
+    assert_eq!(
+        exists, 1,
+        "expected index {index_name} to exist on {table_name}"
+    );
 }
 
 fn assert_tables_exist(conn: &Connection, tables: &[&str]) {
