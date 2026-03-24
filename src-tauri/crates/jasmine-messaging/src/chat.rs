@@ -111,6 +111,14 @@ impl GroupState {
 pub trait ChatStorage: StorageEngine {
     async fn save_group(&self, group: &GroupInfo, created_at_ms: i64) -> jasmine_core::Result<()>;
     async fn get_group(&self, group_id: &ChatId) -> jasmine_core::Result<Option<(GroupInfo, i64)>>;
+    async fn save_message_with_vector_clock(
+        &self,
+        message: &Message,
+        vector_clock: Option<&HashMap<String, u64>>,
+    ) -> jasmine_core::Result<()> {
+        let _ = vector_clock;
+        self.save_message(message).await
+    }
 }
 
 impl ChatStorage for SqliteStorage {
@@ -151,6 +159,14 @@ impl ChatStorage for SqliteStorage {
             chat.created_at_ms,
         )))
     }
+
+    async fn save_message_with_vector_clock(
+        &self,
+        message: &Message,
+        vector_clock: Option<&HashMap<String, u64>>,
+    ) -> jasmine_core::Result<()> {
+        SqliteStorage::save_message_with_vector_clock(self, message, vector_clock).await
+    }
 }
 
 #[derive(Clone)]
@@ -167,6 +183,7 @@ struct IncomingTextMessage {
     timestamp: i64,
     reply_to_id: Option<String>,
     reply_to_preview: Option<String>,
+    vector_clock: Option<HashMap<String, u64>>,
 }
 
 struct IncomingGroupMessage {
@@ -243,6 +260,38 @@ struct PendingDelete {
     expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DirectMessageVectorClock {
+    counters: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorClockRelation {
+    Less,
+    Equal,
+    Greater,
+    Concurrent,
+}
+
+impl DirectMessageVectorClock {
+    fn increment(&mut self, actor_id: &str) -> HashMap<String, u64> {
+        let counter = self.counters.entry(actor_id.to_string()).or_insert(0);
+        *counter = counter.saturating_add(1);
+        self.counters.clone()
+    }
+
+    fn merge(&mut self, other: &HashMap<String, u64>) {
+        for (actor_id, counter) in other {
+            let current = self.counters.entry(actor_id.clone()).or_insert(0);
+            *current = (*current).max(*counter);
+        }
+    }
+
+    fn compare(&self, other: &HashMap<String, u64>) -> VectorClockRelation {
+        compare_vector_clocks(&self.counters, other)
+    }
+}
+
 impl PendingDelete {
     fn into_incoming(self, message_id: String) -> IncomingMessageDelete {
         IncomingMessageDelete {
@@ -275,6 +324,7 @@ struct ChatServiceInner<S: ChatStorage + 'static> {
     pending_acks: Mutex<HashMap<String, oneshot::Sender<()>>>,
     pending_edits: Mutex<HashMap<String, Vec<PendingEdit>>>,
     pending_deletes: Mutex<HashMap<String, PendingDelete>>,
+    direct_message_vector_clocks: Mutex<HashMap<String, DirectMessageVectorClock>>,
     group_sender_key_counters: Mutex<HashMap<String, u32>>,
 }
 
@@ -314,6 +364,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             pending_acks: Mutex::new(HashMap::new()),
             pending_edits: Mutex::new(HashMap::new()),
             pending_deletes: Mutex::new(HashMap::new()),
+            direct_message_vector_clocks: Mutex::new(HashMap::new()),
             group_sender_key_counters: Mutex::new(HashMap::new()),
         });
 
@@ -397,6 +448,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             .inner
             .load_reply_preview(&chat_id, reply_to_id.as_deref())
             .await?;
+        let vector_clock = self.inner.next_outgoing_direct_vector_clock(peer_id);
         let mut message = Message {
             id: Uuid::new_v4(),
             chat_id,
@@ -412,7 +464,9 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             reply_to_preview,
         };
 
-        self.inner.save_message(message.clone()).await?;
+        self.inner
+            .save_message_with_vector_clock(message.clone(), Some(vector_clock.clone()))
+            .await?;
         parse_mentions(&message.content);
         self.inner
             .emit_status(peer_id.to_string(), message.id, MessageStatus::Sent);
@@ -425,6 +479,7 @@ impl<S: ChatStorage + 'static> ChatService<S> {
             timestamp: message.timestamp_ms,
             reply_to_id: message.reply_to_id.clone(),
             reply_to_preview: message.reply_to_preview.clone(),
+            vector_clock: Some(vector_clock),
         };
 
         Arc::clone(&self.inner).arm_ack_timeout(peer_id.to_string(), message.id);
@@ -837,6 +892,7 @@ fn spawn_client_listener<S: ChatStorage + 'static>(
                     warn!(peer_id, reason = ?reason, "chat client disconnected");
                     break;
                 }
+                Ok(WsClientEvent::CallSignalingReceived { .. }) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -888,6 +944,7 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 timestamp,
                 reply_to_id,
                 reply_to_preview,
+                vector_clock,
             } => {
                 self.handle_incoming_text_message(
                     peer_id,
@@ -900,6 +957,7 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                         timestamp,
                         reply_to_id,
                         reply_to_preview,
+                        vector_clock,
                     },
                 )
                 .await
@@ -1028,7 +1086,9 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
 
         let sender_user_id = user_id_from_peer_id(&peer_id)?;
         let message_id = parse_uuid(&text.id, "message_id")?;
-        let stored_chat_id = if text.chat_id == self.local_peer.device_id {
+        let is_direct_message = text.chat_id == self.local_peer.device_id;
+        let incoming_vector_clock = text.vector_clock.clone();
+        let stored_chat_id = if is_direct_message {
             ChatId(parse_uuid(&peer_id, "peer_id")?)
         } else {
             let group_chat_id = ChatId(parse_uuid(&text.chat_id, "chat_id")?);
@@ -1063,7 +1123,19 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
             reply_to_preview: text.reply_to_preview,
         };
 
-        self.save_message(stored_message.clone()).await?;
+        self.save_message_with_vector_clock(
+            stored_message.clone(),
+            if is_direct_message {
+                incoming_vector_clock.clone()
+            } else {
+                None
+            },
+        )
+        .await?;
+        if is_direct_message {
+            let _vector_clock_relation =
+                self.merge_incoming_direct_vector_clock(&peer_id, incoming_vector_clock.as_ref());
+        }
         let _ = self.events.send(ChatServiceEvent::MessageReceived {
             peer_id: peer_id.clone(),
             message: stored_message,
@@ -1411,6 +1483,7 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 timestamp: payload.timestamp,
                 reply_to_id: payload.reply_to_id,
                 reply_to_preview: payload.reply_to_preview,
+                vector_clock: None,
             },
         )
         .await
@@ -1722,6 +1795,33 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         self.server.sender_key_distribution_material(peer_id)
     }
 
+    fn next_outgoing_direct_vector_clock(&self, peer_id: &str) -> HashMap<String, u64> {
+        self.direct_message_vector_clocks
+            .lock()
+            .expect("lock direct message vector clocks")
+            .entry(peer_id.to_string())
+            .or_default()
+            .increment(&self.local_peer.device_id)
+    }
+
+    fn merge_incoming_direct_vector_clock(
+        &self,
+        peer_id: &str,
+        incoming_vector_clock: Option<&HashMap<String, u64>>,
+    ) -> Option<VectorClockRelation> {
+        let incoming_vector_clock = incoming_vector_clock?;
+        let mut direct_message_vector_clocks = self
+            .direct_message_vector_clocks
+            .lock()
+            .expect("lock direct message vector clocks");
+        let local_vector_clock = direct_message_vector_clocks
+            .entry(peer_id.to_string())
+            .or_default();
+        let relation = local_vector_clock.compare(incoming_vector_clock);
+        local_vector_clock.merge(incoming_vector_clock);
+        Some(relation)
+    }
+
     async fn ensure_sender_key_distributed(
         &self,
         group: &GroupState,
@@ -2000,6 +2100,14 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
     }
 
     async fn save_message(&self, message: Message) -> Result<()> {
+        self.save_message_with_vector_clock(message, None).await
+    }
+
+    async fn save_message_with_vector_clock(
+        &self,
+        message: Message,
+        vector_clock: Option<HashMap<String, u64>>,
+    ) -> Result<()> {
         let storage = Arc::clone(&self.storage);
 
         tokio::task::spawn_blocking(move || {
@@ -2009,7 +2117,11 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
                 .map_err(|error| MessagingError::Storage(error.to_string()))?;
 
             runtime
-                .block_on(async move { storage.save_message(&message).await })
+                .block_on(async move {
+                    storage
+                        .save_message_with_vector_clock(&message, vector_clock.as_ref())
+                        .await
+                })
                 .map_err(MessagingError::from)
         })
         .await
@@ -2500,6 +2612,36 @@ fn should_apply_message_edit(message: &Message, edit_version: u32, timestamp_ms:
     matches!(message.edited_at, Some(current_timestamp_ms) if timestamp_ms > current_timestamp_ms)
 }
 
+fn compare_vector_clocks(
+    left: &HashMap<String, u64>,
+    right: &HashMap<String, u64>,
+) -> VectorClockRelation {
+    let mut left_is_less = false;
+    let mut left_is_greater = false;
+
+    for actor_id in left.keys().chain(right.keys()) {
+        let left_counter = left.get(actor_id).copied().unwrap_or(0);
+        let right_counter = right.get(actor_id).copied().unwrap_or(0);
+
+        if left_counter < right_counter {
+            left_is_less = true;
+        } else if left_counter > right_counter {
+            left_is_greater = true;
+        }
+
+        if left_is_less && left_is_greater {
+            return VectorClockRelation::Concurrent;
+        }
+    }
+
+    match (left_is_less, left_is_greater) {
+        (true, false) => VectorClockRelation::Less,
+        (false, true) => VectorClockRelation::Greater,
+        (false, false) => VectorClockRelation::Equal,
+        (true, true) => VectorClockRelation::Concurrent,
+    }
+}
+
 fn local_mention_user_id(content: &str, local_peer_id: &str) -> Option<String> {
     parse_mentions(content)
         .into_iter()
@@ -2548,8 +2690,9 @@ fn now_ms_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        prune_expired_pending_deletes, prune_expired_pending_edits, should_apply_message_edit,
-        snapshot_reply_preview, PendingDelete, PendingEdit,
+        compare_vector_clocks, prune_expired_pending_deletes, prune_expired_pending_edits,
+        should_apply_message_edit, snapshot_reply_preview, PendingDelete, PendingEdit,
+        VectorClockRelation,
     };
     use jasmine_core::{ChatId, Message, MessageStatus, UserId};
     use std::collections::HashMap;
@@ -2650,6 +2793,32 @@ mod tests {
         assert_eq!(
             snapshot_reply_preview(&long),
             format!("{}…", "0123456789".repeat(10))
+        );
+    }
+
+    #[test]
+    fn vector_clock_concurrent_compare_distinguishes_equal_less_greater_and_concurrent() {
+        let equal_left = HashMap::from([("alice".to_string(), 2), ("bob".to_string(), 1)]);
+        let equal_right = HashMap::from([("alice".to_string(), 2), ("bob".to_string(), 1)]);
+        let less = HashMap::from([("alice".to_string(), 1), ("bob".to_string(), 1)]);
+        let greater = HashMap::from([("alice".to_string(), 3), ("bob".to_string(), 1)]);
+        let concurrent = HashMap::from([("alice".to_string(), 3), ("bob".to_string(), 0)]);
+
+        assert_eq!(
+            compare_vector_clocks(&equal_left, &equal_right),
+            VectorClockRelation::Equal
+        );
+        assert_eq!(
+            compare_vector_clocks(&less, &equal_right),
+            VectorClockRelation::Less
+        );
+        assert_eq!(
+            compare_vector_clocks(&greater, &equal_right),
+            VectorClockRelation::Greater
+        );
+        assert_eq!(
+            compare_vector_clocks(&concurrent, &equal_right),
+            VectorClockRelation::Concurrent
         );
     }
 }

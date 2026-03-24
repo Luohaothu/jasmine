@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { FileTransferPanel } from './FileTransferPanel';
 import { useTransferStore } from '../../stores/transferStore';
 import { invoke } from '@tauri-apps/api/core';
+import '../../i18n/i18n';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),

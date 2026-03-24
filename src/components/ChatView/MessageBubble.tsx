@@ -1,6 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { RichTextRenderer } from '../RichTextRenderer';
 import { ImageThumbnail } from '../ImageThumbnail/ImageThumbnail';
+import { OgPreviewCard } from './OgPreviewCard';
+import { extractUrls } from '../../utils/url-detect';
 import styles from './MessageBubble.module.css';
 
 export interface MessageBubbleProps {
@@ -15,6 +18,8 @@ export interface MessageBubbleProps {
   editedAt?: number;
   replyToId?: string;
   replyToPreview?: string;
+  replyCount?: number;
+  firstReplyId?: string;
   type?: 'text' | 'image' | 'file';
   metadata?: {
     fileName?: string;
@@ -23,6 +28,7 @@ export interface MessageBubbleProps {
     thumbnailPath?: string;
     thumbnailState?: 'pending' | 'ready' | 'failed';
   };
+  hideQuote?: boolean;
   // eslint-disable-next-line no-unused-vars
   onEdit?: (id: string, newContent: string) => void;
   // eslint-disable-next-line no-unused-vars
@@ -43,19 +49,27 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   editedAt,
   replyToId,
   replyToPreview,
+  replyCount,
+  firstReplyId,
   type,
   metadata,
+  hideQuote,
   onEdit,
   onDelete,
   onReply,
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(content);
+  const { t } = useTranslation();
 
   const date = new Date(timestamp);
   const hours = date.getHours().toString().padStart(2, '0');
   const minutes = date.getMinutes().toString().padStart(2, '0');
   const timeString = `${hours}:${minutes}`;
+
+  const urls = useMemo(() => {
+    return !isEditing && type !== 'image' && type !== 'file' ? extractUrls(content) : [];
+  }, [content, type, isEditing]);
 
   const renderStatus = () => {
     if (!isOwn || !status || isDeleted) return null;
@@ -84,7 +98,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   };
 
   const handleDelete = () => {
-    if (window.confirm('Are you sure you want to delete this message?')) {
+    if (window.confirm(t('chat.messageBubble.deleteConfirm'))) {
       onDelete?.(id);
     }
   };
@@ -94,16 +108,28 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     onReply?.(id, preview, senderName);
   };
 
+  const scrollToMessage = (messageId?: string) => {
+    if (!messageId) {
+      return;
+    }
+
+    const element = document.getElementById(`message-${messageId}`);
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      element.classList.add(styles.highlight);
+      window.setTimeout(() => {
+        element.classList.remove(styles.highlight);
+      }, 1500);
+    }
+  };
+
   const handleQuoteClick = () => {
-    if (replyToId) {
-      const element = document.getElementById(`message-${replyToId}`);
-      if (element) {
-        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        element.classList.add(styles.highlight);
-        setTimeout(() => {
-          element.classList.remove(styles.highlight);
-        }, 1500);
-      }
+    scrollToMessage(replyToId);
+  };
+
+  const handleRepliesClick = () => {
+    if (replyCount && replyCount > 0) {
+      scrollToMessage(firstReplyId);
     }
   };
 
@@ -114,7 +140,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         className={`${styles.container} ${isOwn ? styles.own : styles.peer}`}
       >
         <div className={`${styles.bubble} ${styles.tombstone}`}>
-          <div className={styles.content}>This message was deleted</div>
+          <div className={styles.content}>{t('chat.messageBubble.deleted')}</div>
         </div>
       </div>
     );
@@ -123,13 +149,13 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   return (
     <div id={`message-${id}`} className={`${styles.container} ${isOwn ? styles.own : styles.peer}`}>
       <div className={`${styles.bubble} ${isOwn ? styles.ownBubble : styles.peerBubble}`}>
-        {replyToId && replyToPreview && (
+        {replyToId && replyToPreview && !hideQuote && (
           <button
             type="button"
             className={styles.quoteBubble}
             data-testid="quote-bubble"
             onClick={handleQuoteClick}
-            aria-label={`Jump to replied message: ${replyToPreview}`}
+            aria-label={t('chat.messageBubble.jumpToReply', { preview: replyToPreview })}
           >
             <span className={styles.quotePreview}>{replyToPreview}</span>
           </button>
@@ -152,10 +178,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             />
             <div className={styles.editActions}>
               <button type="button" className={styles.saveButton} onClick={handleSave}>
-                Save
+                {t('chat.messageBubble.save')}
               </button>
               <button type="button" className={styles.cancelButton} onClick={handleCancel}>
-                Cancel
+                {t('chat.messageBubble.cancel')}
               </button>
             </div>
           </div>
@@ -169,20 +195,25 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 fileName={metadata?.fileName || content}
               />
             ) : (
-              <RichTextRenderer content={content} />
+              <>
+                <RichTextRenderer content={content} />
+                {urls.length > 0 && <OgPreviewCard url={urls[0]} isOwn={isOwn} />}
+              </>
             )}
           </div>
         )}
 
         <div className={`${styles.meta} ${isOwn ? styles.ownMeta : styles.peerMeta}`}>
-          {editedAt && !isEditing && <span className={styles.editedMark}>(edited)</span>}
+          {editedAt && !isEditing && (
+            <span className={styles.editedMark}>{t('chat.messageBubble.edited')}</span>
+          )}
           {encrypted === true && (
             <span
               className={styles.encryptedBadge}
               data-testid="encrypted-badge"
               role="img"
-              aria-label="Encrypted message"
-              title="Encrypted message"
+              aria-label={t('chat.messageBubble.encrypted')}
+              title={t('chat.messageBubble.encrypted')}
             >
               🔒
             </span>
@@ -190,6 +221,17 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           <span className={styles.time}>{timeString}</span>
           {renderStatus()}
         </div>
+
+        {replyCount && replyCount > 0 && (
+          <button
+            type="button"
+            className={styles.replyCountBadge}
+            data-testid="reply-count-badge"
+            onClick={handleRepliesClick}
+          >
+            {t('chat.messageBubble.replies', { count: replyCount })}
+          </button>
+        )}
 
         {!isEditing && (
           <div className={styles.actions} data-testid="message-actions">
@@ -199,7 +241,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
               onClick={handleReply}
               data-testid="action-reply"
             >
-              Reply
+              {t('chat.messageBubble.reply')}
             </button>
             {isOwn && onEdit && (
               <button
@@ -208,7 +250,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 onClick={() => setIsEditing(true)}
                 data-testid="action-edit"
               >
-                Edit
+                {t('chat.messageBubble.edit')}
               </button>
             )}
             {isOwn && onDelete && (
@@ -218,7 +260,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 onClick={handleDelete}
                 data-testid="action-delete"
               >
-                Delete
+                {t('chat.messageBubble.delete')}
               </button>
             )}
           </div>

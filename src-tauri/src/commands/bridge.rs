@@ -1,10 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use jasmine_core::{protocol::FolderManifestData, DeviceId, ProtocolMessage, StorageEngine};
+use jasmine_core::{
+    protocol::{CallType, FolderManifestData},
+    DeviceId, ProtocolMessage, StorageEngine,
+};
 use jasmine_messaging::ChatServiceEvent;
 use jasmine_storage::SqliteStorage;
 use serde::Serialize;
+use tracing::warn;
 
 use super::messaging::{chat_message_payload, message_status_label};
 use super::types::{
@@ -20,6 +24,71 @@ const EVENT_GROUP_CREATED: &str = "group-created";
 const EVENT_GROUP_UPDATED: &str = "group-updated";
 const EVENT_GROUP_MEMBER_ADDED: &str = "group-member-added";
 const EVENT_GROUP_MEMBER_REMOVED: &str = "group-member-removed";
+const EVENT_CALL_OFFER: &str = "call-offer";
+const EVENT_CALL_ANSWER: &str = "call-answer";
+const EVENT_ICE_CANDIDATE: &str = "ice-candidate";
+const EVENT_CALL_HANGUP: &str = "call-hangup";
+const EVENT_CALL_REJECT: &str = "call-reject";
+const EVENT_CALL_JOIN: &str = "call-join";
+const EVENT_CALL_LEAVE: &str = "call-leave";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallOfferPayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+    pub(crate) sdp: String,
+    pub(crate) caller_id: String,
+    pub(crate) call_type: CallType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallAnswerPayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+    pub(crate) sdp: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IceCandidatePayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+    pub(crate) candidate: String,
+    pub(crate) sdp_mid: Option<String>,
+    pub(crate) sdp_mline_index: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallHangupPayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallRejectPayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallJoinPayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+    pub(crate) group_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CallLeavePayload {
+    pub(crate) peer_id: String,
+    pub(crate) call_id: String,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,6 +233,213 @@ pub(crate) fn emit_payload<S: Serialize>(
 ) -> Result<(), String> {
     let value = serde_json::to_value(payload).map_err(|error| error.to_string())?;
     emitter.emit_json(event, value)
+}
+
+#[derive(Default)]
+pub(crate) struct CallBridgeState {
+    known_call_ids: Mutex<HashSet<String>>,
+    group_calls: Mutex<HashMap<String, String>>,
+}
+
+impl CallBridgeState {
+    pub(crate) fn remember_call(&self, call_id: impl Into<String>) -> bool {
+        self.known_call_ids
+            .lock()
+            .expect("lock known call ids")
+            .insert(call_id.into())
+    }
+
+    pub(crate) fn remember_group_call(
+        &self,
+        call_id: impl Into<String>,
+        group_id: impl Into<String>,
+    ) -> bool {
+        let call_id = call_id.into();
+        let inserted = self.remember_call(call_id.clone());
+        self.group_calls
+            .lock()
+            .expect("lock group call ids")
+            .insert(call_id, group_id.into());
+        inserted
+    }
+
+    pub(crate) fn is_known_call(&self, call_id: &str) -> bool {
+        self.known_call_ids
+            .lock()
+            .expect("lock known call ids")
+            .contains(call_id)
+    }
+
+    pub(crate) fn finish_call(&self, call_id: &str) {
+        self.known_call_ids
+            .lock()
+            .expect("lock known call ids")
+            .remove(call_id);
+        self.group_calls
+            .lock()
+            .expect("lock group call ids")
+            .remove(call_id);
+    }
+
+    pub(crate) fn is_group_call(&self, call_id: &str) -> bool {
+        self.group_calls
+            .lock()
+            .expect("lock group call ids")
+            .contains_key(call_id)
+    }
+
+    pub(crate) fn group_id_for_call(&self, call_id: &str) -> Option<String> {
+        self.group_calls
+            .lock()
+            .expect("lock group call ids")
+            .get(call_id)
+            .cloned()
+    }
+}
+
+pub(crate) fn bridge_call_signaling_message(
+    peer_id: &str,
+    message: ProtocolMessage,
+    emitter: &dyn FrontendEmitter,
+    call_bridge: &CallBridgeState,
+) -> Result<bool, String> {
+    match message {
+        ProtocolMessage::CallOffer {
+            call_id,
+            sdp,
+            caller_id,
+            call_type,
+        } => {
+            call_bridge.remember_call(call_id.clone());
+            emit_payload(
+                emitter,
+                EVENT_CALL_OFFER,
+                &CallOfferPayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                    sdp,
+                    caller_id,
+                    call_type,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::CallAnswer { call_id, sdp } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, "dropping call answer for unknown call");
+                return Ok(false);
+            }
+
+            emit_payload(
+                emitter,
+                EVENT_CALL_ANSWER,
+                &CallAnswerPayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                    sdp,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::IceCandidate {
+            call_id,
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, "dropping ICE candidate for unknown call");
+                return Ok(false);
+            }
+
+            emit_payload(
+                emitter,
+                EVENT_ICE_CANDIDATE,
+                &IceCandidatePayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                    candidate,
+                    sdp_mid,
+                    sdp_mline_index,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::CallHangup { call_id } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, "dropping call hangup for unknown call");
+                return Ok(false);
+            }
+
+            if !call_bridge.is_group_call(&call_id) {
+                call_bridge.finish_call(&call_id);
+            }
+            emit_payload(
+                emitter,
+                EVENT_CALL_HANGUP,
+                &CallHangupPayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::CallReject { call_id, reason } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, "dropping call reject for unknown call");
+                return Ok(false);
+            }
+
+            if !call_bridge.is_group_call(&call_id) {
+                call_bridge.finish_call(&call_id);
+            }
+            emit_payload(
+                emitter,
+                EVENT_CALL_REJECT,
+                &CallRejectPayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                    reason,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::CallJoin { call_id, group_id } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, group_id = %group_id, "dropping call join for unknown call");
+                return Ok(false);
+            }
+
+            call_bridge.remember_group_call(call_id.clone(), group_id.clone());
+            emit_payload(
+                emitter,
+                EVENT_CALL_JOIN,
+                &CallJoinPayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                    group_id,
+                },
+            )?;
+            Ok(true)
+        }
+        ProtocolMessage::CallLeave { call_id } => {
+            if !call_bridge.is_known_call(&call_id) {
+                warn!(peer_id = %peer_id, call_id = %call_id, "dropping call leave for unknown call");
+                return Ok(false);
+            }
+
+            emit_payload(
+                emitter,
+                EVENT_CALL_LEAVE,
+                &CallLeavePayload {
+                    peer_id: peer_id.to_string(),
+                    call_id,
+                },
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Default)]

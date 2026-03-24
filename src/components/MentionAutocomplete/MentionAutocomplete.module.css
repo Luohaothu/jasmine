@@ -23,6 +23,11 @@
   gap: 8px;
   transition: background-color 0.1s;
   color: var(--text-primary);
+  width: 100%;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
 }
 
 .item:hover {

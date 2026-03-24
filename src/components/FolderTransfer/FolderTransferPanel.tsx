@@ -1,9 +1,11 @@
-import { useState } from "react";
-import { useFolderTransferStore } from "../../stores/folderTransferStore";
-import { FolderTransferItem } from "./FolderTransferItem";
-import styles from "./FolderTransferPanel.module.css";
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useFolderTransferStore } from '../../stores/folderTransferStore';
+import { FolderTransferItem } from './FolderTransferItem';
+import styles from './FolderTransferPanel.module.css';
 
 export function FolderTransferPanel() {
+  const { t } = useTranslation();
   const transfers = useFolderTransferStore((state) => state.folderTransfers);
   const [isOpen, setIsOpen] = useState(false);
 
@@ -11,15 +13,22 @@ export function FolderTransferPanel() {
     return null;
   }
 
-  const activeCount = transfers.filter((t) => t.state === "active" || t.state === "queued").length;
+  const activeCount = transfers.filter((t) => t.state === 'active' || t.state === 'queued').length;
 
   return (
-    <div className={styles.panelContainer} style={{ bottom: "88px" }}>
+    <div className={styles.panelContainer} style={{ bottom: '88px' }}>
       {isOpen && (
         <div className={styles.panel} data-testid="folder-transfer-panel">
           <div className={styles.header}>
-            <h3 className={styles.title}>Folder Transfers</h3>
-            <button className={styles.closeBtn} onClick={() => setIsOpen(false)} aria-label="Minimize panel">×</button>
+            <h3 className={styles.title}>{t('transfer.folderPanel.title')}</h3>
+            <button
+              className={styles.closeBtn}
+              onClick={() => setIsOpen(false)}
+              aria-label={t('transfer.folderPanel.minimizeAriaLabel')}
+              type="button"
+            >
+              ×
+            </button>
           </div>
           <div className={styles.list}>
             {transfers.map((t) => (
@@ -29,9 +38,18 @@ export function FolderTransferPanel() {
         </div>
       )}
 
-      <button className={styles.fab} onClick={() => setIsOpen(!isOpen)} aria-label="Toggle folder transfer panel">
+      <button
+        className={styles.fab}
+        onClick={() => setIsOpen(!isOpen)}
+        aria-label={t('transfer.folderPanel.toggleAriaLabel')}
+        type="button"
+      >
         📁
-        {activeCount > 0 && <span className={styles.badge} data-testid="folder-active-badge">{activeCount}</span>}
+        {activeCount > 0 && (
+          <span className={styles.badge} data-testid="folder-active-badge">
+            {activeCount}
+          </span>
+        )}
       </button>
     </div>
   );

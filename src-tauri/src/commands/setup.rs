@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use jasmine_core::{
-    AppSettings, ChatId, DeviceId, DeviceIdentity, DiscoveryService, IdentityStore, Message,
-    PeerInfo, ProtocolMessage, SettingsService, StorageEngine, TransferStatus,
+    protocol::CallType, AppSettings, ChatId, DeviceId, DeviceIdentity, DiscoveryService,
+    IdentityStore, Message, OgMetadata, PeerInfo, ProtocolMessage, SettingsService, StorageEngine,
+    TransferStatus,
 };
 use jasmine_crypto::{fingerprint, public_key_from_base64};
 use jasmine_crypto::{load_private_key, store_private_key, StaticSecret};
@@ -17,7 +18,7 @@ use jasmine_messaging::{
     ChatService, WsClient, WsClientConfig, WsClientEvent, WsPeerIdentity, WsServer, WsServerConfig,
     WsServerEvent,
 };
-use jasmine_storage::{ChatType, SqliteStorage};
+use jasmine_storage::{CachedOgMetadata, ChatType, SqliteStorage};
 use jasmine_transfer::{
     FileCryptoMaterial, FileReceiver, FileReceiverError, FileReceiverSignal, FileSender,
     FileSenderError, FileSenderSignal, FolderProgress, FolderProgressReporter, FolderReceiver,
@@ -26,18 +27,22 @@ use jasmine_transfer::{
 use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
-use super::bridge::{emit_chat_service_event, emit_payload, FolderBridgeState};
+use super::bridge::{
+    bridge_call_signaling_message, emit_chat_service_event, emit_payload, CallBridgeState,
+    FolderBridgeState,
+};
 use super::discovery::peer_payload;
 use super::transfers::{transfer_payload_from_managed, transfer_payload_from_record};
 use super::types::{
     AppRuntimeConfig, AppSetupFactory, AppState, DiscoveryServiceHandle, FileOfferPayload,
     FolderCompletedPayload, FolderOfferPayload, FolderProgressPayload, FrontendEmitter,
-    IdentityServiceHandle, MessagingServiceHandle, OwnFingerprintInfo, PeerFingerprintInfo,
-    PeerIncompatiblePayload, PeerLostPayload, SettingsServiceHandle, SetupContext, StoredGroupInfo,
-    ThumbnailFailedPayload, ThumbnailReadyPayload, TransferPayload, TransferProgressPayload,
-    TransferServiceHandle, TransferStatePayload,
+    IdentityServiceHandle, MessagingServiceHandle, OgMetadataServiceHandle, OwnFingerprintInfo,
+    PeerFingerprintInfo, PeerIncompatiblePayload, PeerLostPayload, SettingsServiceHandle,
+    SetupContext, StoredGroupInfo, ThumbnailFailedPayload, ThumbnailReadyPayload, TransferPayload,
+    TransferProgressPayload, TransferServiceHandle, TransferStatePayload,
 };
 
 const EVENT_PEER_DISCOVERED: &str = "peer-discovered";
@@ -188,6 +193,7 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         );
 
         let transfer_signal = TransferSignalBridge::new(Arc::clone(&connector));
+        let call_bridge = Arc::new(CallBridgeState::default());
         let folder_bridge = Arc::new(FolderBridgeState::default());
         let file_sender = Arc::new(FileSender::new(transfer_signal.clone()));
         let file_receiver = Arc::new(FileReceiver::new(
@@ -213,6 +219,10 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         ));
 
         connector.add_observer(Arc::new(ChatClientObserver { chat: chat.clone() }));
+        connector.add_observer(Arc::new(CallClientObserver {
+            emitter: Arc::clone(&emitter),
+            call_bridge: Arc::clone(&call_bridge),
+        }));
         connector.add_observer(Arc::new(TransferClientObserver {
             signal: transfer_signal.clone(),
             transfer_manager: Arc::downgrade(&transfer_manager),
@@ -228,6 +238,11 @@ impl AppSetupFactory for DefaultAppSetupFactory {
             Arc::clone(&folder_bridge),
             transfer_signal.clone(),
             Arc::clone(&emitter),
+        );
+        spawn_server_call_signaling_bridge(
+            Arc::clone(&server),
+            Arc::clone(&emitter),
+            Arc::clone(&call_bridge),
         );
 
         let transfer_service: Arc<dyn TransferServiceHandle> = Arc::new(RealTransferService {
@@ -252,10 +267,14 @@ impl AppSetupFactory for DefaultAppSetupFactory {
             Arc::new(RealMessagingService {
                 chat,
                 connector,
+                call_bridge,
                 server,
                 storage: Arc::clone(&storage),
                 local_device_id: identity.device_id.clone(),
             }) as Arc<dyn MessagingServiceHandle>,
+            Arc::new(RealOgMetadataService {
+                storage: Arc::clone(&storage),
+            }) as Arc<dyn OgMetadataServiceHandle>,
             transfer_service,
             Arc::new(RealIdentityService {
                 store: identity_store,
@@ -353,6 +372,34 @@ fn spawn_server_transfer_bridge(
                         },
                     )
                     .await;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn spawn_server_call_signaling_bridge(
+    server: Arc<WsServer>,
+    emitter: Arc<dyn FrontendEmitter>,
+    call_bridge: Arc<CallBridgeState>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut events = server.subscribe();
+        loop {
+            match events.recv().await {
+                Ok(WsServerEvent::CallSignalingReceived { peer, message }) => {
+                    let peer_id = peer.identity.device_id;
+                    if let Err(error) = bridge_call_signaling_message(
+                        &peer_id,
+                        message,
+                        emitter.as_ref(),
+                        call_bridge.as_ref(),
+                    ) {
+                        warn!(peer_id = %peer_id, error = %error, "call signaling bridge emit failed");
+                    }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -926,6 +973,7 @@ impl PeerConnector {
                         clients.lock().expect("lock peer clients").remove(&peer_id);
                         break;
                     }
+                    Ok(WsClientEvent::CallSignalingReceived { .. }) => {}
                     Ok(WsClientEvent::MessageReceived { .. }) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -946,6 +994,47 @@ impl ClientObserver for ChatClientObserver {
             .register_client(client)
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+struct CallClientObserver {
+    emitter: Arc<dyn FrontendEmitter>,
+    call_bridge: Arc<CallBridgeState>,
+}
+
+#[async_trait::async_trait]
+impl ClientObserver for CallClientObserver {
+    async fn on_client(&self, client: Arc<WsClient>) -> Result<(), String> {
+        let remote_peer = client
+            .remote_peer()
+            .ok_or_else(|| "client remote peer is unavailable".to_string())?;
+        let peer_id = remote_peer.identity.device_id;
+        let emitter = Arc::clone(&self.emitter);
+        let call_bridge = Arc::clone(&self.call_bridge);
+
+        tauri::async_runtime::spawn(async move {
+            let mut events = client.subscribe();
+            loop {
+                match events.recv().await {
+                    Ok(WsClientEvent::CallSignalingReceived { message }) => {
+                        if let Err(error) = bridge_call_signaling_message(
+                            &peer_id,
+                            message,
+                            emitter.as_ref(),
+                            call_bridge.as_ref(),
+                        ) {
+                            warn!(peer_id = %peer_id, error = %error, "call signaling bridge emit failed");
+                        }
+                    }
+                    Ok(WsClientEvent::MessageReceived { .. }) => {}
+                    Ok(WsClientEvent::Disconnected { .. }) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -993,6 +1082,7 @@ impl ClientObserver for TransferClientObserver {
                         )
                         .await;
                     }
+                    Ok(WsClientEvent::CallSignalingReceived { .. }) => {}
                     Ok(WsClientEvent::Disconnected { .. }) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1029,6 +1119,7 @@ impl DiscoveryServiceHandle for RealDiscoveryService {
 struct RealMessagingService {
     chat: ChatService<SqliteStorage>,
     connector: Arc<PeerConnector>,
+    call_bridge: Arc<CallBridgeState>,
     server: Arc<WsServer>,
     storage: Arc<SqliteStorage>,
     local_device_id: String,
@@ -1053,6 +1144,190 @@ impl MessagingServiceHandle for RealMessagingService {
             .map_err(|error| error.to_string())
     }
 
+    async fn send_call_offer(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        sdp: &str,
+        call_type: CallType,
+    ) -> Result<(), String> {
+        let inserted = self.call_bridge.remember_call(call_id.to_string());
+        if let Err(error) = self
+            .connector
+            .send_protocol(
+                peer_id,
+                ProtocolMessage::CallOffer {
+                    call_id: call_id.to_string(),
+                    sdp: sdp.to_string(),
+                    caller_id: self.local_device_id.clone(),
+                    call_type,
+                },
+            )
+            .await
+        {
+            if inserted {
+                self.call_bridge.finish_call(call_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn send_call_join(&self, group_id: &str, call_id: &str) -> Result<(), String> {
+        let peer_ids = self.group_call_peer_ids(group_id).await?;
+        self.call_bridge
+            .remember_group_call(call_id.to_string(), group_id.to_string());
+
+        let mut send_error = None;
+        for peer_id in peer_ids {
+            let _ = self.connector.ensure_connected(&peer_id).await;
+            if let Err(error) = self
+                .connector
+                .send_protocol(
+                    &peer_id,
+                    ProtocolMessage::CallJoin {
+                        call_id: call_id.to_string(),
+                        group_id: group_id.to_string(),
+                    },
+                )
+                .await
+            {
+                send_error.get_or_insert(error);
+            }
+        }
+
+        if let Some(error) = send_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn send_call_leave(&self, call_id: &str) -> Result<(), String> {
+        let group_id = self
+            .call_bridge
+            .group_id_for_call(call_id)
+            .ok_or_else(|| format!("unknown group call {call_id}"))?;
+        let peer_ids = self.group_call_peer_ids(&group_id).await?;
+
+        let mut send_error = None;
+        for peer_id in peer_ids {
+            let _ = self.connector.ensure_connected(&peer_id).await;
+            if let Err(error) = self
+                .connector
+                .send_protocol(
+                    &peer_id,
+                    ProtocolMessage::CallLeave {
+                        call_id: call_id.to_string(),
+                    },
+                )
+                .await
+            {
+                send_error.get_or_insert(error);
+            }
+        }
+
+        self.call_bridge.finish_call(call_id);
+
+        if let Some(error) = send_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn send_call_answer(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        sdp: &str,
+    ) -> Result<(), String> {
+        let inserted = self.call_bridge.remember_call(call_id.to_string());
+        if let Err(error) = self
+            .connector
+            .send_protocol(
+                peer_id,
+                ProtocolMessage::CallAnswer {
+                    call_id: call_id.to_string(),
+                    sdp: sdp.to_string(),
+                },
+            )
+            .await
+        {
+            if inserted {
+                self.call_bridge.finish_call(call_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn send_ice_candidate(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), String> {
+        let inserted = self.call_bridge.remember_call(call_id.to_string());
+        if let Err(error) = self
+            .connector
+            .send_protocol(
+                peer_id,
+                ProtocolMessage::IceCandidate {
+                    call_id: call_id.to_string(),
+                    candidate: candidate.to_string(),
+                    sdp_mid: sdp_mid.map(str::to_string),
+                    sdp_mline_index,
+                },
+            )
+            .await
+        {
+            if inserted {
+                self.call_bridge.finish_call(call_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn send_call_hangup(&self, peer_id: &str, call_id: &str) -> Result<(), String> {
+        self.connector
+            .send_protocol(
+                peer_id,
+                ProtocolMessage::CallHangup {
+                    call_id: call_id.to_string(),
+                },
+            )
+            .await?;
+        if !self.call_bridge.is_group_call(call_id) {
+            self.call_bridge.finish_call(call_id);
+        }
+        Ok(())
+    }
+
+    async fn send_call_reject(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        self.connector
+            .send_protocol(
+                peer_id,
+                ProtocolMessage::CallReject {
+                    call_id: call_id.to_string(),
+                    reason: reason.map(str::to_string),
+                },
+            )
+            .await?;
+        if !self.call_bridge.is_group_call(call_id) {
+            self.call_bridge.finish_call(call_id);
+        }
+        Ok(())
+    }
+
     async fn get_messages(
         &self,
         chat_id: &str,
@@ -1062,6 +1337,23 @@ impl MessagingServiceHandle for RealMessagingService {
         let chat_id = ChatId(parse_uuid(chat_id, "chat_id")?);
         self.chat
             .load_messages(&chat_id, limit as usize, offset as usize)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_reply_count(&self, message_id: &str) -> Result<i64, String> {
+        self.storage
+            .get_reply_count(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_reply_counts(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, i64>, String> {
+        self.storage
+            .get_reply_counts(message_ids)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1190,6 +1482,17 @@ impl MessagingServiceHandle for RealMessagingService {
 }
 
 impl RealMessagingService {
+    async fn group_call_peer_ids(&self, group_id: &str) -> Result<Vec<String>, String> {
+        let group_id = ChatId(parse_uuid(group_id, "group_id")?);
+        let group = self.load_group_info(&group_id).await?;
+
+        Ok(group
+            .member_ids
+            .into_iter()
+            .filter(|member_id| member_id != &self.local_device_id)
+            .collect())
+    }
+
     async fn load_group_info(&self, group_id: &ChatId) -> Result<StoredGroupInfo, String> {
         let chat = self
             .storage
@@ -1230,6 +1533,37 @@ struct RealTransferService {
     folder_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     emitter: Arc<dyn FrontendEmitter>,
     local_device_id: DeviceId,
+}
+
+struct RealOgMetadataService {
+    storage: Arc<SqliteStorage>,
+}
+
+#[async_trait]
+impl OgMetadataServiceHandle for RealOgMetadataService {
+    async fn get_cached_og_metadata(&self, url: &str) -> Result<Option<CachedOgMetadata>, String> {
+        self.storage
+            .get_cached_og_metadata(url)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn save_og_metadata(
+        &self,
+        metadata: &OgMetadata,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        self.storage
+            .save_og_metadata(metadata, ttl_seconds)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn fetch_remote_og_metadata(&self, url: &str) -> Result<OgMetadata, String> {
+        jasmine_core::fetch_og_metadata(url)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[async_trait]

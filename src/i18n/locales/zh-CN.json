@@ -1,0 +1,252 @@
+{
+  "common": {
+    "loading": "加载中...",
+    "error": "错误",
+    "retry": "重试",
+    "actions": {
+      "close": "关闭",
+      "cancel": "取消",
+      "create": "创建"
+    },
+    "status": {
+      "online": "在线",
+      "offline": "离线",
+      "incompatible": "不兼容"
+    },
+    "mentionAutocomplete": {
+      "noMatchesFound": "未找到匹配项"
+    },
+    "imageThumbnail": {
+      "generating": "正在生成缩略图...",
+      "image": "图片",
+      "alt": "图片缩略图",
+      "openInSystemViewer": "点击在系统查看器中打开",
+      "openImage": "打开 {{name}}"
+    },
+    "richTextRenderer": {
+      "openLink": "打开链接：{{href}}"
+    }
+  },
+  "chat": {
+    "title": "聊天",
+    "empty": "发送第一条消息开始聊天",
+    "unknownPeer": "未知",
+    "you": "你",
+    "status": {
+      "online": "在线",
+      "offline": "离线"
+    },
+    "messageBubble": {
+      "deleteConfirm": "确定要删除这条消息吗？",
+      "deleted": "此消息已被删除",
+      "jumpToReply": "跳转到所回复的消息：{{preview}}",
+      "replies_one": "{{count}} 条回复",
+      "replies_other": "{{count}} 条回复",
+      "save": "保存",
+      "cancel": "取消",
+      "edited": "（已编辑）",
+      "encrypted": "已加密消息",
+      "reply": "回复",
+      "edit": "编辑",
+      "delete": "删除"
+    },
+    "messageInput": {
+      "dropToSendFiles": "拖放即可发送文件",
+      "replyingTo": "正在回复 {{senderName}}：",
+      "cancelReply": "取消回复",
+      "placeholder": "输入消息...",
+      "send": "发送"
+    },
+    "ogPreviewCard": {
+      "previewAlt": "预览"
+    }
+  },
+  "settings": {
+    "title": "设置",
+    "actions": {
+      "copy": "复制",
+      "changeAvatar": "更换头像",
+      "changeFolder": "更换文件夹"
+    },
+    "about": {
+      "title": "关于",
+      "versionLabel": "版本",
+      "appDeviceIdLabel": "应用设备 ID"
+    },
+    "profile": {
+      "loading": "正在加载个人资料...",
+      "title": "个人资料",
+      "deviceIdLabel": "设备 ID",
+      "displayNameLabel": "显示名称",
+      "avatarLabel": "头像",
+      "avatarFilterName": "图片",
+      "copyDeviceIdAriaLabel": "复制设备 ID",
+      "noAvatar": "未设置头像"
+    },
+    "app": {
+      "loading": "正在加载设置...",
+      "title": "应用设置",
+      "downloadDirectoryLabel": "下载目录",
+      "defaultDirectory": "默认",
+      "maxConcurrentTransfersLabel": "最大并发传输数（1-5）",
+      "languageTitle": "语言",
+      "languageLabel": "选择语言",
+      "languages": {
+        "en": "英语",
+        "zhCN": "简体中文"
+      }
+    },
+    "security": {
+      "title": "安全",
+      "localFingerprintLabel": "本地指纹",
+      "loadingFingerprint": "正在加载指纹...",
+      "copyFingerprintAriaLabel": "复制指纹",
+      "hint": "请与可信对等端比对此指纹，以验证你的安全身份。"
+    }
+  },
+  "devices": {
+    "title": "设备",
+    "connected": "已连接",
+    "list": {
+      "title": "Jasmine 局域网聊天",
+      "newGroup": "新建群组",
+      "newGroupButton": "+ 群组",
+      "searchPlaceholder": "搜索设备...",
+      "searching": "正在搜索局域网设备...",
+      "noResults": "未找到与“{{search}}”匹配的设备"
+    },
+    "status": {
+      "online": "在线",
+      "offline": "离线",
+      "incompatible": "不兼容"
+    },
+    "verification": {
+      "verified": "已验证",
+      "unverified": "未验证",
+      "verify": "验证",
+      "unverify": "取消验证",
+      "verifyPeer": "验证 {{name}}",
+      "unverifyPeer": "取消验证 {{name}}"
+    },
+    "chatHeader": {
+      "back": "返回"
+    }
+  },
+  "transfer": {
+    "title": "传输",
+    "start": "开始传输",
+    "actions": {
+      "accept": "接受",
+      "reject": "拒绝",
+      "cancel": "取消",
+      "resume": "继续",
+      "retry": "重试"
+    },
+    "aria": {
+      "cancelTransfer": "取消传输",
+      "resumeTransfer": "继续传输",
+      "retryTransfer": "重试传输"
+    },
+    "status": {
+      "queued": "等待中",
+      "active": "传输中",
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "rejected": "已拒绝",
+      "partially-failed": "部分失败"
+    },
+    "filePanel": {
+      "title": "文件传输",
+      "minimizeAriaLabel": "最小化面板",
+      "toggleAriaLabel": "切换传输面板"
+    },
+    "folderPanel": {
+      "title": "文件夹传输",
+      "minimizeAriaLabel": "最小化面板",
+      "toggleAriaLabel": "切换文件夹传输面板"
+    },
+    "fileReceiveDialog": {
+      "title": "收到文件传输请求",
+      "from": "来自：{{sender}}"
+    },
+    "folderReceiveDialog": {
+      "title": "收到文件夹传输请求",
+      "from": "来自：{{sender}}",
+      "fileCount_one": "{{count}} 个文件",
+      "fileCount_other": "{{count}} 个文件",
+      "selectDownloadLocation": "选择下载位置"
+    },
+    "folderItem": {
+      "filesSummary": "文件：{{transferred}} / {{total}}",
+      "currentFile": "当前：{{file}}"
+    }
+  },
+  "groups": {
+    "title": "群组",
+    "new": "新建群组",
+    "chat": {
+      "memberCount_one": "{{count}} 名成员",
+      "memberCount_other": "{{count}} 名成员",
+      "manage": "管理",
+      "empty": "暂无消息，开始聊天吧！",
+      "invalidGroupId": "无效的群组 ID",
+      "notFound": "未找到群组"
+    },
+    "memberPanel": {
+      "title": "成员（{{count}}）",
+      "addMembersPrompt": "输入成员 ID，使用逗号分隔",
+      "addMembers": "添加成员",
+      "leaveGroup": "退出群组",
+      "remove": "移除"
+    },
+    "createGroupModal": {
+      "title": "创建群组",
+      "nameLabel": "群组名称",
+      "namePlaceholder": "群组名称",
+      "selectMembers": "选择成员",
+      "noPeersAvailable": "没有可用设备"
+    }
+  },
+  "call": {
+    "action": {
+      "accept": "接听",
+      "reject": "拒绝",
+      "end": "挂断",
+      "mute": "静音",
+      "unmute": "取消静音",
+      "startVideo": "开启视频",
+      "stopVideo": "关闭视频",
+      "screenShare": "共享屏幕",
+      "stopScreenShare": "停止共享屏幕",
+      "audioCall": "语音通话",
+      "videoCall": "视频通话"
+    },
+    "status": {
+      "incoming": "来电中...",
+      "connecting": "连接中...",
+      "calling": "呼叫中...",
+      "reconnecting": "重连中...",
+      "connected": "已连接",
+      "screenSharing": "你正在共享屏幕",
+      "remoteScreenSharing": "{{name}} 正在共享屏幕"
+    },
+    "settings": {
+      "audioInput": "音频输入",
+      "selectAudio": "选择音频设备...",
+      "videoInput": "视频输入",
+      "selectVideo": "选择视频设备...",
+      "microphoneFallback": "麦克风 {{id}}",
+      "cameraFallback": "摄像头 {{id}}"
+    },
+    "participantBadge": {
+      "status": {
+        "new": "等待中",
+        "connecting": "连接中",
+        "connected": "已连接",
+        "disconnected": "已断开",
+        "closed": "已结束"
+      }
+    }
+  }
+}

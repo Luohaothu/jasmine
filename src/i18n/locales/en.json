@@ -1,0 +1,252 @@
+{
+  "common": {
+    "loading": "Loading...",
+    "error": "Error",
+    "retry": "Retry",
+    "actions": {
+      "close": "Close",
+      "cancel": "Cancel",
+      "create": "Create"
+    },
+    "status": {
+      "online": "online",
+      "offline": "offline",
+      "incompatible": "incompatible"
+    },
+    "mentionAutocomplete": {
+      "noMatchesFound": "No matches found"
+    },
+    "imageThumbnail": {
+      "generating": "Generating thumbnail...",
+      "image": "Image",
+      "alt": "Image thumbnail",
+      "openInSystemViewer": "Click to open in system viewer",
+      "openImage": "Open {{name}}"
+    },
+    "richTextRenderer": {
+      "openLink": "Open link: {{href}}"
+    }
+  },
+  "chat": {
+    "title": "Chat",
+    "empty": "Send the first message to start chatting",
+    "unknownPeer": "Unknown",
+    "you": "You",
+    "status": {
+      "online": "online",
+      "offline": "offline"
+    },
+    "messageBubble": {
+      "deleteConfirm": "Are you sure you want to delete this message?",
+      "deleted": "This message was deleted",
+      "jumpToReply": "Jump to replied message: {{preview}}",
+      "replies_one": "{{count}} reply",
+      "replies_other": "{{count}} replies",
+      "save": "Save",
+      "cancel": "Cancel",
+      "edited": "(edited)",
+      "encrypted": "Encrypted message",
+      "reply": "Reply",
+      "edit": "Edit",
+      "delete": "Delete"
+    },
+    "messageInput": {
+      "dropToSendFiles": "Drop to send files",
+      "replyingTo": "Replying to {{senderName}}:",
+      "cancelReply": "Cancel reply",
+      "placeholder": "Type a message...",
+      "send": "Send"
+    },
+    "ogPreviewCard": {
+      "previewAlt": "Preview"
+    }
+  },
+  "settings": {
+    "title": "Settings",
+    "actions": {
+      "copy": "Copy",
+      "changeAvatar": "Change Avatar",
+      "changeFolder": "Change Folder"
+    },
+    "about": {
+      "title": "About",
+      "versionLabel": "Version",
+      "appDeviceIdLabel": "App Device ID"
+    },
+    "profile": {
+      "loading": "Loading profile...",
+      "title": "Profile Information",
+      "deviceIdLabel": "Device ID",
+      "displayNameLabel": "Display Name",
+      "avatarLabel": "Avatar",
+      "avatarFilterName": "Images",
+      "copyDeviceIdAriaLabel": "Copy Device ID",
+      "noAvatar": "No avatar set"
+    },
+    "app": {
+      "loading": "Loading settings...",
+      "title": "Application Settings",
+      "downloadDirectoryLabel": "Download Directory",
+      "defaultDirectory": "Default",
+      "maxConcurrentTransfersLabel": "Max Concurrent Transfers (1-5)",
+      "languageTitle": "Language",
+      "languageLabel": "Select Language",
+      "languages": {
+        "en": "English",
+        "zhCN": "Simplified Chinese"
+      }
+    },
+    "security": {
+      "title": "Security",
+      "localFingerprintLabel": "Local Fingerprint",
+      "loadingFingerprint": "Loading fingerprint...",
+      "copyFingerprintAriaLabel": "Copy fingerprint",
+      "hint": "Compare this fingerprint with trusted peers to verify your secure identity."
+    }
+  },
+  "devices": {
+    "title": "Devices",
+    "connected": "Connected",
+    "list": {
+      "title": "Jasmine LAN Chat",
+      "newGroup": "New Group",
+      "newGroupButton": "+ Group",
+      "searchPlaceholder": "Search devices...",
+      "searching": "Searching local network devices...",
+      "noResults": "No devices found matching \"{{search}}\""
+    },
+    "status": {
+      "online": "online",
+      "offline": "offline",
+      "incompatible": "incompatible"
+    },
+    "verification": {
+      "verified": "Verified",
+      "unverified": "Unverified",
+      "verify": "Verify",
+      "unverify": "Unverify",
+      "verifyPeer": "Verify {{name}}",
+      "unverifyPeer": "Unverify {{name}}"
+    },
+    "chatHeader": {
+      "back": "Back"
+    }
+  },
+  "transfer": {
+    "title": "Transfers",
+    "start": "Start transfer",
+    "actions": {
+      "accept": "Accept",
+      "reject": "Reject",
+      "cancel": "Cancel",
+      "resume": "Resume",
+      "retry": "Retry"
+    },
+    "aria": {
+      "cancelTransfer": "Cancel transfer",
+      "resumeTransfer": "Resume transfer",
+      "retryTransfer": "Retry transfer"
+    },
+    "status": {
+      "queued": "queued",
+      "active": "active",
+      "completed": "completed",
+      "failed": "failed",
+      "cancelled": "cancelled",
+      "rejected": "rejected",
+      "partially-failed": "partially-failed"
+    },
+    "filePanel": {
+      "title": "File Transfers",
+      "minimizeAriaLabel": "Minimize panel",
+      "toggleAriaLabel": "Toggle transfer panel"
+    },
+    "folderPanel": {
+      "title": "Folder Transfers",
+      "minimizeAriaLabel": "Minimize panel",
+      "toggleAriaLabel": "Toggle folder transfer panel"
+    },
+    "fileReceiveDialog": {
+      "title": "File Offer Received",
+      "from": "From: {{sender}}"
+    },
+    "folderReceiveDialog": {
+      "title": "Folder Offer Received",
+      "from": "From: {{sender}}",
+      "fileCount_one": "{{count}} file",
+      "fileCount_other": "{{count}} files",
+      "selectDownloadLocation": "Select Download Location"
+    },
+    "folderItem": {
+      "filesSummary": "Files: {{transferred}} / {{total}}",
+      "currentFile": "Current: {{file}}"
+    }
+  },
+  "groups": {
+    "title": "Groups",
+    "new": "New group",
+    "chat": {
+      "memberCount_one": "{{count}} member",
+      "memberCount_other": "{{count}} members",
+      "manage": "Manage",
+      "empty": "No messages yet. Start the conversation!",
+      "invalidGroupId": "Invalid Group ID",
+      "notFound": "Group not found"
+    },
+    "memberPanel": {
+      "title": "Members ({{count}})",
+      "addMembersPrompt": "Enter member IDs separated by commas",
+      "addMembers": "Add Members",
+      "leaveGroup": "Leave Group",
+      "remove": "Remove"
+    },
+    "createGroupModal": {
+      "title": "Create Group",
+      "nameLabel": "Group Name",
+      "namePlaceholder": "Group Name",
+      "selectMembers": "Select Members",
+      "noPeersAvailable": "No peers available"
+    }
+  },
+  "call": {
+    "action": {
+      "accept": "Accept",
+      "reject": "Reject",
+      "end": "End Call",
+      "mute": "Mute",
+      "unmute": "Unmute",
+      "startVideo": "Start Video",
+      "stopVideo": "Stop Video",
+      "screenShare": "Share Screen",
+      "stopScreenShare": "Stop Screen Share",
+      "audioCall": "Audio Call",
+      "videoCall": "Video Call"
+    },
+    "status": {
+      "incoming": "Incoming call...",
+      "connecting": "Connecting...",
+      "calling": "Calling...",
+      "reconnecting": "Reconnecting...",
+      "connected": "Connected",
+      "screenSharing": "You are sharing your screen",
+      "remoteScreenSharing": "{{name}} is sharing their screen"
+    },
+    "settings": {
+      "audioInput": "Audio Input",
+      "selectAudio": "Select Audio...",
+      "videoInput": "Video Input",
+      "selectVideo": "Select Video...",
+      "microphoneFallback": "Microphone {{id}}",
+      "cameraFallback": "Camera {{id}}"
+    },
+    "participantBadge": {
+      "status": {
+        "new": "Waiting",
+        "connecting": "Connecting",
+        "connected": "Connected",
+        "disconnected": "Disconnected",
+        "closed": "Ended"
+      }
+    }
+  }
+}

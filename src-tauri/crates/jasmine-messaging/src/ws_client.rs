@@ -13,7 +13,19 @@ use crate::{MessagingError, Result, WsClientConfig, WsDisconnectReason, WsPeerCo
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsClientEvent {
     MessageReceived { message: ProtocolMessage },
+    CallSignalingReceived { message: ProtocolMessage },
     Disconnected { reason: WsDisconnectReason },
+}
+
+fn is_call_signaling_message(message: &ProtocolMessage) -> bool {
+    matches!(
+        message,
+        ProtocolMessage::CallOffer { .. }
+            | ProtocolMessage::CallAnswer { .. }
+            | ProtocolMessage::IceCandidate { .. }
+            | ProtocolMessage::CallHangup { .. }
+            | ProtocolMessage::CallReject { .. }
+    )
 }
 
 pub struct WsClient {
@@ -58,7 +70,13 @@ impl WsClient {
                 command_rx,
                 shutdown_rx,
                 move |message| {
+                    let signaling_message =
+                        is_call_signaling_message(&message).then(|| message.clone());
                     let _ = message_sender.send(WsClientEvent::MessageReceived { message });
+                    if let Some(message) = signaling_message {
+                        let _ =
+                            message_sender.send(WsClientEvent::CallSignalingReceived { message });
+                    }
                 },
             )
             .await;

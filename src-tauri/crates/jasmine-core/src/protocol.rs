@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -9,6 +11,13 @@ pub const MAX_PROTOCOL_MESSAGE_BYTES: usize = 64 * 1024;
 pub enum AckStatus {
     Received,
     Read,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallType {
+    Audio,
+    Video,
+    Screen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +33,8 @@ pub enum ProtocolMessage {
         reply_to_id: Option<String>,
         #[serde(default)]
         reply_to_preview: Option<String>,
+        #[serde(default)]
+        vector_clock: Option<HashMap<String, u64>>,
     },
     MessageEdit {
         message_id: String,
@@ -38,6 +49,36 @@ pub enum ProtocolMessage {
         chat_id: String,
         sender_id: String,
         timestamp_ms: u64,
+    },
+    CallOffer {
+        call_id: String,
+        sdp: String,
+        caller_id: String,
+        call_type: CallType,
+    },
+    CallAnswer {
+        call_id: String,
+        sdp: String,
+    },
+    IceCandidate {
+        call_id: String,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    },
+    CallHangup {
+        call_id: String,
+    },
+    CallReject {
+        call_id: String,
+        reason: Option<String>,
+    },
+    CallJoin {
+        call_id: String,
+        group_id: String,
+    },
+    CallLeave {
+        call_id: String,
     },
     FolderManifest {
         folder_transfer_id: String,
@@ -184,9 +225,19 @@ impl ProtocolMessage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        AckStatus, FolderFileEntry, FolderManifestData, ProtocolMessage, MAX_PROTOCOL_MESSAGE_BYTES,
+        AckStatus, CallType, FolderFileEntry, FolderManifestData, ProtocolMessage,
+        MAX_PROTOCOL_MESSAGE_BYTES,
     };
+
+    fn sample_vector_clock() -> HashMap<String, u64> {
+        HashMap::from([
+            ("device-a".to_string(), 2_u64),
+            ("device-b".to_string(), 1_u64),
+        ])
+    }
 
     #[test]
     fn protocol_json_roundtrip_with_size_guard_roundtrip() {
@@ -231,9 +282,118 @@ mod tests {
     }
 
     #[test]
+    fn protocol_text_message_with_vector_clock_roundtrip() {
+        let message = ProtocolMessage::TextMessage {
+            id: "msg-002".to_string(),
+            chat_id: "chat-001".to_string(),
+            sender_id: "user-001".to_string(),
+            content: "Vector clock attached".to_string(),
+            timestamp: 1_700_000_003,
+            reply_to_id: None,
+            reply_to_preview: None,
+            vector_clock: Some(sample_vector_clock()),
+        };
+
+        let payload = message
+            .to_json()
+            .expect("serialize text message with vector clock");
+        let decoded = ProtocolMessage::from_json(&payload)
+            .expect("deserialize text message with vector clock");
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn protocol_call_signaling_variants_roundtrip() {
+        let messages = vec![
+            ProtocolMessage::CallOffer {
+                call_id: "call-audio".to_string(),
+                sdp: "offer-sdp-audio".to_string(),
+                caller_id: "user-001".to_string(),
+                call_type: CallType::Audio,
+            },
+            ProtocolMessage::CallOffer {
+                call_id: "call-video".to_string(),
+                sdp: "offer-sdp-video".to_string(),
+                caller_id: "user-001".to_string(),
+                call_type: CallType::Video,
+            },
+            ProtocolMessage::CallOffer {
+                call_id: "call-screen".to_string(),
+                sdp: "offer-sdp-screen".to_string(),
+                caller_id: "user-001".to_string(),
+                call_type: CallType::Screen,
+            },
+            ProtocolMessage::CallAnswer {
+                call_id: "call-answer".to_string(),
+                sdp: "answer-sdp".to_string(),
+            },
+            ProtocolMessage::IceCandidate {
+                call_id: "call-ice".to_string(),
+                candidate: "candidate:1 1 udp 2122260223 192.168.1.5 54400 typ host".to_string(),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+            },
+            ProtocolMessage::CallHangup {
+                call_id: "call-hangup".to_string(),
+            },
+            ProtocolMessage::CallReject {
+                call_id: "call-reject".to_string(),
+                reason: Some("busy".to_string()),
+            },
+            ProtocolMessage::CallJoin {
+                call_id: "call-join".to_string(),
+                group_id: "group-001".to_string(),
+            },
+            ProtocolMessage::CallLeave {
+                call_id: "call-leave".to_string(),
+            },
+        ];
+
+        for message in messages {
+            let payload = message.to_json().expect("serialize call signaling message");
+            let decoded =
+                ProtocolMessage::from_json(&payload).expect("deserialize call signaling message");
+
+            assert_eq!(message, decoded);
+        }
+    }
+
+    #[test]
+    fn protocol_text_message_backward_compat_without_vector_clock() {
+        let raw_json = r#"
+            {
+                "type": "TextMessage",
+                "id": "msg-legacy",
+                "chat_id": "chat-legacy",
+                "sender_id": "user-legacy",
+                "content": "legacy text",
+                "timestamp": 1700000000000
+            }
+        "#;
+
+        let message =
+            ProtocolMessage::from_json(raw_json).expect("deserialize legacy text message payload");
+
+        assert_eq!(
+            message,
+            ProtocolMessage::TextMessage {
+                id: "msg-legacy".to_string(),
+                chat_id: "chat-legacy".to_string(),
+                sender_id: "user-legacy".to_string(),
+                content: "legacy text".to_string(),
+                timestamp: 1_700_000_000_000,
+                reply_to_id: None,
+                reply_to_preview: None,
+                vector_clock: None,
+            }
+        );
+    }
+
+    #[test]
     fn protocol_version_incompatible_roundtrip() {
         let message = ProtocolMessage::VersionIncompatible {
-            local_version: 2,
+            local_version: crate::CURRENT_PROTOCOL_VERSION,
             remote_version: 1,
             message: "peer protocol version 1 is incompatible; minimum supported version is 2"
                 .to_string(),
@@ -322,6 +482,7 @@ mod tests {
             timestamp: 0,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         };
 
         let err = message

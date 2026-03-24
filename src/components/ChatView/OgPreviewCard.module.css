@@ -1,0 +1,121 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+  border-radius: 8px;
+  overflow: hidden;
+  text-decoration: none;
+  font-size: 0.85rem;
+  background-color: rgba(0, 0, 0, 0.05);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  transition: opacity 0.2s;
+  color: inherit;
+  width: 100%;
+}
+
+.card:hover {
+  opacity: 0.9;
+}
+
+.cardOwn {
+  background-color: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.imageContainer {
+  width: 100%;
+  height: 120px;
+  background-color: rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.imageContainerOwn {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+
+.image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.content {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.siteName {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  opacity: 0.8;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  line-height: 1.2;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.description {
+  font-size: 0.8rem;
+  opacity: 0.9;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 0.3;
+  }
+  100% {
+    opacity: 0.6;
+  }
+}
+
+.skeleton {
+  animation: pulse 1.5s infinite ease-in-out;
+}
+
+.skeletonText {
+  height: 1em;
+  background-color: rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+
+.skeletonTextOwn {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+
+.skeletonTitle {
+  width: 80%;
+  height: 1.2em;
+}
+
+.skeletonDesc1 {
+  width: 100%;
+}
+
+.skeletonDesc2 {
+  width: 60%;
+}

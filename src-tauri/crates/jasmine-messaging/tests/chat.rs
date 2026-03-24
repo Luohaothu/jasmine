@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +135,13 @@ fn ws_url(server: &WsServer) -> String {
     format!("ws://{}", server.local_addr())
 }
 
+fn clock_map<const N: usize>(entries: [(&str, u64); N]) -> HashMap<String, u64> {
+    entries
+        .into_iter()
+        .map(|(peer_id, counter)| (peer_id.to_string(), counter))
+        .collect()
+}
+
 async fn expect_server_event(
     receiver: &mut tokio::sync::broadcast::Receiver<WsServerEvent>,
 ) -> WsServerEvent {
@@ -159,6 +167,49 @@ async fn expect_chat_event(
         .await
         .expect("chat event timeout")
         .expect("chat event channel closed")
+}
+
+async fn expect_server_text_message(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsServerEvent>,
+) -> (String, ProtocolMessage) {
+    loop {
+        match expect_server_event(receiver).await {
+            WsServerEvent::MessageReceived { peer, message }
+                if matches!(message, ProtocolMessage::TextMessage { .. }) =>
+            {
+                return (peer.identity.device_id, message);
+            }
+            WsServerEvent::MessageReceived { .. } => continue,
+            other => panic!("expected server text message, got {other:?}"),
+        }
+    }
+}
+
+async fn expect_client_text_message(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsClientEvent>,
+) -> ProtocolMessage {
+    loop {
+        match expect_client_event(receiver).await {
+            WsClientEvent::MessageReceived { message }
+                if matches!(message, ProtocolMessage::TextMessage { .. }) =>
+            {
+                return message;
+            }
+            WsClientEvent::MessageReceived { .. } => continue,
+            other => panic!("expected client text message, got {other:?}"),
+        }
+    }
+}
+
+async fn expect_chat_message_received(
+    receiver: &mut tokio::sync::broadcast::Receiver<ChatServiceEvent>,
+) -> (String, Message) {
+    loop {
+        match expect_chat_event(receiver).await {
+            ChatServiceEvent::MessageReceived { peer_id, message } => return (peer_id, message),
+            _ => continue,
+        }
+    }
 }
 
 async fn expect_no_chat_event(receiver: &mut tokio::sync::broadcast::Receiver<ChatServiceEvent>) {
@@ -283,6 +334,33 @@ async fn wait_for_message(storage: &Arc<SqliteStorage>, message_id: Uuid) -> Mes
     })
     .await
     .expect("message should be persisted")
+}
+
+async fn wait_for_message_vector_clock(
+    storage: &Arc<SqliteStorage>,
+    message_id: Uuid,
+    expected_clock: &HashMap<String, u64>,
+) -> HashMap<String, u64> {
+    let message_id_string = message_id.to_string();
+    let expected_clock = expected_clock.clone();
+
+    time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(vector_clock) = storage
+                .get_message_vector_clock(&message_id_string)
+                .await
+                .expect("load message vector clock")
+            {
+                if vector_clock == expected_clock {
+                    return vector_clock;
+                }
+            }
+
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("message vector clock should be persisted")
 }
 
 async fn wait_for_sender_key(
@@ -678,6 +756,7 @@ async fn chat_receives_incoming_message_persists_emits_event_and_acknowledges() 
             timestamp: 1_700_000_000_123,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send inbound text message");
@@ -763,6 +842,212 @@ async fn chat_send_uses_inbound_server_connection_for_bidirectional_messages() {
 
     alpha.shutdown().await;
     beta.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn chat_vector_clock_causal_merges_incoming_dm_clock_before_next_send() {
+    let alice = Node::new(27, "Alice Node").await;
+    let bob = Node::new(28, "Bob Node").await;
+    let mut bob_server_events = bob.server.subscribe();
+    let mut bob_chat_events = bob.chat.subscribe();
+    let alice_client = alice.connect_to(&bob).await;
+    let mut alice_client_events = alice_client.subscribe();
+    let mut alice_chat_events = alice.chat.subscribe();
+
+    match expect_server_event(&mut bob_server_events).await {
+        WsServerEvent::PeerConnected { peer } => {
+            assert_eq!(peer.identity.device_id, alice.identity.device_id);
+        }
+        other => panic!("expected bob peer connection, got {other:?}"),
+    }
+
+    let first = alice
+        .chat
+        .send_message(&bob.identity.device_id, "first causal message")
+        .await
+        .expect("send first causal message");
+    let first_clock = clock_map([(&alice.identity.device_id, 1)]);
+
+    match expect_server_text_message(&mut bob_server_events).await {
+        (
+            peer_id,
+            ProtocolMessage::TextMessage {
+                id, vector_clock, ..
+            },
+        ) => {
+            assert_eq!(peer_id, alice.identity.device_id);
+            assert_eq!(id, first.id.to_string());
+            assert_eq!(vector_clock, Some(first_clock.clone()));
+        }
+        other => panic!("expected first causal text message, got {other:?}"),
+    }
+    assert_eq!(
+        wait_for_message_vector_clock(&alice._storage, first.id, &first_clock).await,
+        first_clock
+    );
+
+    let (peer_id, message) = expect_chat_message_received(&mut bob_chat_events).await;
+    assert_eq!(peer_id, alice.identity.device_id);
+    assert_eq!(message.id, first.id);
+    assert_eq!(
+        wait_for_message_vector_clock(&bob._storage, first.id, &first_clock).await,
+        first_clock
+    );
+
+    let reply = bob
+        .chat
+        .send_message(&alice.identity.device_id, "causal reply")
+        .await
+        .expect("send causal reply");
+    let reply_clock = clock_map([(&alice.identity.device_id, 1), (&bob.identity.device_id, 1)]);
+
+    match expect_client_text_message(&mut alice_client_events).await {
+        ProtocolMessage::TextMessage {
+            id, vector_clock, ..
+        } => {
+            assert_eq!(id, reply.id.to_string());
+            assert_eq!(vector_clock, Some(reply_clock.clone()));
+        }
+        other => panic!("expected causal reply text message, got {other:?}"),
+    }
+    assert_eq!(
+        wait_for_message_vector_clock(&bob._storage, reply.id, &reply_clock).await,
+        reply_clock
+    );
+
+    let (peer_id, message) = expect_chat_message_received(&mut alice_chat_events).await;
+    assert_eq!(peer_id, bob.identity.device_id);
+    assert_eq!(message.id, reply.id);
+    assert_eq!(
+        wait_for_message_vector_clock(&alice._storage, reply.id, &reply_clock).await,
+        reply_clock
+    );
+
+    let follow_up = alice
+        .chat
+        .send_message(&bob.identity.device_id, "causal follow up")
+        .await
+        .expect("send causal follow up");
+    let follow_up_clock = clock_map([(&alice.identity.device_id, 2), (&bob.identity.device_id, 1)]);
+
+    match expect_server_text_message(&mut bob_server_events).await {
+        (
+            peer_id,
+            ProtocolMessage::TextMessage {
+                id, vector_clock, ..
+            },
+        ) => {
+            assert_eq!(peer_id, alice.identity.device_id);
+            assert_eq!(id, follow_up.id.to_string());
+            assert_eq!(vector_clock, Some(follow_up_clock.clone()));
+        }
+        other => panic!("expected causal follow-up text message, got {other:?}"),
+    }
+    assert_eq!(
+        wait_for_message_vector_clock(&alice._storage, follow_up.id, &follow_up_clock).await,
+        follow_up_clock
+    );
+
+    let (peer_id, message) = expect_chat_message_received(&mut bob_chat_events).await;
+    assert_eq!(peer_id, alice.identity.device_id);
+    assert_eq!(message.id, follow_up.id);
+    assert_eq!(
+        wait_for_message_vector_clock(&bob._storage, follow_up.id, &follow_up_clock).await,
+        follow_up_clock
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_vector_clock_skew_uses_merged_local_max_on_reply() {
+    let receiver = Node::new(29, "Receiver Node").await;
+    let sender_identity = peer(30, "Sender Node");
+    let sender_client = Arc::new(
+        WsClient::connect(
+            ws_url(&receiver.server),
+            client_config(sender_identity.clone()),
+        )
+        .await
+        .expect("connect sender client"),
+    );
+    let mut sender_events = sender_client.subscribe();
+    let mut receiver_chat_events = receiver.chat.subscribe();
+    let message_id = Uuid::new_v4();
+    let skewed_clock = clock_map([
+        (&sender_identity.device_id, 3),
+        (&receiver.identity.device_id, 7),
+    ]);
+
+    sender_client
+        .send(ProtocolMessage::TextMessage {
+            id: message_id.to_string(),
+            chat_id: receiver.identity.device_id.clone(),
+            sender_id: sender_identity.device_id.clone(),
+            content: "future vector clock".to_string(),
+            timestamp: 1_700_000_000_500,
+            reply_to_id: None,
+            reply_to_preview: None,
+            vector_clock: Some(skewed_clock.clone()),
+        })
+        .await
+        .expect("send skewed inbound text message");
+
+    let (peer_id, message) = expect_chat_message_received(&mut receiver_chat_events).await;
+    assert_eq!(peer_id, sender_identity.device_id);
+    assert_eq!(message.id, message_id);
+    assert_eq!(
+        wait_for_message_vector_clock(&receiver._storage, message_id, &skewed_clock).await,
+        skewed_clock
+    );
+
+    let reply = receiver
+        .chat
+        .send_message(&sender_identity.device_id, "reply after skew")
+        .await
+        .expect("send skew-aware reply");
+    let reply_clock = clock_map([
+        (&sender_identity.device_id, 3),
+        (&receiver.identity.device_id, 8),
+    ]);
+
+    match expect_client_text_message(&mut sender_events).await {
+        ProtocolMessage::TextMessage {
+            id, vector_clock, ..
+        } => {
+            assert_eq!(id, reply.id.to_string());
+            assert_eq!(vector_clock, Some(reply_clock.clone()));
+        }
+        other => panic!("expected skew reply text message, got {other:?}"),
+    }
+    assert_eq!(
+        wait_for_message_vector_clock(&receiver._storage, reply.id, &reply_clock).await,
+        reply_clock
+    );
+
+    sender_client
+        .send(ProtocolMessage::Ack {
+            message_id: reply.id.to_string(),
+            status: AckStatus::Received,
+        })
+        .await
+        .expect("ack skew reply");
+
+    let delivered = wait_for_status(
+        &receiver.chat,
+        &sender_identity.device_id,
+        reply.id,
+        MessageStatus::Delivered,
+    )
+    .await;
+    assert_eq!(delivered.id, reply.id);
+
+    sender_client
+        .disconnect()
+        .await
+        .expect("disconnect sender client");
+    receiver.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1344,6 +1629,7 @@ async fn chat_receives_incoming_reply_metadata_and_persists_it() {
             timestamp: 1_700_000_000_222,
             reply_to_id: Some(reply_to_id.clone()),
             reply_to_preview: Some(reply_to_preview.clone()),
+            vector_clock: None,
         })
         .await
         .expect("send inbound reply text message");
@@ -1718,6 +2004,7 @@ async fn chat_buffers_out_of_order_message_edit_until_original_message_arrives()
             timestamp: 1_700_000_000_000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send original text message");
@@ -1813,6 +2100,7 @@ async fn chat_buffers_out_of_order_message_delete_until_original_message_arrives
             timestamp: 1_700_000_000_000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send original text message");
@@ -1883,6 +2171,7 @@ async fn chat_incoming_message_edits_use_version_then_timestamp_conflict_resolut
             timestamp: 1_700_000_000_000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send original text message");
@@ -2039,6 +2328,7 @@ async fn chat_ignores_message_edit_after_message_delete() {
             timestamp: 1_700_000_000_000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send original text message");

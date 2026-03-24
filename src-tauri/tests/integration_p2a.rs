@@ -778,6 +778,7 @@ async fn phase2a_out_of_order_edit_and_delete_buffering() {
                 timestamp: now_ms_i64(),
                 reply_to_id: None,
                 reply_to_preview: None,
+                vector_clock: None,
             })
             .await
             .expect("send original message after edit");
@@ -833,6 +834,7 @@ async fn phase2a_out_of_order_edit_and_delete_buffering() {
                 timestamp: now_ms_i64(),
                 reply_to_id: None,
                 reply_to_preview: None,
+                vector_clock: None,
             })
             .await
             .expect("send original message after delete");

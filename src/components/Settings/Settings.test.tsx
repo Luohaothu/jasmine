@@ -5,6 +5,7 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import Settings from './Settings';
+import '../../i18n/i18n';
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn(),

@@ -7,6 +7,7 @@ export interface ChatMessage {
   receiverId: string;
   content: string;
   timestamp: number;
+  vectorClock?: Record<string, number>;
   encrypted?: boolean;
   status: 'sent' | 'delivered' | 'failed';
   editVersion?: number;
@@ -15,6 +16,7 @@ export interface ChatMessage {
   deletedAt?: number;
   replyToId?: string;
   replyToPreview?: string;
+  replyCount?: number;
   type?: 'text' | 'image' | 'file';
   transferId?: string;
   metadata?: {
@@ -25,6 +27,60 @@ export interface ChatMessage {
     thumbnailState?: 'pending' | 'ready' | 'failed';
   };
 }
+
+type VectorClockComparison = 'less' | 'equal' | 'greater' | 'concurrent';
+
+const compareVectorClocks = (
+  left: Record<string, number>,
+  right: Record<string, number>
+): VectorClockComparison => {
+  const actors = new Set([...Object.keys(left), ...Object.keys(right)]);
+  let sawLess = false;
+  let sawGreater = false;
+
+  for (const actor of actors) {
+    const leftValue = left[actor] ?? 0;
+    const rightValue = right[actor] ?? 0;
+
+    if (leftValue < rightValue) {
+      sawLess = true;
+    } else if (leftValue > rightValue) {
+      sawGreater = true;
+    }
+  }
+
+  if (sawLess && sawGreater) {
+    return 'concurrent';
+  }
+
+  if (sawLess) {
+    return 'less';
+  }
+
+  if (sawGreater) {
+    return 'greater';
+  }
+
+  return 'equal';
+};
+
+const sortMessagesByCausalThenTimestamp = (messages: ChatMessage[]): ChatMessage[] => {
+  return [...messages].sort((left, right) => {
+    if (left.vectorClock && right.vectorClock) {
+      const relation = compareVectorClocks(left.vectorClock, right.vectorClock);
+
+      if (relation === 'less') {
+        return -1;
+      }
+
+      if (relation === 'greater') {
+        return 1;
+      }
+    }
+
+    return left.timestamp - right.timestamp;
+  });
+};
 
 export interface ReplyingTo {
   id: string;
@@ -86,14 +142,14 @@ export const useChatStore = create<ChatStore>((set) => ({
     set((state) => ({
       messages: {
         ...state.messages,
-        [peerId]: [...(state.messages[peerId] || []), message],
+        [peerId]: sortMessagesByCausalThenTimestamp([...(state.messages[peerId] || []), message]),
       },
     })),
   setMessages: (peerId, messages) =>
     set((state) => ({
       messages: {
         ...state.messages,
-        [peerId]: messages,
+        [peerId]: sortMessagesByCausalThenTimestamp(messages),
       },
     })),
   editMessage: (peerId, messageId, newContent) =>

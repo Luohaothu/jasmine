@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import styles from './MemberPanel.module.css';
 import { Peer } from '../../types/peer';
 
@@ -19,6 +20,8 @@ export const MemberPanel: React.FC<MemberPanelProps> = ({
   onRemoveMember,
   onLeaveGroup,
 }) => {
+  const { t } = useTranslation();
+
   if (!isOpen) return null;
 
   const handleAddMembers = () => {
@@ -26,7 +29,7 @@ export const MemberPanel: React.FC<MemberPanelProps> = ({
       return;
     }
 
-    const input = window.prompt('Enter member IDs separated by commas');
+    const input = window.prompt(t('groups.memberPanel.addMembersPrompt'));
     if (!input) {
       return;
     }
@@ -66,17 +69,17 @@ export const MemberPanel: React.FC<MemberPanelProps> = ({
 
   return (
     <div className={styles.panel} data-testid="member-panel">
-      <h3 className={styles.header}>Members ({members.length})</h3>
+      <h3 className={styles.header}>{t('groups.memberPanel.title', { count: members.length })}</h3>
       {(onAddMembers || onLeaveGroup) && (
         <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
           {onAddMembers && (
             <button type="button" onClick={handleAddMembers}>
-              Add Members
+              {t('groups.memberPanel.addMembers')}
             </button>
           )}
           {onLeaveGroup && (
             <button type="button" onClick={handleLeaveGroup}>
-              Leave Group
+              {t('groups.memberPanel.leaveGroup')}
             </button>
           )}
         </div>
@@ -89,13 +92,13 @@ export const MemberPanel: React.FC<MemberPanelProps> = ({
                 className={`${styles.indicator} ${member.status === 'online' ? styles.online : styles.offline}`}
                 data-testid="status-indicator"
                 role="img"
-                aria-label={member.status}
+                aria-label={t(`common.status.${member.status}`)}
               />
               <span className={styles.memberName}>{member.name}</span>
             </div>
             {onRemoveMember && (
               <button type="button" onClick={() => handleRemoveMember(member.id)}>
-                Remove
+                {t('groups.memberPanel.remove')}
               </button>
             )}
           </div>

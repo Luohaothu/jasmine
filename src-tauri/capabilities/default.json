@@ -3,9 +3,10 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "permissions": [
-  "core:default",
-  "opener:default",
-  "core:path:default",
+    "core:default",
+    "opener:default",
+    "notification:default",
+    "core:path:default",
     "allow-app-commands"
   ]
 }

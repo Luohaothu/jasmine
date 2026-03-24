@@ -52,6 +52,7 @@ jasmine-transfer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-notification = "2.3.3"
 tauri-plugin-opener = "2"
 tokio.workspace = true
 tokio-util = "0.7"

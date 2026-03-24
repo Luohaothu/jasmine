@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { GroupChat } from './GroupChat';
+import '../../i18n/i18n';
 
 // Mocking the router params
 vi.mock('react-router-dom', () => ({
@@ -47,7 +48,7 @@ describe('GroupChat', () => {
 
     expect(screen.getByText('Dev Team')).toBeInTheDocument();
     expect(screen.getByText('3 members')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /管理|Manage/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Manage/i })).toBeInTheDocument();
   });
 
   it('toggles member panel when manage button is clicked', () => {
@@ -65,14 +66,14 @@ describe('GroupChat', () => {
     expect(screen.queryByTestId('member-panel')).not.toBeInTheDocument();
 
     // Click Manage
-    fireEvent.click(screen.getByRole('button', { name: /管理|Manage/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Manage/i }));
 
     // Panel should open
     expect(screen.getByTestId('member-panel')).toBeInTheDocument();
     expect(screen.getAllByText('Alice').length).toBeGreaterThan(0);
 
     // Click Manage again
-    fireEvent.click(screen.getByRole('button', { name: /管理|Manage/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Manage/i }));
 
     // Panel should close
     expect(screen.queryByTestId('member-panel')).not.toBeInTheDocument();

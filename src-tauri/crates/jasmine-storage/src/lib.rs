@@ -2,7 +2,7 @@ mod sqlite;
 
 use jasmine_core::{Message, PeerInfo, StorageEngine, TransferRecord};
 
-pub use sqlite::{ChatRecord, ChatType, SqliteStorage};
+pub use sqlite::{CachedOgMetadata, ChatRecord, ChatType, SqliteStorage};
 
 pub struct StorageModule<T: StorageEngine> {
     engine: T,

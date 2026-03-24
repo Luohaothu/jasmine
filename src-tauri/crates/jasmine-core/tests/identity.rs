@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hostname::get;
-use jasmine_core::identity::DeviceIdentity;
+use jasmine_core::identity::{DeviceIdentity, CURRENT_PROTOCOL_VERSION};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ mod identity {
         assert_eq!(parsed.get_version_num(), 4);
         assert_eq!(identity.display_name, hostname_string());
         assert_eq!(identity.avatar_path, None);
-        assert_eq!(identity.protocol_version, 2);
+        assert_eq!(identity.protocol_version, CURRENT_PROTOCOL_VERSION);
         assert!(!identity.public_key.is_empty());
         assert!(identity.created_at > 0);
     }
@@ -66,8 +66,8 @@ mod identity {
             display_name: "Desk Jasmine".to_string(),
             avatar_path: Some("/tmp/avatar.png".to_string()),
             created_at: 42,
-            public_key: "public-key-v2".to_string(),
-            protocol_version: 2,
+            public_key: "public-key-v3".to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
         };
 
         jasmine_core::identity::save(dir.path(), &identity).expect("save identity");
@@ -87,7 +87,7 @@ mod identity {
 
         assert!(dir.identity_file().exists());
         assert_eq!(identity.display_name, hostname_string());
-        assert_eq!(identity.protocol_version, 2);
+        assert_eq!(identity.protocol_version, CURRENT_PROTOCOL_VERSION);
         assert!(!identity.public_key.is_empty());
         assert_eq!(
             jasmine_core::identity::load(dir.path()).expect("reload generated identity"),
@@ -177,7 +177,7 @@ mod identity {
         );
         assert_eq!(loaded.created_at, 11);
         assert!(!loaded.public_key.is_empty());
-        assert_eq!(loaded.protocol_version, 2);
+        assert_eq!(loaded.protocol_version, CURRENT_PROTOCOL_VERSION);
 
         let persisted: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(dir.identity_file()).expect("read persisted identity"),
@@ -187,7 +187,10 @@ mod identity {
             persisted["public_key"],
             serde_json::Value::String(loaded.public_key.clone())
         );
-        assert_eq!(persisted["protocol_version"], serde_json::json!(2));
+        assert_eq!(
+            persisted["protocol_version"],
+            serde_json::json!(CURRENT_PROTOCOL_VERSION)
+        );
 
         let (reloaded, second_private_key) =
             jasmine_core::identity::load_with_private_key(dir.path())
@@ -221,7 +224,7 @@ mod identity {
         assert!(private_key.is_none());
         assert_eq!(loaded.device_id, legacy_device_id);
         assert_eq!(loaded.public_key, "legacy-public-key");
-        assert_eq!(loaded.protocol_version, 2);
+        assert_eq!(loaded.protocol_version, CURRENT_PROTOCOL_VERSION);
 
         let persisted: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(dir.identity_file()).expect("read persisted identity"),
@@ -231,7 +234,10 @@ mod identity {
             persisted["public_key"],
             serde_json::json!("legacy-public-key")
         );
-        assert_eq!(persisted["protocol_version"], serde_json::json!(2));
+        assert_eq!(
+            persisted["protocol_version"],
+            serde_json::json!(CURRENT_PROTOCOL_VERSION)
+        );
     }
 
     mod corrupted {
@@ -250,7 +256,7 @@ mod identity {
 
             assert_ne!(recovered.device_id, original.device_id);
             assert_eq!(recovered.display_name, hostname_string());
-            assert_eq!(recovered.protocol_version, 2);
+            assert_eq!(recovered.protocol_version, CURRENT_PROTOCOL_VERSION);
             assert!(!recovered.public_key.is_empty());
             assert!(Uuid::parse_str(&recovered.device_id).is_ok());
             assert_eq!(

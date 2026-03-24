@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use jasmine_core::{AckStatus, ProtocolMessage, StorageEngine, CURRENT_PROTOCOL_VERSION};
+use jasmine_core::{
+    protocol::CallType, AckStatus, ProtocolMessage, StorageEngine, CURRENT_PROTOCOL_VERSION,
+};
 use jasmine_crypto::{
     fingerprint, public_key_from_base64, public_key_to_base64, EncryptedFrame, PublicKey, Session,
     SessionKeyManager, StaticSecret,
@@ -137,6 +139,50 @@ async fn expect_client_event(
         .await
         .expect("client event timeout")
         .expect("client event channel closed")
+}
+
+async fn expect_server_message_received(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsServerEvent>,
+) -> (WsPeerConnection, ProtocolMessage) {
+    loop {
+        match expect_server_event(receiver).await {
+            WsServerEvent::MessageReceived { peer, message } => return (peer, message),
+            _ => continue,
+        }
+    }
+}
+
+async fn expect_server_call_signaling_received(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsServerEvent>,
+) -> (WsPeerConnection, ProtocolMessage) {
+    loop {
+        match expect_server_event(receiver).await {
+            WsServerEvent::CallSignalingReceived { peer, message } => return (peer, message),
+            _ => continue,
+        }
+    }
+}
+
+async fn expect_client_message_received(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsClientEvent>,
+) -> ProtocolMessage {
+    loop {
+        match expect_client_event(receiver).await {
+            WsClientEvent::MessageReceived { message } => return message,
+            _ => continue,
+        }
+    }
+}
+
+async fn expect_client_call_signaling_received(
+    receiver: &mut tokio::sync::broadcast::Receiver<WsClientEvent>,
+) -> ProtocolMessage {
+    loop {
+        match expect_client_event(receiver).await {
+            WsClientEvent::CallSignalingReceived { message } => return message,
+            _ => continue,
+        }
+    }
 }
 
 async fn expect_protocol_message<S>(socket: &mut WebSocketStream<S>, label: &str) -> ProtocolMessage
@@ -636,6 +682,7 @@ async fn ws_key_exchange_establishes_session_and_persists_peer_public_key() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
     client
         .send(outbound.clone())
@@ -683,6 +730,7 @@ async fn ws_roundtrip_json_messages_between_server_and_client() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
 
     client
@@ -721,6 +769,254 @@ async fn ws_roundtrip_json_messages_between_server_and_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_signaling_roundtrip_between_server_and_client_covers_all_variants() {
+    let server_identity = peer("server-call-101", "Server Call Node");
+    let client_identity = peer("client-call-101", "Client Call Node");
+    let server = WsServer::bind(server_config(server_identity, None))
+        .await
+        .expect("bind ws server");
+    let mut server_events = server.subscribe();
+    let client = WsClient::connect(
+        ws_url(&server),
+        client_config(client_identity.clone(), None),
+    )
+    .await
+    .expect("connect authenticated client");
+    let mut client_events = client.subscribe();
+
+    match expect_server_event(&mut server_events).await {
+        WsServerEvent::PeerConnected { .. } => {}
+        other => panic!("expected peer connection event, got {other:?}"),
+    }
+
+    let call_id = "call-variant-1".to_string();
+    let offer = ProtocolMessage::CallOffer {
+        call_id: call_id.clone(),
+        sdp: "offer-sdp".to_string(),
+        caller_id: client_identity.device_id.clone(),
+        call_type: CallType::Video,
+    };
+    client.send(offer.clone()).await.expect("send call offer");
+    let (offer_peer, offer_message) = expect_server_message_received(&mut server_events).await;
+    assert_eq!(offer_peer.identity, client_identity);
+    assert_eq!(offer_message, offer);
+    let (signal_peer, signal_message) =
+        expect_server_call_signaling_received(&mut server_events).await;
+    assert_eq!(signal_peer.identity, client_identity);
+    assert_eq!(
+        signal_message,
+        ProtocolMessage::CallOffer {
+            call_id: call_id.clone(),
+            sdp: "offer-sdp".to_string(),
+            caller_id: client_identity.device_id.clone(),
+            call_type: CallType::Video,
+        }
+    );
+
+    let answer = ProtocolMessage::CallAnswer {
+        call_id: call_id.clone(),
+        sdp: "answer-sdp".to_string(),
+    };
+    server
+        .send_to(&client_identity.device_id, answer.clone())
+        .await
+        .expect("send call answer");
+    assert_eq!(
+        expect_client_message_received(&mut client_events).await,
+        answer
+    );
+    assert_eq!(
+        expect_client_call_signaling_received(&mut client_events).await,
+        ProtocolMessage::CallAnswer {
+            call_id: call_id.clone(),
+            sdp: "answer-sdp".to_string(),
+        }
+    );
+
+    let client_candidate = ProtocolMessage::IceCandidate {
+        call_id: call_id.clone(),
+        candidate: "candidate:1 1 udp 1 127.0.0.1 5000 typ host".to_string(),
+        sdp_mid: Some("audio".to_string()),
+        sdp_mline_index: Some(0),
+    };
+    client
+        .send(client_candidate.clone())
+        .await
+        .expect("send client ice candidate");
+    assert_eq!(
+        expect_server_message_received(&mut server_events).await.1,
+        client_candidate
+    );
+    assert_eq!(
+        expect_server_call_signaling_received(&mut server_events)
+            .await
+            .1,
+        ProtocolMessage::IceCandidate {
+            call_id: call_id.clone(),
+            candidate: "candidate:1 1 udp 1 127.0.0.1 5000 typ host".to_string(),
+            sdp_mid: Some("audio".to_string()),
+            sdp_mline_index: Some(0),
+        }
+    );
+
+    let server_candidate = ProtocolMessage::IceCandidate {
+        call_id: call_id.clone(),
+        candidate: "candidate:2 1 udp 1 127.0.0.1 5001 typ host".to_string(),
+        sdp_mid: Some("video".to_string()),
+        sdp_mline_index: Some(1),
+    };
+    server
+        .send_to(&client_identity.device_id, server_candidate.clone())
+        .await
+        .expect("send server ice candidate");
+    assert_eq!(
+        expect_client_message_received(&mut client_events).await,
+        server_candidate
+    );
+    assert_eq!(
+        expect_client_call_signaling_received(&mut client_events).await,
+        ProtocolMessage::IceCandidate {
+            call_id: call_id.clone(),
+            candidate: "candidate:2 1 udp 1 127.0.0.1 5001 typ host".to_string(),
+            sdp_mid: Some("video".to_string()),
+            sdp_mline_index: Some(1),
+        }
+    );
+
+    let hangup = ProtocolMessage::CallHangup {
+        call_id: call_id.clone(),
+    };
+    client.send(hangup.clone()).await.expect("send call hangup");
+    assert_eq!(
+        expect_server_message_received(&mut server_events).await.1,
+        hangup
+    );
+    assert_eq!(
+        expect_server_call_signaling_received(&mut server_events)
+            .await
+            .1,
+        ProtocolMessage::CallHangup {
+            call_id: call_id.clone(),
+        }
+    );
+
+    let rejected_call_id = "call-variant-2".to_string();
+    let second_offer = ProtocolMessage::CallOffer {
+        call_id: rejected_call_id.clone(),
+        sdp: "offer-reject".to_string(),
+        caller_id: client_identity.device_id.clone(),
+        call_type: CallType::Audio,
+    };
+    client
+        .send(second_offer.clone())
+        .await
+        .expect("send second call offer");
+    assert_eq!(
+        expect_server_message_received(&mut server_events).await.1,
+        second_offer
+    );
+    assert_eq!(
+        expect_server_call_signaling_received(&mut server_events)
+            .await
+            .1,
+        ProtocolMessage::CallOffer {
+            call_id: rejected_call_id.clone(),
+            sdp: "offer-reject".to_string(),
+            caller_id: client_identity.device_id.clone(),
+            call_type: CallType::Audio,
+        }
+    );
+
+    let reject = ProtocolMessage::CallReject {
+        call_id: rejected_call_id,
+        reason: Some("busy".to_string()),
+    };
+    server
+        .send_to(&client_identity.device_id, reject.clone())
+        .await
+        .expect("send call reject");
+    assert_eq!(
+        expect_client_message_received(&mut client_events).await,
+        reject
+    );
+    assert_eq!(
+        expect_client_call_signaling_received(&mut client_events).await,
+        ProtocolMessage::CallReject {
+            call_id: "call-variant-2".to_string(),
+            reason: Some("busy".to_string()),
+        }
+    );
+
+    client.disconnect().await.expect("disconnect client");
+    server.shutdown().await.expect("shutdown ws server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_signaling_unknown_call_id_does_not_interrupt_text_message_flow() {
+    let server_identity = peer("server-call-102", "Server Signaling Safety");
+    let client_identity = peer("client-call-102", "Client Signaling Safety");
+    let server = WsServer::bind(server_config(server_identity, None))
+        .await
+        .expect("bind ws server");
+    let mut server_events = server.subscribe();
+    let client = WsClient::connect(
+        ws_url(&server),
+        client_config(client_identity.clone(), None),
+    )
+    .await
+    .expect("connect authenticated client");
+
+    match expect_server_event(&mut server_events).await {
+        WsServerEvent::PeerConnected { .. } => {}
+        other => panic!("expected peer connection event, got {other:?}"),
+    }
+
+    let unknown_answer = ProtocolMessage::CallAnswer {
+        call_id: "unknown-call-id".to_string(),
+        sdp: "late-answer".to_string(),
+    };
+    client
+        .send(unknown_answer.clone())
+        .await
+        .expect("send unknown call answer");
+    assert_eq!(
+        expect_server_message_received(&mut server_events).await.1,
+        unknown_answer
+    );
+    assert_eq!(
+        expect_server_call_signaling_received(&mut server_events)
+            .await
+            .1,
+        ProtocolMessage::CallAnswer {
+            call_id: "unknown-call-id".to_string(),
+            sdp: "late-answer".to_string(),
+        }
+    );
+
+    let text = ProtocolMessage::TextMessage {
+        id: "msg-after-unknown-call".to_string(),
+        chat_id: "chat-after-unknown-call".to_string(),
+        sender_id: client_identity.device_id.clone(),
+        content: "chat continues".to_string(),
+        timestamp: 1_700_000_000_001,
+        reply_to_id: None,
+        reply_to_preview: None,
+        vector_clock: None,
+    };
+    client
+        .send(text.clone())
+        .await
+        .expect("send text after unknown call signaling");
+    assert_eq!(
+        expect_server_message_received(&mut server_events).await.1,
+        text
+    );
+
+    client.disconnect().await.expect("disconnect client");
+    server.shutdown().await.expect("shutdown ws server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_encrypted_roundtrip_after_handshake_uses_binary_frames() {
     let server = WsServer::bind(server_config(peer("server-111", "Server Node"), None))
         .await
@@ -750,6 +1046,7 @@ async fn ws_encrypted_roundtrip_after_handshake_uses_binary_frames() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
     let encrypted_outbound = encrypt_transport_frame(&mut handshake.session, &outbound);
     assert_eq!(
@@ -917,6 +1214,7 @@ async fn ws_encrypted_tamper_closes_connection_with_protocol_violation() {
         timestamp: 1_700_000_000_100,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
     let mut tampered_frame = encrypt_transport_frame(&mut handshake.session, &outbound);
     tamper_transport_frame(&mut tampered_frame);
@@ -966,6 +1264,7 @@ async fn ws_plaintext_after_handshake_is_rejected() {
                 timestamp: 1_700_000_000_200,
                 reply_to_id: None,
                 reply_to_preview: None,
+                vector_clock: None,
             }
             .to_json()
             .expect("serialize plaintext post-handshake message")
@@ -1223,6 +1522,7 @@ async fn ws_multi_client_supports_message_isolation_and_reconnect() {
                 timestamp: 1_700_000_000_000 + index as i64,
                 reply_to_id: None,
                 reply_to_preview: None,
+                vector_clock: None,
             })
             .await
             .expect("send isolated client message");
@@ -1280,6 +1580,7 @@ async fn ws_multi_client_supports_message_isolation_and_reconnect() {
             timestamp: 1_700_000_000_100,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         })
         .await
         .expect("send reconnect message");

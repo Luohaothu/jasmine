@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import styles from './CreateGroupModal.module.css';
 import { useGroupStore } from '../../stores/groupStore';
 import { Peer } from '../../types/peer';
@@ -13,6 +14,7 @@ export const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onCl
   const [name, setName] = useState('');
   const [selectedMembers, setSelectedMembers] = useState<Set<string>>(new Set());
   const createGroup = useGroupStore((state) => state.createGroup);
+  const { t } = useTranslation();
 
   if (!isOpen) return null;
 
@@ -42,28 +44,33 @@ export const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onCl
     <div className={styles.overlay}>
       <div className={styles.modal} role="dialog" aria-modal="true">
         <div className={styles.header}>
-          <h2 className={styles.title}>Create Group</h2>
-          <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close">
+          <h2 className={styles.title}>{t('groups.createGroupModal.title')}</h2>
+          <button
+            type="button"
+            className={styles.closeBtn}
+            onClick={onClose}
+            aria-label={t('common.actions.close')}
+          >
             &times;
           </button>
         </div>
 
         <div className={styles.inputGroup}>
           <label htmlFor="groupName" className={styles.label}>
-            Group Name
+            {t('groups.createGroupModal.nameLabel')}
           </label>
           <input
             id="groupName"
             type="text"
             className={styles.input}
-            placeholder="Group Name"
+            placeholder={t('groups.createGroupModal.namePlaceholder')}
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
         </div>
 
         <div className={styles.inputGroup}>
-          <span className={styles.label}>Select Members</span>
+          <span className={styles.label}>{t('groups.createGroupModal.selectMembers')}</span>
           <div className={styles.memberList}>
             {peers.map((peer) => (
               <label key={peer.id} className={styles.memberItem}>
@@ -78,14 +85,16 @@ export const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onCl
               </label>
             ))}
             {peers.length === 0 && (
-              <span style={{ color: 'var(--text-secondary)' }}>No peers available</span>
+              <span style={{ color: 'var(--text-secondary)' }}>
+                {t('groups.createGroupModal.noPeersAvailable')}
+              </span>
             )}
           </div>
         </div>
 
         <div className={styles.actions}>
           <button type="button" className={styles.cancelBtn} onClick={onClose}>
-            Cancel
+            {t('common.actions.cancel')}
           </button>
           <button
             type="button"
@@ -93,7 +102,7 @@ export const CreateGroupModal: React.FC<CreateGroupModalProps> = ({ isOpen, onCl
             onClick={handleCreate}
             disabled={!name.trim() || selectedMembers.size === 0}
           >
-            Create
+            {t('common.actions.create')}
           </button>
         </div>
       </div>

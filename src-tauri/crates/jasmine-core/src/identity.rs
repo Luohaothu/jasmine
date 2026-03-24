@@ -10,7 +10,7 @@ use crate::{CoreError, Result};
 
 pub const IDENTITY_FILE_NAME: &str = "identity.json";
 
-pub const CURRENT_PROTOCOL_VERSION: u32 = 2;
+pub const CURRENT_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
