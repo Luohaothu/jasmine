@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useTranslation } from 'react-i18next';
 import { useTransferStore } from '../../stores/transferStore';
 import { Transfer } from '../../stores/transferStore';
 import styles from './FileTransferPanel.module.css';
@@ -21,6 +22,7 @@ function formatSpeed(speed: number) {
 }
 
 export function TransferItem({ transfer }: TransferItemProps) {
+  const { t } = useTranslation();
   const resumeTransfer = useTransferStore((state) => state.resumeTransfer);
   const retryTransfer = useTransferStore((state) => state.retryTransfer);
   const [isActionPending, setIsActionPending] = useState(false);
@@ -71,7 +73,7 @@ export function TransferItem({ transfer }: TransferItemProps) {
           {transfer.filename}
         </span>
         <span className={`${styles.status} ${styles[`status-${transfer.state}`]}`}>
-          {transfer.state}
+          {t(`transfer.status.${transfer.state}`)}
         </span>
       </div>
 
@@ -91,35 +93,35 @@ export function TransferItem({ transfer }: TransferItemProps) {
             <button
               className={styles.cancelBtn}
               onClick={handleCancel}
-              aria-label="Cancel transfer"
+              aria-label={t('transfer.aria.cancelTransfer')}
               type="button"
               disabled={isActionPending}
             >
-              Cancel
+              {t('transfer.actions.cancel')}
             </button>
           )}
           {showResume && (
             <button
               className={styles.actionBtn}
               onClick={handleResume}
-              aria-label="Resume transfer"
+              aria-label={t('transfer.aria.resumeTransfer')}
               type="button"
               disabled={isActionPending}
               data-testid="resume-btn"
             >
-              Resume
+              {t('transfer.actions.resume')}
             </button>
           )}
           {showRetry && (
             <button
               className={styles.secondaryBtn}
               onClick={handleRetry}
-              aria-label="Retry transfer"
+              aria-label={t('transfer.aria.retryTransfer')}
               type="button"
               disabled={isActionPending}
               data-testid="retry-btn"
             >
-              Retry
+              {t('transfer.actions.retry')}
             </button>
           )}
         </div>

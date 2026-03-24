@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { useTranslation } from 'react-i18next';
 
 import { FolderTransfer, useFolderTransferStore } from '../../stores/folderTransferStore';
 import styles from './FolderTransferPanel.module.css';
@@ -21,6 +22,7 @@ function formatSpeed(speed: number) {
 }
 
 export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const resumeFolderTransfer = useFolderTransferStore((state) => state.resumeFolderTransfer);
   const retryFolderTransfer = useFolderTransferStore((state) => state.retryFolderTransfer);
@@ -89,7 +91,7 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
           📁 {transfer.folderName}
         </span>
         <span className={`${styles.status} ${styles[`status-${transfer.state}`]}`}>
-          {transfer.state}
+          {t(`transfer.status.${transfer.state}`)}
         </span>
       </button>
 
@@ -115,10 +117,10 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
                 e.stopPropagation();
                 handleCancel();
               }}
-              aria-label="Cancel transfer"
+              aria-label={t('transfer.aria.cancelTransfer')}
               disabled={isActionPending}
             >
-              Cancel
+              {t('transfer.actions.cancel')}
             </button>
           )}
           {showResume && (
@@ -126,11 +128,11 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
               className={styles.actionBtn}
               type="button"
               onClick={handleResume}
-              aria-label="Resume transfer"
+              aria-label={t('transfer.aria.resumeTransfer')}
               disabled={isActionPending}
               data-testid="resume-btn"
             >
-              Resume
+              {t('transfer.actions.resume')}
             </button>
           )}
           {showRetry && (
@@ -138,11 +140,11 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
               className={styles.secondaryBtn}
               type="button"
               onClick={handleRetry}
-              aria-label="Retry transfer"
+              aria-label={t('transfer.aria.retryTransfer')}
               disabled={isActionPending}
               data-testid="retry-btn"
             >
-              Retry
+              {t('transfer.actions.retry')}
             </button>
           )}
         </div>
@@ -154,7 +156,10 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
           style={{ fontSize: '12px', marginTop: '8px', color: 'var(--text-secondary, #666)' }}
         >
           <div style={{ marginBottom: '4px' }}>
-            Files: {transfer.transferredFiles} / {transfer.totalFiles}
+            {t('transfer.folderItem.filesSummary', {
+              transferred: transfer.transferredFiles,
+              total: transfer.totalFiles,
+            })}
           </div>
           {displayFiles.length > 0 ? (
             <ul
@@ -191,7 +196,7 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
                       {file.relativePath}
                     </span>
                     <span className={`${styles.status} ${styles[`status-${file.state}`]}`}>
-                      {file.state}
+                      {t(`transfer.status.${file.state}`)}
                     </span>
                   </div>
                   <div
@@ -218,7 +223,7 @@ export function FolderTransferItem({ transfer }: FolderTransferItemProps) {
                 style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
                 title={transfer.currentFile}
               >
-                Current: {transfer.currentFile}
+                {t('transfer.folderItem.currentFile', { file: transfer.currentFile })}
               </div>
             )
           )}

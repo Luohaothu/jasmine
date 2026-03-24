@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { invoke } from '@tauri-apps/api/core';
 
+import '../../i18n/i18n';
 import { useFolderTransferStore } from '../../stores/folderTransferStore';
 import { FolderTransferPanel } from './FolderTransferPanel';
 
