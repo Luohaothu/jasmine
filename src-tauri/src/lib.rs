@@ -8,6 +8,7 @@ pub mod commands;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_data_dir: std::path::PathBuf = app
                 .path()
@@ -23,17 +24,29 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_webrtc_platform_info,
+            commands::check_call_support,
             commands::start_discovery,
             commands::stop_discovery,
             commands::get_peers,
             commands::send_message,
+            commands::send_call_join,
+            commands::send_call_leave,
+            commands::send_call_offer,
+            commands::send_call_answer,
+            commands::send_ice_candidate,
+            commands::send_call_hangup,
+            commands::send_call_reject,
             commands::get_messages,
+            commands::get_reply_count,
+            commands::get_reply_counts,
             commands::create_group,
             commands::add_group_members,
             commands::remove_group_members,
             commands::get_group_info,
             commands::list_groups,
             commands::leave_group,
+            commands::fetch_og_metadata,
             commands::send_group_message,
             commands::edit_message,
             commands::delete_message,
