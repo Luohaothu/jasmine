@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
+import '../../../i18n/i18n';
 import { MessageBubble } from '../MessageBubble';
 import styles from '../MessageBubble.module.css';
 
@@ -280,6 +281,60 @@ describe('MessageBubble', () => {
       fireEvent.click(replyButton);
 
       expect(mockOnReply).toHaveBeenCalledWith('msg-1', 'A'.repeat(80) + '…', undefined);
+    });
+
+    it('renders the replies badge when replyCount is greater than zero', () => {
+      render(
+        <MessageBubble
+          id="msg-1"
+          content="Hello World"
+          timestamp={timestamp}
+          isOwn={false}
+          replyCount={3}
+          firstReplyId="msg-2"
+        />
+      );
+
+      expect(screen.getByTestId('reply-count-badge')).toHaveTextContent('3 replies');
+    });
+
+    it('does not render the replies badge when replyCount is zero', () => {
+      render(
+        <MessageBubble
+          id="msg-1"
+          content="Hello World"
+          timestamp={timestamp}
+          isOwn={false}
+          replyCount={0}
+        />
+      );
+
+      expect(screen.queryByTestId('reply-count-badge')).not.toBeInTheDocument();
+    });
+
+    it('clicking the replies badge scrolls to the first reply', () => {
+      const scrollIntoViewMock = vi.fn();
+      const replyElement = document.createElement('div');
+      replyElement.id = 'message-msg-2';
+      replyElement.scrollIntoView = scrollIntoViewMock;
+      document.body.appendChild(replyElement);
+
+      render(
+        <MessageBubble
+          id="msg-1"
+          content="Hello World"
+          timestamp={timestamp}
+          isOwn={false}
+          replyCount={3}
+          firstReplyId="msg-2"
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('reply-count-badge'));
+
+      expect(scrollIntoViewMock).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' });
+
+      document.body.removeChild(replyElement);
     });
   });
 });
