@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import '../../i18n/i18n';
 import { MessageInput } from './MessageInput';
 import { usePeerStore } from '../../stores/peerStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -107,10 +108,10 @@ describe('MessageInput', () => {
 
       fireEvent.dragOver(container, { dataTransfer: { types: ['Files'] } });
 
-      expect(screen.getByText(/释放以发送文件/i)).toBeInTheDocument();
+      expect(screen.getByText(/drop to send files/i)).toBeInTheDocument();
 
       fireEvent.dragLeave(container);
-      expect(screen.queryByText(/释放以发送文件/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/drop to send files/i)).not.toBeInTheDocument();
     });
 
     it('invokes file transfer on file drop', async () => {
@@ -144,7 +145,7 @@ describe('MessageInput', () => {
   describe('Quote Reply', () => {
     beforeEach(() => {
       useChatStore.setState({
-        replyingTo: { id: 'msg-123', preview: 'This is a preview text' }
+        replyingTo: { id: 'msg-123', preview: 'This is a preview text' },
       });
     });
 
@@ -228,7 +229,7 @@ describe('MessageInput', () => {
 
   describe('Mentions', () => {
     beforeEach(() => {
-      (usePeerStore as any).mockImplementation((selector: any) => 
+      (usePeerStore as any).mockImplementation((selector: any) =>
         selector({
           peers: [
             { id: 'uuid-1', name: 'Alice', status: 'online' },
@@ -295,7 +296,7 @@ describe('MessageInput', () => {
 
       await user.type(input, '@');
       await user.type(input, '{ArrowDown}{Enter}');
-      
+
       expect(input).toHaveValue('@[Bob](user:uuid-2) ');
     });
   });
