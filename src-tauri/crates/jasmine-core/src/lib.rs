@@ -1,6 +1,7 @@
 #![allow(async_fn_in_trait)]
 
 pub mod identity;
+pub mod og;
 pub mod protocol;
 pub mod richtext;
 pub mod settings;
@@ -12,6 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use identity::{DeviceIdentity, IdentityStore, CURRENT_PROTOCOL_VERSION};
+pub use og::{fetch_og_metadata, OgMetadata};
 pub use protocol::{AckStatus, ProtocolMessage};
 pub use richtext::{extract_urls, parse_mentions, MentionRef, UrlRef};
 pub use settings::{AppSettings, SettingsService};
