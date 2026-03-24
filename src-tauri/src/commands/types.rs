@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use jasmine_core::{AppSettings, DeviceIdentity, Message, PeerInfo};
+use jasmine_core::{
+    protocol::CallType, AppSettings, DeviceIdentity, Message, OgMetadata, PeerInfo,
+};
+use jasmine_storage::CachedOgMetadata;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter as _;
@@ -38,6 +42,22 @@ pub struct StoredGroupInfo {
     pub name: String,
     pub member_ids: Vec<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebRTCPlatformInfo {
+    pub platform: String,
+    pub webview: String,
+    pub webview_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallSupportInfo {
+    pub supported: bool,
+    pub platform: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -214,6 +234,7 @@ pub struct AppState {
     pub(crate) local_device_id: String,
     pub(crate) discovery: Arc<dyn DiscoveryServiceHandle>,
     pub(crate) messaging: Arc<dyn MessagingServiceHandle>,
+    pub(crate) og_metadata: Arc<dyn OgMetadataServiceHandle>,
     pub(crate) transfers: Arc<dyn TransferServiceHandle>,
     pub(crate) identity_service: Arc<dyn IdentityServiceHandle>,
     pub(crate) settings_service: Arc<dyn SettingsServiceHandle>,
@@ -224,6 +245,7 @@ impl AppState {
         local_device_id: String,
         discovery: Arc<dyn DiscoveryServiceHandle>,
         messaging: Arc<dyn MessagingServiceHandle>,
+        og_metadata: Arc<dyn OgMetadataServiceHandle>,
         transfers: Arc<dyn TransferServiceHandle>,
         identity_service: Arc<dyn IdentityServiceHandle>,
         settings_service: Arc<dyn SettingsServiceHandle>,
@@ -232,6 +254,7 @@ impl AppState {
             local_device_id,
             discovery,
             messaging,
+            og_metadata,
             transfers,
             identity_service,
             settings_service,
@@ -263,6 +286,65 @@ impl AppState {
         super::messaging::send_message_impl(self, peer_id, content, reply_to_id).await
     }
 
+    pub async fn send_call_offer(
+        &self,
+        peer_id: String,
+        call_id: String,
+        sdp: String,
+        call_type: CallType,
+    ) -> Result<(), String> {
+        super::calls::send_call_offer_impl(self, peer_id, call_id, sdp, call_type).await
+    }
+
+    pub async fn send_call_join(&self, group_id: String, call_id: String) -> Result<(), String> {
+        super::calls::send_call_join_impl(self, group_id, call_id).await
+    }
+
+    pub async fn send_call_leave(&self, call_id: String) -> Result<(), String> {
+        super::calls::send_call_leave_impl(self, call_id).await
+    }
+
+    pub async fn send_call_answer(
+        &self,
+        peer_id: String,
+        call_id: String,
+        sdp: String,
+    ) -> Result<(), String> {
+        super::calls::send_call_answer_impl(self, peer_id, call_id, sdp).await
+    }
+
+    pub async fn send_ice_candidate(
+        &self,
+        peer_id: String,
+        call_id: String,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), String> {
+        super::calls::send_ice_candidate_impl(
+            self,
+            peer_id,
+            call_id,
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        )
+        .await
+    }
+
+    pub async fn send_call_hangup(&self, peer_id: String, call_id: String) -> Result<(), String> {
+        super::calls::send_call_hangup_impl(self, peer_id, call_id).await
+    }
+
+    pub async fn send_call_reject(
+        &self,
+        peer_id: String,
+        call_id: String,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        super::calls::send_call_reject_impl(self, peer_id, call_id, reason).await
+    }
+
     pub async fn get_messages(
         &self,
         chat_id: String,
@@ -270,6 +352,17 @@ impl AppState {
         offset: u32,
     ) -> Result<Vec<ChatMessagePayload>, String> {
         super::messaging::get_messages_impl(self, chat_id, limit, offset).await
+    }
+
+    pub async fn get_reply_count(&self, message_id: String) -> Result<i64, String> {
+        super::messaging::get_reply_count_impl(self, message_id).await
+    }
+
+    pub async fn get_reply_counts(
+        &self,
+        message_ids: Vec<String>,
+    ) -> Result<HashMap<String, i64>, String> {
+        super::messaging::get_reply_counts_impl(self, message_ids).await
     }
 
     pub async fn create_group(
@@ -477,12 +570,43 @@ pub trait MessagingServiceHandle: Send + Sync {
         content: &str,
         reply_to_id: Option<&str>,
     ) -> Result<Message, String>;
+    async fn send_call_offer(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        sdp: &str,
+        call_type: CallType,
+    ) -> Result<(), String>;
+    async fn send_call_join(&self, group_id: &str, call_id: &str) -> Result<(), String>;
+    async fn send_call_leave(&self, call_id: &str) -> Result<(), String>;
+    async fn send_call_answer(&self, peer_id: &str, call_id: &str, sdp: &str)
+        -> Result<(), String>;
+    async fn send_ice_candidate(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), String>;
+    async fn send_call_hangup(&self, peer_id: &str, call_id: &str) -> Result<(), String>;
+    async fn send_call_reject(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String>;
     async fn get_messages(
         &self,
         chat_id: &str,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<Message>, String>;
+    async fn get_reply_count(&self, message_id: &str) -> Result<i64, String>;
+    async fn get_reply_counts(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, i64>, String>;
     async fn create_group(&self, name: &str, members: &[String])
         -> Result<StoredGroupInfo, String>;
     async fn add_group_members(
@@ -512,6 +636,14 @@ pub trait MessagingServiceHandle: Send + Sync {
     ) -> Result<(), String>;
     async fn delete_message(&self, message_id: &str, sender_id: &str) -> Result<(), String>;
     async fn shutdown(&self) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait OgMetadataServiceHandle: Send + Sync {
+    async fn get_cached_og_metadata(&self, url: &str) -> Result<Option<CachedOgMetadata>, String>;
+    async fn save_og_metadata(&self, metadata: &OgMetadata, ttl_seconds: u64)
+        -> Result<(), String>;
+    async fn fetch_remote_og_metadata(&self, url: &str) -> Result<OgMetadata, String>;
 }
 
 #[async_trait]

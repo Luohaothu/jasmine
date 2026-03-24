@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use jasmine_core::{Message, MessageStatus};
@@ -26,6 +27,24 @@ pub async fn get_messages(
     offset: u32,
 ) -> Result<Vec<ChatMessagePayload>, String> {
     get_messages_impl(state.inner().as_ref(), chat_id, limit, offset).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn get_reply_count(
+    state: State<'_, Arc<AppState>>,
+    messageId: String,
+) -> Result<i64, String> {
+    get_reply_count_impl(state.inner().as_ref(), messageId).await
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub async fn get_reply_counts(
+    state: State<'_, Arc<AppState>>,
+    messageIds: Vec<String>,
+) -> Result<HashMap<String, i64>, String> {
+    get_reply_counts_impl(state.inner().as_ref(), messageIds).await
 }
 
 #[tauri::command]
@@ -137,6 +156,20 @@ pub(crate) async fn get_messages_impl(
         .into_iter()
         .map(|message| chat_message_payload(&local_device_id, &chat_id, message, None))
         .collect())
+}
+
+pub(crate) async fn get_reply_count_impl(
+    state: &AppState,
+    message_id: String,
+) -> Result<i64, String> {
+    state.messaging.get_reply_count(&message_id).await
+}
+
+pub(crate) async fn get_reply_counts_impl(
+    state: &AppState,
+    message_ids: Vec<String>,
+) -> Result<HashMap<String, i64>, String> {
+    state.messaging.get_reply_counts(&message_ids).await
 }
 
 pub(crate) async fn create_group_impl(

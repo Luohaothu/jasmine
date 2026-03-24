@@ -5,29 +5,35 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use jasmine_core::{
-    AppSettings, ChatId, DeviceId, DeviceIdentity, Message, MessageStatus, PeerInfo,
-    TransferRecord, TransferStatus, UserId,
+    protocol::CallType, AppSettings, ChatId, DeviceId, DeviceIdentity, Message, MessageStatus,
+    OgMetadata, PeerInfo, TransferRecord, TransferStatus, UserId,
 };
 use jasmine_crypto::{fingerprint, public_key_from_base64, public_key_to_base64, PublicKey};
+use jasmine_storage::CachedOgMetadata;
 use jasmine_transfer::{ManagedTransfer, TransferDirection, TransferProgress};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use super::{
     accept_file_impl, accept_folder_transfer_impl, add_group_members_impl,
-    cancel_folder_transfer_impl, cancel_transfer_impl, create_group_impl, delete_message_impl,
-    edit_message_impl, get_group_info_impl, get_identity_impl, get_messages_impl,
-    get_own_fingerprint_impl, get_peer_fingerprint_impl, get_peers_impl, get_settings_impl,
-    get_transfers_impl, leave_group_impl, list_groups_impl, reject_file_impl,
-    reject_folder_transfer_impl, remove_group_members_impl, resume_transfer_impl,
-    retry_transfer_impl, send_file_impl, send_folder_impl, send_group_message_impl,
-    send_message_impl, setup_app_state_with_factory, start_discovery_impl, stop_discovery_impl,
-    toggle_peer_verified_impl, transfer_payload_from_managed, transfer_payload_from_record,
-    update_avatar_impl, update_display_name_impl, update_settings_impl, AppSetupFactory, AppState,
+    cancel_folder_transfer_impl, cancel_transfer_impl, check_call_support_impl, create_group_impl,
+    current_webview_backend, delete_message_impl, edit_message_impl, fetch_og_metadata_impl,
+    fetch_og_metadata_with_cache_policy, get_group_info_impl, get_identity_impl,
+    get_messages_impl,
+    get_own_fingerprint_impl, get_peer_fingerprint_impl, get_peers_impl, get_reply_count_impl,
+    get_reply_counts_impl, get_settings_impl, get_transfers_impl, get_webrtc_platform_info_impl,
+    leave_group_impl, list_groups_impl, reject_file_impl, reject_folder_transfer_impl,
+    remove_group_members_impl, resume_transfer_impl, retry_transfer_impl, send_call_answer_impl,
+    send_call_hangup_impl, send_call_join_impl, send_call_leave_impl, send_call_offer_impl,
+    send_call_reject_impl, send_file_impl, send_folder_impl, send_group_message_impl,
+    send_ice_candidate_impl, send_message_impl, setup_app_state_with_factory, start_discovery_impl,
+    stop_discovery_impl, toggle_peer_verified_impl, transfer_payload_from_managed,
+    transfer_payload_from_record, update_avatar_impl, update_display_name_impl,
+    update_settings_impl, AppSetupFactory, AppState, CallBridgeState, CallSupportInfo,
     ChatMessagePayload, DiscoveryServiceHandle, FrontendEmitter, GroupInfoResponse,
-    GroupMemberInfo, IdentityServiceHandle, MessagingServiceHandle, OwnFingerprintInfo,
-    PeerFingerprintInfo, PeerPayload, SettingsServiceHandle, SetupContext, StoredGroupInfo,
-    TransferPayload, TransferServiceHandle,
+    GroupMemberInfo, IdentityServiceHandle, MessagingServiceHandle, OgMetadataServiceHandle,
+    OwnFingerprintInfo, PeerFingerprintInfo, PeerPayload, SettingsServiceHandle, SetupContext,
+    StoredGroupInfo, TransferPayload, TransferServiceHandle, WebRTCPlatformInfo,
 };
 
 fn device_id(seed: u128) -> DeviceId {
@@ -125,6 +131,20 @@ fn stored_group(
     }
 }
 
+fn og_metadata(url: &str, title: Option<&str>, description: Option<&str>) -> OgMetadata {
+    OgMetadata {
+        url: url.to_string(),
+        title: title.map(str::to_string),
+        description: description.map(str::to_string),
+        image_url: None,
+        site_name: Some("Example".to_string()),
+    }
+}
+
+fn cached_og_metadata(metadata: OgMetadata, fetched_at_ms: i64, ttl_seconds: i64) -> CachedOgMetadata {
+    CachedOgMetadata::new(metadata, fetched_at_ms, ttl_seconds)
+}
+
 #[derive(Default)]
 struct MockDiscoveryService {
     peers: Mutex<Vec<PeerInfo>>,
@@ -168,6 +188,13 @@ impl DiscoveryServiceHandle for MockDiscoveryService {
 #[derive(Default)]
 struct MockMessagingService {
     sent_messages: Mutex<Vec<(String, String)>>,
+    call_joins: Mutex<Vec<(String, String)>>,
+    call_leaves: Mutex<Vec<String>>,
+    call_offers: Mutex<Vec<(String, String, String, CallType)>>,
+    call_answers: Mutex<Vec<(String, String, String)>>,
+    ice_candidates: Mutex<Vec<(String, String, String, Option<String>, Option<u16>)>>,
+    call_hangups: Mutex<Vec<(String, String)>>,
+    call_rejects: Mutex<Vec<(String, String, Option<String>)>>,
     group_creations: Mutex<Vec<(String, Vec<String>)>>,
     group_additions: Mutex<Vec<(String, Vec<String>)>>,
     group_removals: Mutex<Vec<(String, Vec<String>)>>,
@@ -176,6 +203,7 @@ struct MockMessagingService {
     edit_calls: Mutex<Vec<(String, String, String)>>,
     delete_calls: Mutex<Vec<(String, String)>>,
     messages: Mutex<Vec<Message>>,
+    reply_counts: Mutex<HashMap<String, i64>>,
     groups: Mutex<HashMap<String, StoredGroupInfo>>,
     send_error: Mutex<Option<String>>,
 }
@@ -196,6 +224,11 @@ impl MockMessagingService {
             .into_iter()
             .map(|group| (group.id.clone(), group))
             .collect();
+        self
+    }
+
+    fn with_reply_counts(self, reply_counts: HashMap<String, i64>) -> Self {
+        *self.reply_counts.lock().expect("lock reply counts") = reply_counts;
         self
     }
 
@@ -231,6 +264,95 @@ impl MessagingServiceHandle for MockMessagingService {
         Ok(message(11, 2, 1, content, MessageStatus::Sent))
     }
 
+    async fn send_call_offer(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        sdp: &str,
+        call_type: CallType,
+    ) -> Result<(), String> {
+        self.call_offers.lock().expect("lock call offers").push((
+            peer_id.to_string(),
+            call_id.to_string(),
+            sdp.to_string(),
+            call_type,
+        ));
+        Ok(())
+    }
+
+    async fn send_call_join(&self, group_id: &str, call_id: &str) -> Result<(), String> {
+        self.call_joins
+            .lock()
+            .expect("lock call joins")
+            .push((group_id.to_string(), call_id.to_string()));
+        Ok(())
+    }
+
+    async fn send_call_leave(&self, call_id: &str) -> Result<(), String> {
+        self.call_leaves
+            .lock()
+            .expect("lock call leaves")
+            .push(call_id.to_string());
+        Ok(())
+    }
+
+    async fn send_call_answer(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        sdp: &str,
+    ) -> Result<(), String> {
+        self.call_answers.lock().expect("lock call answers").push((
+            peer_id.to_string(),
+            call_id.to_string(),
+            sdp.to_string(),
+        ));
+        Ok(())
+    }
+
+    async fn send_ice_candidate(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u16>,
+    ) -> Result<(), String> {
+        self.ice_candidates
+            .lock()
+            .expect("lock ice candidates")
+            .push((
+                peer_id.to_string(),
+                call_id.to_string(),
+                candidate.to_string(),
+                sdp_mid.map(str::to_string),
+                sdp_mline_index,
+            ));
+        Ok(())
+    }
+
+    async fn send_call_hangup(&self, peer_id: &str, call_id: &str) -> Result<(), String> {
+        self.call_hangups
+            .lock()
+            .expect("lock call hangups")
+            .push((peer_id.to_string(), call_id.to_string()));
+        Ok(())
+    }
+
+    async fn send_call_reject(
+        &self,
+        peer_id: &str,
+        call_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        self.call_rejects.lock().expect("lock call rejects").push((
+            peer_id.to_string(),
+            call_id.to_string(),
+            reason.map(str::to_string),
+        ));
+        Ok(())
+    }
+
     async fn get_messages(
         &self,
         _chat_id: &str,
@@ -238,6 +360,31 @@ impl MessagingServiceHandle for MockMessagingService {
         _offset: u32,
     ) -> Result<Vec<Message>, String> {
         Ok(self.messages.lock().expect("lock messages").clone())
+    }
+
+    async fn get_reply_count(&self, message_id: &str) -> Result<i64, String> {
+        Ok(*self
+            .reply_counts
+            .lock()
+            .expect("lock reply counts")
+            .get(message_id)
+            .unwrap_or(&0))
+    }
+
+    async fn get_reply_counts(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, i64>, String> {
+        let reply_counts = self.reply_counts.lock().expect("lock reply counts");
+
+        Ok(message_ids
+            .iter()
+            .cloned()
+            .map(|message_id| {
+                let count = reply_counts.get(&message_id).copied().unwrap_or(0);
+                (message_id, count)
+            })
+            .collect())
     }
 
     async fn create_group(
@@ -389,6 +536,74 @@ impl MessagingServiceHandle for MockMessagingService {
 
     async fn shutdown(&self) -> Result<(), String> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MockOgMetadataService {
+    cache_reads: Mutex<Vec<String>>,
+    remote_requests: Mutex<Vec<String>>,
+    saved_entries: Mutex<Vec<(OgMetadata, u64)>>,
+    cached_entries: Mutex<HashMap<String, CachedOgMetadata>>,
+    remote_response: Mutex<Option<Result<OgMetadata, String>>>,
+}
+
+impl MockOgMetadataService {
+    fn with_cached_entry(self, entry: CachedOgMetadata) -> Self {
+        self.cached_entries
+            .lock()
+            .expect("lock cached og entries")
+            .insert(entry.metadata().url.clone(), entry);
+        self
+    }
+
+    fn with_remote_response(self, response: Result<OgMetadata, String>) -> Self {
+        *self.remote_response.lock().expect("lock og response") = Some(response);
+        self
+    }
+}
+
+#[async_trait]
+impl OgMetadataServiceHandle for MockOgMetadataService {
+    async fn get_cached_og_metadata(&self, url: &str) -> Result<Option<CachedOgMetadata>, String> {
+        self.cache_reads
+            .lock()
+            .expect("lock cached og urls")
+            .push(url.to_string());
+
+        Ok(self
+            .cached_entries
+            .lock()
+            .expect("lock cached og entries")
+            .get(url)
+            .cloned())
+    }
+
+    async fn save_og_metadata(&self, metadata: &OgMetadata, ttl_seconds: u64) -> Result<(), String> {
+        self.saved_entries
+            .lock()
+            .expect("lock saved og entries")
+            .push((metadata.clone(), ttl_seconds));
+        self.cached_entries
+            .lock()
+            .expect("lock cached og entries")
+            .insert(
+                metadata.url.clone(),
+                CachedOgMetadata::new(metadata.clone(), 1_700_000_000_000, ttl_seconds as i64),
+            );
+        Ok(())
+    }
+
+    async fn fetch_remote_og_metadata(&self, url: &str) -> Result<OgMetadata, String> {
+        self.remote_requests
+            .lock()
+            .expect("lock requested og urls")
+            .push(url.to_string());
+
+        match self.remote_response.lock().expect("lock og response").clone() {
+            Some(result) => result,
+            None => Ok(OgMetadata::empty(url)),
+        }
     }
 }
 
@@ -636,6 +851,7 @@ impl FrontendEmitter for MockEmitter {
 fn app_state(
     discovery: Arc<dyn DiscoveryServiceHandle>,
     messaging: Arc<dyn MessagingServiceHandle>,
+    og_metadata: Arc<dyn OgMetadataServiceHandle>,
     transfers: Arc<dyn TransferServiceHandle>,
     identity_service: Arc<dyn IdentityServiceHandle>,
     settings_service: Arc<dyn SettingsServiceHandle>,
@@ -644,6 +860,7 @@ fn app_state(
         identity().device_id,
         discovery,
         messaging,
+        og_metadata,
         transfers,
         identity_service,
         settings_service,
@@ -653,12 +870,34 @@ fn app_state(
 mod commands {
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingEmitter {
+        fn snapshot(&self) -> Vec<(String, serde_json::Value)> {
+            self.events.lock().expect("lock og updated events").clone()
+        }
+    }
+
+    impl FrontendEmitter for RecordingEmitter {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("lock og updated events")
+                .push((event.to_string(), payload));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn start_discovery_dispatches_to_discovery_service() {
         let discovery = Arc::new(MockDiscoveryService::default());
         let state = app_state(
             discovery.clone(),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -677,6 +916,7 @@ mod commands {
         let state = app_state(
             discovery.clone(),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -694,6 +934,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default().with_peers(vec![peer(2, "Alice")])),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -712,12 +953,396 @@ mod commands {
         );
     }
 
+    #[test]
+    fn get_webrtc_platform_info_reports_platform_and_backend() {
+        assert_eq!(
+            get_webrtc_platform_info_impl(),
+            WebRTCPlatformInfo {
+                platform: std::env::consts::OS.to_string(),
+                webview: current_webview_backend().to_string(),
+                webview_version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn check_call_support_reports_expected_platform_support() {
+        let support = check_call_support_impl();
+
+        assert_eq!(support.platform, std::env::consts::OS.to_string());
+
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                support,
+                CallSupportInfo {
+                    supported: false,
+                    platform: std::env::consts::OS.to_string(),
+                    reason: Some("Linux calling support is not enabled yet".to_string()),
+                }
+            );
+            return;
+        }
+
+        assert_eq!(
+            support,
+            CallSupportInfo {
+                supported: true,
+                platform: std::env::consts::OS.to_string(),
+                reason: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_og_metadata_dispatches_to_service_on_cache_miss() {
+        let url = "https://example.org/post".to_string();
+        let expected = og_metadata(&url, Some("Example title"), Some("Example description"));
+        let og_metadata = Arc::new(
+            MockOgMetadataService::default().with_remote_response(Ok(expected.clone())),
+        );
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(MockMessagingService::default()),
+            og_metadata.clone(),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let metadata = fetch_og_metadata_impl(&state, Arc::new(MockEmitter), url.clone())
+            .await
+            .expect("fetch og metadata command");
+
+        assert_eq!(metadata, expected);
+        assert_eq!(
+            og_metadata
+                .cache_reads
+                .lock()
+                .expect("lock cached og urls")
+                .clone(),
+            vec![url]
+        );
+        assert_eq!(
+            og_metadata
+                .remote_requests
+                .lock()
+                .expect("lock requested og urls")
+                .clone(),
+            vec!["https://example.org/post".to_string()]
+        );
+        assert_eq!(
+            og_metadata
+                .saved_entries
+                .lock()
+                .expect("lock saved og entries")
+                .clone(),
+            vec![(expected, 86_400)]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_og_metadata_uses_cached_row_when_fresh() {
+        let url = "https://example.org/cached-preview";
+        let metadata = og_metadata(url, Some("Cached title"), Some("Cached description"));
+        let fresh_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_millis() as i64)
+            - 1_000;
+        let service = Arc::new(
+            MockOgMetadataService::default().with_cached_entry(cached_og_metadata(
+                metadata.clone(),
+                fresh_at,
+                86_400,
+            )),
+        );
+
+        let loaded = fetch_og_metadata_with_cache_policy(
+            service.clone(),
+            Arc::new(MockEmitter),
+            url.to_string(),
+        )
+        .await
+        .expect("load cached og metadata");
+
+        assert_eq!(loaded, metadata);
+        assert!(
+            service
+                .remote_requests
+                .lock()
+                .expect("lock requested og urls")
+                .is_empty()
+        );
+        assert!(
+            service
+                .saved_entries
+                .lock()
+                .expect("lock saved og entries")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_og_metadata_returns_stale_cache_and_refreshes_in_background() {
+        let url = "https://example.org/stale-preview".to_string();
+        let stale_metadata = og_metadata(&url, Some("Stale title"), Some("Stale description"));
+        let refreshed_metadata = og_metadata(&url, Some("Fresh title"), Some("Fresh description"));
+        let stale_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_millis() as i64)
+            - 86_401_000;
+        let service = Arc::new(
+            MockOgMetadataService::default()
+                .with_cached_entry(cached_og_metadata(stale_metadata.clone(), stale_at, 86_400))
+                .with_remote_response(Ok(refreshed_metadata.clone())),
+        );
+        let emitter = Arc::new(RecordingEmitter::default());
+
+        let returned = fetch_og_metadata_with_cache_policy(
+            service.clone(),
+            emitter.clone(),
+            url.clone(),
+        )
+        .await
+        .expect("return stale og metadata immediately");
+
+        assert_eq!(returned, stale_metadata);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !service
+                    .saved_entries
+                    .lock()
+                    .expect("lock saved og entries")
+                    .is_empty()
+                    && !emitter.snapshot().is_empty()
+                {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background stale refresh should complete");
+
+        assert_eq!(
+            service
+                .remote_requests
+                .lock()
+                .expect("lock requested og urls")
+                .clone(),
+            vec![url.clone()]
+        );
+        assert_eq!(
+            service
+                .saved_entries
+                .lock()
+                .expect("lock saved og entries")
+                .clone(),
+            vec![(refreshed_metadata.clone(), 86_400)]
+        );
+        assert_eq!(
+            emitter.snapshot(),
+            vec![(
+                "og:updated".to_string(),
+                serde_json::json!({
+                    "url": url,
+                    "metadata": refreshed_metadata,
+                })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_og_metadata_returns_empty_metadata_for_invalid_url_without_touching_service() {
+        let service = Arc::new(MockOgMetadataService::default());
+
+        let metadata = fetch_og_metadata_with_cache_policy(
+            service.clone(),
+            Arc::new(MockEmitter),
+            "not a url".to_string(),
+        )
+        .await
+        .expect("invalid url should degrade to empty metadata");
+
+        assert_eq!(metadata, OgMetadata::empty("not a url"));
+        assert!(
+            service
+                .cache_reads
+                .lock()
+                .expect("lock cached og urls")
+                .is_empty()
+        );
+        assert!(
+            service
+                .remote_requests
+                .lock()
+                .expect("lock requested og urls")
+                .is_empty()
+        );
+        assert!(
+            service
+                .saved_entries
+                .lock()
+                .expect("lock saved og entries")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fetch_og_command_is_registered_in_generate_handler() {
+        let lib_rs = include_str!("../lib.rs");
+
+        assert!(
+            lib_rs.contains("commands::fetch_og_metadata"),
+            "expected `commands::fetch_og_metadata` to be registered in generate_handler!"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_signaling_commands_dispatch_arguments_to_messaging_service() {
+        let messaging = Arc::new(MockMessagingService::default());
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+        let peer_id = Uuid::from_u128(2).to_string();
+        let call_id = Uuid::from_u128(70).to_string();
+        let group_id = Uuid::from_u128(77).to_string();
+
+        send_call_join_impl(&state, group_id.clone(), call_id.clone())
+            .await
+            .expect("send call join command");
+
+        send_call_offer_impl(
+            &state,
+            peer_id.clone(),
+            call_id.clone(),
+            "offer-sdp".to_string(),
+            CallType::Video,
+        )
+        .await
+        .expect("send call offer command");
+        send_call_answer_impl(
+            &state,
+            peer_id.clone(),
+            call_id.clone(),
+            "answer-sdp".to_string(),
+        )
+        .await
+        .expect("send call answer command");
+        send_ice_candidate_impl(
+            &state,
+            peer_id.clone(),
+            call_id.clone(),
+            "candidate:1 1 udp 1 127.0.0.1 9000 typ host".to_string(),
+            Some("audio".to_string()),
+            Some(0),
+        )
+        .await
+        .expect("send ice candidate command");
+        send_call_hangup_impl(&state, peer_id.clone(), call_id.clone())
+            .await
+            .expect("send call hangup command");
+        send_call_reject_impl(
+            &state,
+            peer_id.clone(),
+            Uuid::from_u128(71).to_string(),
+            Some("busy".to_string()),
+        )
+        .await
+        .expect("send call reject command");
+        send_call_leave_impl(&state, call_id.clone())
+            .await
+            .expect("send call leave command");
+
+        assert_eq!(
+            messaging
+                .call_joins
+                .lock()
+                .expect("lock call joins")
+                .clone(),
+            vec![(group_id, call_id.clone())]
+        );
+
+        assert_eq!(
+            messaging
+                .call_offers
+                .lock()
+                .expect("lock call offers")
+                .clone(),
+            vec![(
+                peer_id.clone(),
+                call_id.clone(),
+                "offer-sdp".to_string(),
+                CallType::Video,
+            )]
+        );
+        assert_eq!(
+            messaging
+                .call_answers
+                .lock()
+                .expect("lock call answers")
+                .clone(),
+            vec![(peer_id.clone(), call_id.clone(), "answer-sdp".to_string())]
+        );
+        assert_eq!(
+            messaging
+                .ice_candidates
+                .lock()
+                .expect("lock ice candidates")
+                .clone(),
+            vec![(
+                peer_id.clone(),
+                call_id.clone(),
+                "candidate:1 1 udp 1 127.0.0.1 9000 typ host".to_string(),
+                Some("audio".to_string()),
+                Some(0),
+            )]
+        );
+        assert_eq!(
+            messaging
+                .call_hangups
+                .lock()
+                .expect("lock call hangups")
+                .clone(),
+            vec![(peer_id.clone(), call_id.clone())]
+        );
+        assert_eq!(
+            messaging
+                .call_rejects
+                .lock()
+                .expect("lock call rejects")
+                .clone(),
+            vec![(
+                peer_id,
+                Uuid::from_u128(71).to_string(),
+                Some("busy".to_string()),
+            )]
+        );
+        assert_eq!(
+            messaging
+                .call_leaves
+                .lock()
+                .expect("lock call leaves")
+                .clone(),
+            vec![call_id]
+        );
+    }
+
     #[tokio::test]
     async fn send_message_returns_message_id_and_passes_arguments() {
         let messaging = Arc::new(MockMessagingService::default());
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -781,6 +1406,7 @@ mod commands {
                     reply_to_preview: None,
                 },
             ])),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -828,11 +1454,52 @@ mod commands {
     }
 
     #[tokio::test]
+    async fn get_reply_count_commands_return_single_and_batch_totals() {
+        let first_message_id = Uuid::from_u128(31).to_string();
+        let second_message_id = Uuid::from_u128(32).to_string();
+        let missing_message_id = Uuid::from_u128(33).to_string();
+        let state = app_state(
+            Arc::new(MockDiscoveryService::default()),
+            Arc::new(
+                MockMessagingService::default().with_reply_counts(HashMap::from([
+                    (first_message_id.clone(), 3),
+                    (second_message_id.clone(), 1),
+                ])),
+            ),
+            Arc::new(MockOgMetadataService::default()),
+            Arc::new(MockTransferService::default()),
+            Arc::new(MockIdentityService::default()),
+            Arc::new(MockSettingsService::default()),
+        );
+
+        let first_reply_count = get_reply_count_impl(&state, first_message_id.clone())
+            .await
+            .expect("get single reply count command");
+        assert_eq!(first_reply_count, 3);
+
+        let reply_counts = get_reply_counts_impl(
+            &state,
+            vec![
+                first_message_id.clone(),
+                second_message_id.clone(),
+                missing_message_id.clone(),
+            ],
+        )
+        .await
+        .expect("get reply counts command");
+
+        assert_eq!(reply_counts.get(&first_message_id), Some(&3));
+        assert_eq!(reply_counts.get(&second_message_id), Some(&1));
+        assert_eq!(reply_counts.get(&missing_message_id), Some(&0));
+    }
+
+    #[tokio::test]
     async fn create_group_returns_rich_group_info_response() {
         let messaging = Arc::new(MockMessagingService::default());
         let state = app_state(
             Arc::new(MockDiscoveryService::default().with_peers(vec![peer(2, "Alice")])),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -901,6 +1568,7 @@ mod commands {
                 MockDiscoveryService::default().with_peers(vec![peer(2, "Alice"), peer(3, "Bob")]),
             ),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -985,12 +1653,36 @@ mod commands {
     fn group_commands_are_registered_in_generate_handler() {
         let lib_rs = include_str!("../lib.rs");
         for command in [
+            "commands::get_reply_count",
+            "commands::get_reply_counts",
             "commands::create_group",
             "commands::add_group_members",
             "commands::remove_group_members",
             "commands::get_group_info",
             "commands::list_groups",
             "commands::leave_group",
+            "commands::fetch_og_metadata",
+            "commands::get_webrtc_platform_info",
+            "commands::check_call_support",
+        ] {
+            assert!(
+                lib_rs.contains(command),
+                "expected `{command}` to be registered in generate_handler!"
+            );
+        }
+    }
+
+    #[test]
+    fn call_signaling_commands_are_registered_in_generate_handler() {
+        let lib_rs = include_str!("../lib.rs");
+        for command in [
+            "commands::send_call_join",
+            "commands::send_call_leave",
+            "commands::send_call_offer",
+            "commands::send_call_answer",
+            "commands::send_ice_candidate",
+            "commands::send_call_hangup",
+            "commands::send_call_reject",
         ] {
             assert!(
                 lib_rs.contains(command),
@@ -1005,6 +1697,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1036,6 +1729,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1065,6 +1759,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             messaging.clone(),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1090,6 +1785,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1123,6 +1819,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1153,6 +1850,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1178,6 +1876,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1203,6 +1902,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1228,6 +1928,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1253,6 +1954,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1278,6 +1980,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1303,6 +2006,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1329,6 +2033,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             transfers.clone(),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1354,6 +2059,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(
                 MockTransferService::default()
                     .with_transfers(vec![transfer("transfer-1", "active")]),
@@ -1470,6 +2176,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1487,6 +2194,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             identities.clone(),
             Arc::new(MockSettingsService::default()),
@@ -1511,6 +2219,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             identities.clone(),
             Arc::new(MockSettingsService::default()),
@@ -1534,6 +2243,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1563,6 +2273,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             identities,
             Arc::new(MockSettingsService::default()),
@@ -1593,6 +2304,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             identities,
             Arc::new(MockSettingsService::default()),
@@ -1618,6 +2330,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1635,6 +2348,7 @@ mod commands {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             settings_service.clone(),
@@ -1668,6 +2382,7 @@ mod commands_error {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default().with_send_error("peer offline")),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1690,6 +2405,7 @@ mod commands_error {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default().with_reject_error("unknown offer")),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1707,6 +2423,7 @@ mod commands_error {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default().with_update_error("transfer manager failed")),
@@ -1724,6 +2441,7 @@ mod commands_error {
         let state = app_state(
             Arc::new(MockDiscoveryService::default().with_start_error("mdns unavailable")),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1745,6 +2463,7 @@ mod group_error_handling {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1762,6 +2481,7 @@ mod group_error_handling {
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
+            Arc::new(MockOgMetadataService::default()),
             Arc::new(MockTransferService::default()),
             Arc::new(MockIdentityService::default()),
             Arc::new(MockSettingsService::default()),
@@ -1817,6 +2537,7 @@ mod setup_init {
             Ok(app_state(
                 discovery,
                 Arc::new(MockMessagingService::default()),
+                Arc::new(MockOgMetadataService::default()),
                 Arc::new(MockTransferService::default()),
                 Arc::new(MockIdentityService::default()),
                 Arc::new(MockSettingsService::default()),
@@ -2074,6 +2795,252 @@ mod chat_bridge {
                     "group-updated".to_string(),
                     json!({
                         "groupId": chat_id(77).0.to_string()
+                    })
+                ),
+            ]
+        );
+    }
+}
+
+mod call_bridge {
+    use super::*;
+    use crate::commands::bridge_call_signaling_message;
+    use jasmine_core::ProtocolMessage;
+    use serde_json::json;
+
+    struct RecordingEmitter {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingEmitter {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<(String, serde_json::Value)> {
+            self.events.lock().expect("lock emitted events").clone()
+        }
+    }
+
+    impl FrontendEmitter for RecordingEmitter {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("lock emitted events")
+                .push((event.to_string(), payload));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn call_signaling_bridge_emits_events_and_ignores_unknown_call_ids() {
+        let emitter = RecordingEmitter::new();
+        let call_bridge = CallBridgeState::default();
+        let peer_id = Uuid::from_u128(2).to_string();
+        let active_call_id = Uuid::from_u128(70).to_string();
+        let group_call_id = Uuid::from_u128(72).to_string();
+        let group_id = Uuid::from_u128(77).to_string();
+        let rejected_call_id = Uuid::from_u128(71).to_string();
+
+        assert!(!bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallAnswer {
+                call_id: Uuid::from_u128(99).to_string(),
+                sdp: "unexpected-answer".to_string(),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("drop unknown call answer"));
+
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallOffer {
+                call_id: active_call_id.clone(),
+                sdp: "offer-sdp".to_string(),
+                caller_id: peer_id.clone(),
+                call_type: CallType::Audio,
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call offer"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallAnswer {
+                call_id: active_call_id.clone(),
+                sdp: "answer-sdp".to_string(),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call answer"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::IceCandidate {
+                call_id: active_call_id.clone(),
+                candidate: "candidate:1 1 udp 1 127.0.0.1 9000 typ host".to_string(),
+                sdp_mid: Some("audio".to_string()),
+                sdp_mline_index: Some(0),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge ice candidate"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallHangup {
+                call_id: active_call_id.clone(),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call hangup"));
+
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallOffer {
+                call_id: group_call_id.clone(),
+                sdp: "offer-group".to_string(),
+                caller_id: peer_id.clone(),
+                call_type: CallType::Video,
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge group call offer"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallJoin {
+                call_id: group_call_id.clone(),
+                group_id: group_id.clone(),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call join"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallLeave {
+                call_id: group_call_id.clone(),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call leave"));
+
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallOffer {
+                call_id: rejected_call_id.clone(),
+                sdp: "offer-reject".to_string(),
+                caller_id: peer_id.clone(),
+                call_type: CallType::Video,
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge second call offer"));
+        assert!(bridge_call_signaling_message(
+            &peer_id,
+            ProtocolMessage::CallReject {
+                call_id: rejected_call_id.clone(),
+                reason: Some("busy".to_string()),
+            },
+            &emitter,
+            &call_bridge,
+        )
+        .expect("bridge call reject"));
+
+        assert!(!call_bridge.is_known_call(&active_call_id));
+        assert!(call_bridge.is_known_call(&group_call_id));
+        assert!(call_bridge.is_group_call(&group_call_id));
+        assert_eq!(
+            call_bridge.group_id_for_call(&group_call_id),
+            Some(group_id.clone())
+        );
+        assert!(!call_bridge.is_known_call(&rejected_call_id));
+        assert_eq!(
+            emitter.snapshot(),
+            vec![
+                (
+                    "call-offer".to_string(),
+                    json!({
+                        "peerId": peer_id.clone(),
+                        "callId": active_call_id.clone(),
+                        "sdp": "offer-sdp",
+                        "callerId": Uuid::from_u128(2).to_string(),
+                        "callType": "Audio",
+                    })
+                ),
+                (
+                    "call-answer".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(70).to_string(),
+                        "sdp": "answer-sdp",
+                    })
+                ),
+                (
+                    "ice-candidate".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(70).to_string(),
+                        "candidate": "candidate:1 1 udp 1 127.0.0.1 9000 typ host",
+                        "sdpMid": "audio",
+                        "sdpMlineIndex": 0,
+                    })
+                ),
+                (
+                    "call-hangup".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(70).to_string(),
+                    })
+                ),
+                (
+                    "call-offer".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(72).to_string(),
+                        "sdp": "offer-group",
+                        "callerId": Uuid::from_u128(2).to_string(),
+                        "callType": "Video",
+                    })
+                ),
+                (
+                    "call-join".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(72).to_string(),
+                        "groupId": Uuid::from_u128(77).to_string(),
+                    })
+                ),
+                (
+                    "call-leave".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(72).to_string(),
+                    })
+                ),
+                (
+                    "call-offer".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(71).to_string(),
+                        "sdp": "offer-reject",
+                        "callerId": Uuid::from_u128(2).to_string(),
+                        "callType": "Video",
+                    })
+                ),
+                (
+                    "call-reject".to_string(),
+                    json!({
+                        "peerId": Uuid::from_u128(2).to_string(),
+                        "callId": Uuid::from_u128(71).to_string(),
+                        "reason": "busy",
                     })
                 ),
             ]
