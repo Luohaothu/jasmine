@@ -5,6 +5,7 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { invoke } from '@tauri-apps/api/core';
 import { usePeerStore } from '../../stores/peerStore';
 import { DeviceList } from './DeviceList';
+import '../../i18n/i18n';
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tauri-apps/api/core')>();
@@ -63,7 +64,7 @@ describe('DeviceList', () => {
 
   it('renders empty state with spinner when no peers', () => {
     renderDeviceList();
-    expect(screen.getByText(/正在搜索局域网设备/i)).toBeInTheDocument();
+    expect(screen.getByText(/Searching local network devices/i)).toBeInTheDocument();
   });
 
   it('renders list of peers with avatars and online/offline status indicators', () => {

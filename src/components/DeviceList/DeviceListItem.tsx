@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Link } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import styles from './DeviceListItem.module.css';
 import { Peer } from '../../types/peer';
 
@@ -21,6 +22,7 @@ function formatFingerprint(fingerprint: string): string {
 }
 
 export const DeviceListItem = ({ peer }: Props) => {
+  const { t } = useTranslation();
   const initial = peer.name ? peer.name.charAt(0).toUpperCase() : '?';
   const [fingerprintInfo, setFingerprintInfo] = useState<PeerFingerprintInfo | null>(null);
 
@@ -60,9 +62,7 @@ export const DeviceListItem = ({ peer }: Props) => {
           <span className={styles.name}>{peer.name}</span>
           <div className={styles.status}>
             <span className={`${styles.dot} ${styles[peer.status]}`} />
-            <span className={styles.statusText}>
-              {peer.status === 'incompatible' ? 'incompatible' : peer.status}
-            </span>
+            <span className={styles.statusText}>{t(`devices.status.${peer.status}`)}</span>
           </div>
           {peer.warning && <div className={styles.warningText}>{peer.warning}</div>}
           {formattedFingerprint && (
@@ -73,7 +73,9 @@ export const DeviceListItem = ({ peer }: Props) => {
               <span
                 className={`${styles.verifiedBadge} ${fingerprintInfo?.verified ? styles.verified : styles.unverified}`}
               >
-                {fingerprintInfo?.verified ? 'Verified' : 'Unverified'}
+                {fingerprintInfo?.verified
+                  ? t('devices.verification.verified')
+                  : t('devices.verification.unverified')}
               </span>
             </div>
           )}
@@ -85,9 +87,15 @@ export const DeviceListItem = ({ peer }: Props) => {
           className={styles.verifyToggle}
           data-testid="verify-toggle"
           onClick={toggleVerified}
-          aria-label={fingerprintInfo.verified ? `Unverify ${peer.name}` : `Verify ${peer.name}`}
+          aria-label={
+            fingerprintInfo.verified
+              ? t('devices.verification.unverifyPeer', { name: peer.name })
+              : t('devices.verification.verifyPeer', { name: peer.name })
+          }
         >
-          {fingerprintInfo.verified ? 'Unverify' : 'Verify'}
+          {fingerprintInfo.verified
+            ? t('devices.verification.unverify')
+            : t('devices.verification.verify')}
         </button>
       )}
     </div>
