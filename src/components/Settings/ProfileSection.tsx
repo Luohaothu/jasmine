@@ -1,8 +1,9 @@
-import React from "react";
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
-import styles from "./Settings.module.css";
+import React from 'react';
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+import { useTranslation } from 'react-i18next';
+import styles from './Settings.module.css';
 
 interface Identity {
   device_id: string;
@@ -11,56 +12,77 @@ interface Identity {
 }
 
 export default function ProfileSection() {
+  const { t } = useTranslation();
   const [identity, setIdentity] = useState<Identity | null>(null);
-  const [savedName, setSavedName] = useState<string>("");
+  const [savedName, setSavedName] = useState<string>('');
 
   useEffect(() => {
-    invoke<Identity | null>("get_identity").then((res) => {
-      if (res) {
-        setIdentity(res);
-        setSavedName(res.display_name);
-      }
-    }).catch((error) => { void error; });
+    invoke<Identity | null>('get_identity')
+      .then((res) => {
+        if (res) {
+          setIdentity(res);
+          setSavedName(res.display_name);
+        }
+      })
+      .catch((error) => {
+        void error;
+      });
   }, []);
 
   const handleNameBlur = (e: React.FocusEvent<HTMLInputElement>) => {
     const name = e.target.value;
     if (name !== savedName) {
-      invoke("update_display_name", { name }).catch((error) => { void error; });
+      invoke('update_display_name', { name }).catch((error) => {
+        void error;
+      });
       setSavedName(name);
     }
   };
 
   const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setIdentity(prev => prev ? { ...prev, display_name: e.target.value } : null);
+    setIdentity((prev) => (prev ? { ...prev, display_name: e.target.value } : null));
   };
 
   const handleChangeAvatar = () => {
     open({
-      filters: [{ name: "Images", extensions: ["jpg", "png", "gif"] }]
-    }).then(selected => {
-      if (typeof selected === "string") {
-        invoke("update_avatar", { path: selected }).then(() => {
-          setIdentity(prev => prev ? { ...prev, avatar_path: selected } : null);
-        }).catch((error) => { void error; });
-      }
-    }).catch((error) => { void error; });
+      filters: [
+        { name: t('settings.profile.avatarFilterName'), extensions: ['jpg', 'png', 'gif'] },
+      ],
+    })
+      .then((selected) => {
+        if (typeof selected === 'string') {
+          invoke('update_avatar', { path: selected })
+            .then(() => {
+              setIdentity((prev) => (prev ? { ...prev, avatar_path: selected } : null));
+            })
+            .catch((error) => {
+              void error;
+            });
+        }
+      })
+      .catch((error) => {
+        void error;
+      });
   };
 
   const copyDeviceId = () => {
     if (identity?.device_id) {
-      navigator.clipboard.writeText(identity.device_id).catch((error) => { void error; });
+      navigator.clipboard.writeText(identity.device_id).catch((error) => {
+        void error;
+      });
     }
   };
 
-  if (!identity) return <div className={styles.section}>Loading profile...</div>;
+  if (!identity) return <div className={styles.section}>{t('settings.profile.loading')}</div>;
 
   return (
     <section className={styles.section}>
-      <h2 className={styles.sectionTitle}>Profile Information</h2>
-      
+      <h2 className={styles.sectionTitle}>{t('settings.profile.title')}</h2>
+
       <div className={styles.fieldGroup}>
-        <label className={styles.label} htmlFor="device_id">Device ID</label>
+        <label className={styles.label} htmlFor="device_id">
+          {t('settings.profile.deviceIdLabel')}
+        </label>
         <div className={styles.row}>
           <input
             id="device_id"
@@ -68,22 +90,24 @@ export default function ProfileSection() {
             type="text"
             value={identity.device_id}
             readOnly
-            title="Device ID"
+            title={t('settings.profile.deviceIdLabel')}
           />
-          <button 
-            className={styles.iconButton} 
-            onClick={copyDeviceId} 
-            aria-label="Copy Device ID"
-            title="Copy"
+          <button
+            className={styles.iconButton}
+            onClick={copyDeviceId}
+            aria-label={t('settings.profile.copyDeviceIdAriaLabel')}
+            title={t('settings.actions.copy')}
             type="button"
           >
-            Copy
+            {t('settings.actions.copy')}
           </button>
         </div>
       </div>
 
       <div className={styles.fieldGroup}>
-        <label className={styles.label} htmlFor="display_name">Display Name</label>
+        <label className={styles.label} htmlFor="display_name">
+          {t('settings.profile.displayNameLabel')}
+        </label>
         <input
           id="display_name"
           className={styles.input}
@@ -95,12 +119,21 @@ export default function ProfileSection() {
       </div>
 
       <div className={styles.fieldGroup}>
-        <label className={styles.label}>Avatar</label>
+        <label className={styles.label} htmlFor="change-avatar">
+          {t('settings.profile.avatarLabel')}
+        </label>
         <div className={styles.row}>
-          <button className={styles.button} onClick={handleChangeAvatar} type="button">
-            Change Avatar
+          <button
+            id="change-avatar"
+            className={styles.button}
+            onClick={handleChangeAvatar}
+            type="button"
+          >
+            {t('settings.actions.changeAvatar')}
           </button>
-          <span className={styles.aboutText}>{identity.avatar_path || "No avatar set"}</span>
+          <span className={styles.aboutText}>
+            {identity.avatar_path || t('settings.profile.noAvatar')}
+          </span>
         </div>
       </div>
     </section>

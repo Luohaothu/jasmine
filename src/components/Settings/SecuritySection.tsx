@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useTranslation } from 'react-i18next';
 import styles from './Settings.module.css';
 
 interface OwnFingerprintInfo {
@@ -13,6 +14,7 @@ function formatFingerprint(fingerprint: string): string {
 }
 
 export default function SecuritySection() {
+  const { t } = useTranslation();
   const [fingerprintInfo, setFingerprintInfo] = useState<OwnFingerprintInfo | null>(null);
 
   useEffect(() => {
@@ -25,8 +27,10 @@ export default function SecuritySection() {
 
   const formattedFingerprint = useMemo(
     () =>
-      fingerprintInfo ? formatFingerprint(fingerprintInfo.fingerprint) : 'Loading fingerprint...',
-    [fingerprintInfo]
+      fingerprintInfo
+        ? formatFingerprint(fingerprintInfo.fingerprint)
+        : t('settings.security.loadingFingerprint'),
+    [fingerprintInfo, t]
   );
 
   const copyFingerprint = () => {
@@ -41,11 +45,11 @@ export default function SecuritySection() {
 
   return (
     <section className={styles.section} data-testid="security-section">
-      <h2 className={styles.sectionTitle}>Security</h2>
+      <h2 className={styles.sectionTitle}>{t('settings.security.title')}</h2>
 
       <div className={styles.fieldGroup}>
         <label className={styles.label} htmlFor="own-fingerprint">
-          Local Fingerprint
+          {t('settings.security.localFingerprintLabel')}
         </label>
         <div className={styles.row}>
           <div
@@ -60,17 +64,15 @@ export default function SecuritySection() {
             className={styles.iconButton}
             onClick={copyFingerprint}
             data-testid="copy-fingerprint"
-            aria-label="Copy fingerprint"
+            aria-label={t('settings.security.copyFingerprintAriaLabel')}
             disabled={!fingerprintInfo}
           >
-            Copy
+            {t('settings.actions.copy')}
           </button>
         </div>
       </div>
 
-      <p className={styles.securityHint}>
-        Compare this fingerprint with trusted peers to verify your secure identity.
-      </p>
+      <p className={styles.securityHint}>{t('settings.security.hint')}</p>
     </section>
   );
 }
