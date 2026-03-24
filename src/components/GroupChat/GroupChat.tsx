@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import styles from './GroupChat.module.css';
 import { MemberPanel } from './MemberPanel';
 import { Peer } from '../../types/peer';
@@ -44,6 +45,7 @@ export const GroupChat: React.FC<GroupChatProps> = ({
 }) => {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const setReplyingTo = useChatStore((state) => state.setReplyingTo);
+  const { t } = useTranslation();
 
   return (
     <div className={styles.container}>
@@ -51,20 +53,22 @@ export const GroupChat: React.FC<GroupChatProps> = ({
         <div className={styles.header}>
           <div className={styles.headerInfo}>
             <h2 className={styles.title}>{groupName}</h2>
-            <p className={styles.subtitle}>{members.length} members</p>
+            <p className={styles.subtitle}>
+              {t('groups.chat.memberCount', { count: members.length })}
+            </p>
           </div>
           <button
             type="button"
             className={`${styles.manageBtn} ${isPanelOpen ? styles.activeManageBtn : ''}`}
             onClick={() => setIsPanelOpen(!isPanelOpen)}
           >
-            管理 / Manage
+            {t('groups.chat.manage')}
           </button>
         </div>
 
         <div className={styles.messageList}>
           {messages.length === 0 ? (
-            <div className={styles.emptyState}>No messages yet. Start the conversation!</div>
+            <div className={styles.emptyState}>{t('groups.chat.empty')}</div>
           ) : (
             messages.map((msg) => (
               <div

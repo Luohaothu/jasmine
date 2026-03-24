@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { CreateGroupModal } from './CreateGroupModal';
 import { invoke } from '@tauri-apps/api/core';
+import '../../i18n/i18n';
 
 // Mock Tauri invoke
 vi.mock('@tauri-apps/api/core', () => ({

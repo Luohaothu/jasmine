@@ -1,9 +1,11 @@
 import React, { useEffect } from 'react';
 import { useParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { GroupChat } from './GroupChat';
 import { useGroupStore } from '../../stores/groupStore';
 
 export const GroupChatWrapper: React.FC = () => {
+  const { t } = useTranslation();
   const { groupId } = useParams<{ groupId: string }>();
   const groups = useGroupStore((state) => state.groups);
   const fetchGroupInfo = useGroupStore((state) => state.fetchGroupInfo);
@@ -22,12 +24,12 @@ export const GroupChatWrapper: React.FC = () => {
     });
   }, [fetchGroupInfo, groupId]);
 
-  if (!groupId) return <div className="placeholder-view">Invalid Group ID</div>;
+  if (!groupId) return <div className="placeholder-view">{t('groups.chat.invalidGroupId')}</div>;
 
   const group = groups[groupId];
 
   if (!group) {
-    return <div className="placeholder-view">Group not found</div>;
+    return <div className="placeholder-view">{t('groups.chat.notFound')}</div>;
   }
 
   const handleSendMessage = async (content: string, replyToId?: string) => {

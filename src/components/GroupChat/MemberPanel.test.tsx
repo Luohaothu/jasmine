@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { MemberPanel } from './MemberPanel';
 import { Peer } from '../../types/peer';
+import '../../i18n/i18n';
 
 const mockMembers: Peer[] = [
   { id: 'p1', name: 'Alice', status: 'online' },
