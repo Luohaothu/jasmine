@@ -54,7 +54,7 @@ where
         Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
     };
 
-    ensure_remote_protocol_version_compatible(
+    let negotiated_protocol_version = ensure_remote_protocol_version_compatible(
         socket,
         local_peer.protocol_version,
         identity.protocol_version,
@@ -71,7 +71,7 @@ where
         socket,
         &ProtocolMessage::KeyExchangeInit {
             ephemeral_public_key: public_key_to_base64(&our_ephemeral_public),
-            protocol_version: CURRENT_PROTOCOL_VERSION,
+            protocol_version: negotiated_protocol_version,
         },
     )
     .await?;
@@ -119,7 +119,7 @@ where
         Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
     };
 
-    ensure_remote_protocol_version_compatible(
+    let negotiated_protocol_version = ensure_remote_protocol_version_compatible(
         socket,
         local_peer.protocol_version,
         identity.protocol_version,
@@ -130,10 +130,14 @@ where
         return fail_handshake(socket, &error.to_string(), error).await;
     }
 
-    send_protocol_message(socket, &local_peer.to_protocol_message()).await?;
+    send_protocol_message(
+        socket,
+        &peer_info_with_protocol_version(local_peer, negotiated_protocol_version),
+    )
+    .await?;
 
     let message = read_handshake_message(socket, handshake_timeout, "KeyExchangeInit").await?;
-    let peer_ephemeral_key = match parse_key_exchange_init(message, local_peer.protocol_version) {
+    let peer_ephemeral_key = match parse_key_exchange_init(message, negotiated_protocol_version) {
         Ok(value) => value,
         Err(error) => return fail_handshake(socket, &error.to_string(), error).await,
     };
@@ -419,36 +423,80 @@ async fn ensure_remote_protocol_version_compatible<S>(
     socket: &mut WebSocketStream<S>,
     local_protocol_version: u32,
     remote_protocol_version: u32,
-) -> Result<()>
+) -> Result<u32>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    match negotiated_protocol_version(local_protocol_version, remote_protocol_version) {
+        Ok(version) => Ok(version),
+        Err(MessagingError::ProtocolVersionIncompatible {
+            local_version,
+            remote_version,
+            message,
+        }) => {
+            reject_protocol_version_incompatible(socket, local_version, remote_version, message)
+                .await
+        }
+        Err(error) => fail_handshake(socket, &error.to_string(), error).await,
+    }
+}
+
+fn negotiated_protocol_version(
+    local_protocol_version: u32,
+    remote_protocol_version: u32,
+) -> Result<u32> {
     if remote_protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION {
-        return reject_protocol_version_incompatible(
-            socket,
-            local_protocol_version,
-            remote_protocol_version,
-        )
-        .await;
+        return Err(MessagingError::ProtocolVersionIncompatible {
+            local_version: local_protocol_version,
+            remote_version: remote_protocol_version,
+            message: format!(
+                "peer protocol version {remote_protocol_version} is incompatible; minimum supported version is {MIN_SUPPORTED_PROTOCOL_VERSION}"
+            ),
+        });
     }
 
-    if let Err(error) = validate_protocol_version(remote_protocol_version, local_protocol_version) {
-        return fail_handshake(socket, &error.to_string(), error).await;
+    if remote_protocol_version > local_protocol_version {
+        return Err(MessagingError::ProtocolVersionIncompatible {
+            local_version: local_protocol_version,
+            remote_version: remote_protocol_version,
+            message: format!(
+                "peer protocol version {remote_protocol_version} is newer than local supported version {local_protocol_version}"
+            ),
+        });
     }
 
-    Ok(())
+    Ok(local_protocol_version.min(remote_protocol_version))
+}
+
+fn peer_info_with_protocol_version(
+    local_peer: &WsPeerIdentity,
+    protocol_version: u32,
+) -> ProtocolMessage {
+    ProtocolMessage::PeerInfo {
+        device_id: local_peer.device_id.clone(),
+        display_name: local_peer.display_name.clone(),
+        avatar_hash: local_peer.avatar_hash.clone(),
+        public_key: (!local_peer.public_key.trim().is_empty())
+            .then_some(local_peer.public_key.clone()),
+        protocol_version: Some(protocol_version),
+    }
 }
 
 fn parse_key_exchange_init(
     message: ProtocolMessage,
-    local_protocol_version: u32,
+    expected_protocol_version: u32,
 ) -> Result<PublicKey> {
     match message {
         ProtocolMessage::KeyExchangeInit {
             ephemeral_public_key,
             protocol_version,
         } => {
-            validate_protocol_version(protocol_version, local_protocol_version)?;
+            if protocol_version != expected_protocol_version {
+                return Err(MessagingError::Protocol(format!(
+                    "unexpected negotiated protocol version, expected {expected_protocol_version}, got {protocol_version}"
+                )));
+            }
+
             decode_public_key(
                 &ephemeral_public_key,
                 "key exchange init ephemeral_public_key",
@@ -460,49 +508,15 @@ fn parse_key_exchange_init(
     }
 }
 
-fn parse_key_exchange_response(message: ProtocolMessage) -> Result<PublicKey> {
-    match message {
-        ProtocolMessage::KeyExchangeResponse {
-            ephemeral_public_key,
-        } => decode_public_key(
-            &ephemeral_public_key,
-            "key exchange response ephemeral_public_key",
-        ),
-        other => Err(MessagingError::Protocol(format!(
-            "expected KeyExchangeResponse, got {other:?}"
-        ))),
-    }
-}
-
-fn validate_protocol_version(protocol_version: u32, local_protocol_version: u32) -> Result<()> {
-    if protocol_version != CURRENT_PROTOCOL_VERSION {
-        return Err(MessagingError::Protocol(format!(
-            "unsupported protocol version, expected {}, got {}",
-            CURRENT_PROTOCOL_VERSION, protocol_version
-        )));
-    }
-
-    if protocol_version != local_protocol_version {
-        return Err(MessagingError::Protocol(format!(
-            "protocol version mismatch, expected {}, got {}",
-            local_protocol_version, protocol_version
-        )));
-    }
-
-    Ok(())
-}
-
 async fn reject_protocol_version_incompatible<S, T>(
     socket: &mut WebSocketStream<S>,
     local_version: u32,
     remote_version: u32,
+    message: String,
 ) -> Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let message = format!(
-        "peer protocol version {remote_version} is incompatible; minimum supported version is {MIN_SUPPORTED_PROTOCOL_VERSION}"
-    );
     let _ = send_protocol_message(
         socket,
         &ProtocolMessage::VersionIncompatible {
@@ -523,6 +537,20 @@ where
         remote_version,
         message,
     })
+}
+
+fn parse_key_exchange_response(message: ProtocolMessage) -> Result<PublicKey> {
+    match message {
+        ProtocolMessage::KeyExchangeResponse {
+            ephemeral_public_key,
+        } => decode_public_key(
+            &ephemeral_public_key,
+            "key exchange response ephemeral_public_key",
+        ),
+        other => Err(MessagingError::Protocol(format!(
+            "expected KeyExchangeResponse, got {other:?}"
+        ))),
+    }
 }
 
 fn decode_public_key(encoded: &str, label: &str) -> Result<PublicKey> {
@@ -776,7 +804,7 @@ fn transport_error_to_disconnect_reason(error: TungsteniteError) -> WsDisconnect
 
 #[cfg(test)]
 mod tests {
-    use super::error_to_disconnect_reason;
+    use super::{error_to_disconnect_reason, negotiated_protocol_version};
     use crate::{MessagingError, WsDisconnectReason};
 
     #[test]
@@ -789,5 +817,25 @@ mod tests {
         });
 
         assert_eq!(reason, WsDisconnectReason::ProtocolVersionIncompatible);
+    }
+
+    #[test]
+    fn negotiated_protocol_version_accepts_v2_and_v3_peers() {
+        assert_eq!(negotiated_protocol_version(3, 3).expect("negotiate v3"), 3);
+        assert_eq!(negotiated_protocol_version(3, 2).expect("negotiate v2"), 2);
+    }
+
+    #[test]
+    fn negotiated_protocol_version_rejects_newer_remote_peer() {
+        let error = negotiated_protocol_version(3, 4).expect_err("reject newer remote version");
+
+        assert!(matches!(
+            error,
+            MessagingError::ProtocolVersionIncompatible {
+                local_version: 3,
+                remote_version: 4,
+                ..
+            }
+        ));
     }
 }
