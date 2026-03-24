@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+
 use jasmine_core::protocol::{
-    AckStatus, FolderFileEntry, FolderManifestData, ProtocolMessage, MAX_PROTOCOL_MESSAGE_BYTES,
+    AckStatus, CallType, FolderFileEntry, FolderManifestData, ProtocolMessage,
+    MAX_PROTOCOL_MESSAGE_BYTES,
 };
+use jasmine_core::CURRENT_PROTOCOL_VERSION;
 
 fn protocol_roundtrip(message: ProtocolMessage) {
     let json = serde_json::to_string(&message).expect("serialize protocol message to json");
@@ -16,6 +20,13 @@ fn make_repeating_string(length: usize) -> String {
     "a".repeat(length)
 }
 
+fn sample_vector_clock() -> HashMap<String, u64> {
+    HashMap::from([
+        ("device-a".to_string(), 5_u64),
+        ("device-b".to_string(), 3_u64),
+    ])
+}
+
 #[test]
 fn protocol_roundtrip_text_message() {
     protocol_roundtrip(ProtocolMessage::TextMessage {
@@ -26,6 +37,7 @@ fn protocol_roundtrip_text_message() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     });
 }
 
@@ -50,6 +62,21 @@ fn protocol_roundtrip_text_message_with_reply_fields() {
         timestamp: 1_700_000_000_001,
         reply_to_id: Some("msg-parent-001".to_string()),
         reply_to_preview: Some("Parent preview text".to_string()),
+        vector_clock: None,
+    });
+}
+
+#[test]
+fn protocol_roundtrip_text_message_with_vector_clock() {
+    protocol_roundtrip(ProtocolMessage::TextMessage {
+        id: "msg-vector-clock".to_string(),
+        chat_id: "chat-vector-clock".to_string(),
+        sender_id: "user-vector-clock".to_string(),
+        content: "Clocked message".to_string(),
+        timestamp: 1_700_000_000_111,
+        reply_to_id: None,
+        reply_to_preview: None,
+        vector_clock: Some(sample_vector_clock()),
     });
 }
 
@@ -151,7 +178,7 @@ fn protocol_roundtrip_file_reject() {
 fn protocol_roundtrip_key_exchange_init() {
     protocol_roundtrip(ProtocolMessage::KeyExchangeInit {
         ephemeral_public_key: "ephemeral-init-key".to_string(),
-        protocol_version: 2,
+        protocol_version: CURRENT_PROTOCOL_VERSION,
     });
 }
 
@@ -240,7 +267,7 @@ fn protocol_peer_info_serializes_with_optional_fields() {
         display_name: "secure-device".to_string(),
         avatar_hash: Some("avatar-002".to_string()),
         public_key: Some("base64-25519-key".to_string()),
-        protocol_version: Some(2),
+        protocol_version: Some(CURRENT_PROTOCOL_VERSION),
     };
 
     let json = serde_json::to_string(&message).expect("serialize peer info with optional fields");
@@ -251,7 +278,53 @@ fn protocol_peer_info_serializes_with_optional_fields() {
     assert_eq!(parsed["display_name"], "secure-device");
     assert_eq!(parsed["avatar_hash"], "avatar-002");
     assert_eq!(parsed["public_key"], "base64-25519-key");
-    assert_eq!(parsed["protocol_version"], 2);
+    assert_eq!(parsed["protocol_version"], CURRENT_PROTOCOL_VERSION);
+}
+
+#[test]
+fn call_offer_roundtrip_includes_all_signaling_variants() {
+    protocol_roundtrip(ProtocolMessage::CallOffer {
+        call_id: "call-audio".to_string(),
+        sdp: "offer-audio".to_string(),
+        caller_id: "caller-audio".to_string(),
+        call_type: CallType::Audio,
+    });
+    protocol_roundtrip(ProtocolMessage::CallOffer {
+        call_id: "call-video".to_string(),
+        sdp: "offer-video".to_string(),
+        caller_id: "caller-video".to_string(),
+        call_type: CallType::Video,
+    });
+    protocol_roundtrip(ProtocolMessage::CallOffer {
+        call_id: "call-screen".to_string(),
+        sdp: "offer-screen".to_string(),
+        caller_id: "caller-screen".to_string(),
+        call_type: CallType::Screen,
+    });
+    protocol_roundtrip(ProtocolMessage::CallAnswer {
+        call_id: "call-answer".to_string(),
+        sdp: "answer-sdp".to_string(),
+    });
+    protocol_roundtrip(ProtocolMessage::IceCandidate {
+        call_id: "call-ice".to_string(),
+        candidate: "candidate:1 1 udp 2122260223 192.168.1.5 54400 typ host".to_string(),
+        sdp_mid: Some("0".to_string()),
+        sdp_mline_index: Some(0),
+    });
+    protocol_roundtrip(ProtocolMessage::CallHangup {
+        call_id: "call-hangup".to_string(),
+    });
+    protocol_roundtrip(ProtocolMessage::CallReject {
+        call_id: "call-reject".to_string(),
+        reason: Some("busy".to_string()),
+    });
+    protocol_roundtrip(ProtocolMessage::CallJoin {
+        call_id: "call-join".to_string(),
+        group_id: "group-001".to_string(),
+    });
+    protocol_roundtrip(ProtocolMessage::CallLeave {
+        call_id: "call-leave".to_string(),
+    });
 }
 
 #[test]
@@ -307,6 +380,7 @@ fn protocol_max_size_rejects_oversized_text_messages() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
 
     let json = serde_json::to_string(&message).expect("serialize message for test");
@@ -323,6 +397,7 @@ fn protocol_max_size_accepts_within_limit() {
         timestamp: 1_700_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
 
     let json = serde_json::to_string(&message).expect("serialize message for limit test");
@@ -357,12 +432,13 @@ fn protocol_unknown_fields_are_ignored_on_deserialize() {
             timestamp: 1700000000000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         }
     );
 }
 
 #[test]
-fn protocol_backward_compatible_text_message_without_reply_fields() {
+fn text_message_backward_compat_without_reply_or_vector_clock_fields() {
     let raw_json = r#"
         {
             "type": "TextMessage",
@@ -387,6 +463,7 @@ fn protocol_backward_compatible_text_message_without_reply_fields() {
             timestamp: 1700000000000,
             reply_to_id: None,
             reply_to_preview: None,
+            vector_clock: None,
         }
     );
 }
@@ -401,6 +478,7 @@ fn protocol_timestamp_is_unix_epoch_milliseconds() {
         timestamp: 1_760_000_000_000,
         reply_to_id: None,
         reply_to_preview: None,
+        vector_clock: None,
     };
 
     let payload = serde_json::to_value(&message).expect("convert to json value");
