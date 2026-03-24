@@ -188,6 +188,8 @@ impl DiscoveryServiceHandle for MockDiscoveryService {
     }
 }
 
+type MockIceCandidateRecord = (String, String, String, Option<String>, Option<u16>);
+
 #[derive(Default)]
 struct MockMessagingService {
     sent_messages: Mutex<Vec<(String, String)>>,
@@ -195,7 +197,7 @@ struct MockMessagingService {
     call_leaves: Mutex<Vec<String>>,
     call_offers: Mutex<Vec<(String, String, String, CallType)>>,
     call_answers: Mutex<Vec<(String, String, String)>>,
-    ice_candidates: Mutex<Vec<(String, String, String, Option<String>, Option<u16>)>>,
+    ice_candidates: Mutex<Vec<MockIceCandidateRecord>>,
     call_hangups: Mutex<Vec<(String, String)>>,
     call_rejects: Mutex<Vec<(String, String, Option<String>)>>,
     group_creations: Mutex<Vec<(String, Vec<String>)>>,
