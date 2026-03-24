@@ -1,20 +1,25 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { ChatView } from "../ChatView";
-import { useChatStore } from "../../../stores/chatStore";
-import { usePeerStore } from "../../../stores/peerStore";
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import '../../../i18n/i18n';
+import { ChatView } from '../ChatView';
+import { useChatStore } from '../../../stores/chatStore';
+import { usePeerStore } from '../../../stores/peerStore';
 
-vi.mock("@tauri-apps/api/event", () => ({
+vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn().mockResolvedValue({}),
 }));
 
 window.HTMLElement.prototype.scrollIntoView = vi.fn();
 
-describe("ChatView", () => {
+describe('ChatView', () => {
   beforeEach(() => {
     useChatStore.setState({ messages: {} });
-    usePeerStore.setState({ peers: [{ id: "peer-1", name: "Alice", status: "online" }] });
+    usePeerStore.setState({ peers: [{ id: 'peer-1', name: 'Alice', status: 'online' }] });
   });
 
   const renderWithRouter = (peerId: string) => {
@@ -27,15 +32,15 @@ describe("ChatView", () => {
     );
   };
 
-  it("renders empty state when no messages", () => {
-    renderWithRouter("peer-1");
-    expect(screen.getByText("Alice")).toBeInTheDocument();
-    expect(screen.getByText("发送第一条消息开始聊天")).toBeInTheDocument();
+  it('renders empty state when no messages', () => {
+    renderWithRouter('peer-1');
+    expect(screen.getByText('Alice')).toBeInTheDocument();
+    expect(screen.getByText('Send the first message to start chatting')).toBeInTheDocument();
   });
 
-  it("renders peer as offline if not found in store", () => {
-    renderWithRouter("unknown-peer");
-    expect(screen.getByText("Unknown")).toBeInTheDocument();
-    expect(screen.getByText("offline")).toBeInTheDocument();
+  it('renders peer as offline if not found in store', () => {
+    renderWithRouter('unknown-peer');
+    expect(screen.getByText('Unknown')).toBeInTheDocument();
+    expect(screen.getByText('offline')).toBeInTheDocument();
   });
 });

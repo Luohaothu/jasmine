@@ -1,18 +1,23 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import { render, act } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { ChatView } from "../ChatView";
-import { useChatStore } from "../../../stores/chatStore";
-import { usePeerStore } from "../../../stores/peerStore";
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { render, act } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import '../../../i18n/i18n';
+import { ChatView } from '../ChatView';
+import { useChatStore } from '../../../stores/chatStore';
+import { usePeerStore } from '../../../stores/peerStore';
 
-vi.mock("@tauri-apps/api/event", () => ({
+vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-describe("ChatView.scroll", () => {
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn().mockResolvedValue({}),
+}));
+
+describe('ChatView.scroll', () => {
   beforeEach(() => {
     useChatStore.setState({ messages: {} });
-    usePeerStore.setState({ peers: [{ id: "peer-1", name: "Alice", status: "online" }] });
+    usePeerStore.setState({ peers: [{ id: 'peer-1', name: 'Alice', status: 'online' }] });
   });
 
   afterEach(() => {
@@ -29,20 +34,20 @@ describe("ChatView.scroll", () => {
     );
   };
 
-  it("auto-scrolls to the newest message when messages change", () => {
+  it('auto-scrolls to the newest message when messages change', () => {
     const mockScrollIntoView = vi.fn();
     window.HTMLElement.prototype.scrollIntoView = mockScrollIntoView;
 
-    renderWithRouter("peer-1");
+    renderWithRouter('peer-1');
 
     act(() => {
-      useChatStore.getState().addMessage("peer-1", {
-        id: "msg-1",
-        senderId: "local",
-        receiverId: "peer-1",
-        content: "New Message",
+      useChatStore.getState().addMessage('peer-1', {
+        id: 'msg-1',
+        senderId: 'local',
+        receiverId: 'peer-1',
+        content: 'New Message',
         timestamp: 1000,
-        status: "sent",
+        status: 'sent',
       });
     });
 
