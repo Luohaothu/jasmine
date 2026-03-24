@@ -190,6 +190,7 @@ where
             match expect_client_event(receiver).await {
                 WsClientEvent::MessageReceived { message } if matcher(&message) => return message,
                 WsClientEvent::MessageReceived { .. } => continue,
+                WsClientEvent::CallSignalingReceived { .. } => continue,
                 WsClientEvent::Disconnected { reason } => {
                     panic!("client disconnected while waiting for matching message: {reason:?}")
                 }

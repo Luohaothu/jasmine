@@ -23,10 +23,25 @@ pub enum WsServerEvent {
         peer: WsPeerConnection,
         message: ProtocolMessage,
     },
+    CallSignalingReceived {
+        peer: WsPeerConnection,
+        message: ProtocolMessage,
+    },
     PeerDisconnected {
         peer: WsPeerConnection,
         reason: WsDisconnectReason,
     },
+}
+
+fn is_call_signaling_message(message: &ProtocolMessage) -> bool {
+    matches!(
+        message,
+        ProtocolMessage::CallOffer { .. }
+            | ProtocolMessage::CallAnswer { .. }
+            | ProtocolMessage::IceCandidate { .. }
+            | ProtocolMessage::CallHangup { .. }
+            | ProtocolMessage::CallReject { .. }
+    )
 }
 
 struct ServerPeerHandle {
@@ -286,10 +301,17 @@ async fn handle_connection(
         command_rx,
         shutdown_rx,
         move |message| {
+            let signaling_message = is_call_signaling_message(&message).then(|| message.clone());
             let _ = events.send(WsServerEvent::MessageReceived {
                 peer: peer_for_messages.clone(),
                 message,
             });
+            if let Some(message) = signaling_message {
+                let _ = events.send(WsServerEvent::CallSignalingReceived {
+                    peer: peer_for_messages.clone(),
+                    message,
+                });
+            }
         },
     )
     .await;
