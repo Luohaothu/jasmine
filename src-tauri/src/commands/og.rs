@@ -56,7 +56,9 @@ pub(crate) async fn fetch_og_metadata_with_cache_policy(
     }
 
     let metadata = service.fetch_remote_og_metadata(&url).await?;
-    service.save_og_metadata(&metadata, OG_CACHE_TTL_SECONDS).await?;
+    service
+        .save_og_metadata(&metadata, OG_CACHE_TTL_SECONDS)
+        .await?;
     Ok(metadata)
 }
 
@@ -78,7 +80,9 @@ async fn refresh_stale_og_metadata(
     url: String,
 ) -> Result<(), String> {
     let metadata = service.fetch_remote_og_metadata(&url).await?;
-    service.save_og_metadata(&metadata, OG_CACHE_TTL_SECONDS).await?;
+    service
+        .save_og_metadata(&metadata, OG_CACHE_TTL_SECONDS)
+        .await?;
     emit_og_updated(emitter.as_ref(), &url, metadata)
 }
 

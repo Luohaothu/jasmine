@@ -90,7 +90,10 @@ pub async fn fetch_og_metadata(url: &str) -> Result<OgMetadata> {
     ))
 }
 
-async fn read_response_body(mut response: reqwest::Response, url: &str) -> reqwest::Result<Vec<u8>> {
+async fn read_response_body(
+    mut response: reqwest::Response,
+    url: &str,
+) -> reqwest::Result<Vec<u8>> {
     let mut body = Vec::new();
     let mut truncated = false;
 
@@ -112,7 +115,11 @@ async fn read_response_body(mut response: reqwest::Response, url: &str) -> reqwe
     }
 
     if truncated {
-        warn!(url = url, max_bytes = OG_MAX_BODY_BYTES, "OG metadata body truncated");
+        warn!(
+            url = url,
+            max_bytes = OG_MAX_BODY_BYTES,
+            "OG metadata body truncated"
+        );
     }
 
     Ok(body)

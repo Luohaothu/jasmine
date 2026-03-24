@@ -1548,7 +1548,11 @@ impl OgMetadataServiceHandle for RealOgMetadataService {
             .map_err(|error| error.to_string())
     }
 
-    async fn save_og_metadata(&self, metadata: &OgMetadata, ttl_seconds: u64) -> Result<(), String> {
+    async fn save_og_metadata(
+        &self,
+        metadata: &OgMetadata,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
         self.storage
             .save_og_metadata(metadata, ttl_seconds)
             .await

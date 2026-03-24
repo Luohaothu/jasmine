@@ -18,8 +18,7 @@ use super::{
     accept_file_impl, accept_folder_transfer_impl, add_group_members_impl,
     cancel_folder_transfer_impl, cancel_transfer_impl, check_call_support_impl, create_group_impl,
     current_webview_backend, delete_message_impl, edit_message_impl, fetch_og_metadata_impl,
-    fetch_og_metadata_with_cache_policy, get_group_info_impl, get_identity_impl,
-    get_messages_impl,
+    fetch_og_metadata_with_cache_policy, get_group_info_impl, get_identity_impl, get_messages_impl,
     get_own_fingerprint_impl, get_peer_fingerprint_impl, get_peers_impl, get_reply_count_impl,
     get_reply_counts_impl, get_settings_impl, get_transfers_impl, get_webrtc_platform_info_impl,
     leave_group_impl, list_groups_impl, reject_file_impl, reject_folder_transfer_impl,
@@ -141,7 +140,11 @@ fn og_metadata(url: &str, title: Option<&str>, description: Option<&str>) -> OgM
     }
 }
 
-fn cached_og_metadata(metadata: OgMetadata, fetched_at_ms: i64, ttl_seconds: i64) -> CachedOgMetadata {
+fn cached_og_metadata(
+    metadata: OgMetadata,
+    fetched_at_ms: i64,
+    ttl_seconds: i64,
+) -> CachedOgMetadata {
     CachedOgMetadata::new(metadata, fetched_at_ms, ttl_seconds)
 }
 
@@ -579,7 +582,11 @@ impl OgMetadataServiceHandle for MockOgMetadataService {
             .cloned())
     }
 
-    async fn save_og_metadata(&self, metadata: &OgMetadata, ttl_seconds: u64) -> Result<(), String> {
+    async fn save_og_metadata(
+        &self,
+        metadata: &OgMetadata,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
         self.saved_entries
             .lock()
             .expect("lock saved og entries")
@@ -600,7 +607,12 @@ impl OgMetadataServiceHandle for MockOgMetadataService {
             .expect("lock requested og urls")
             .push(url.to_string());
 
-        match self.remote_response.lock().expect("lock og response").clone() {
+        match self
+            .remote_response
+            .lock()
+            .expect("lock og response")
+            .clone()
+        {
             Some(result) => result,
             None => Ok(OgMetadata::empty(url)),
         }
@@ -997,9 +1009,8 @@ mod commands {
     async fn fetch_og_metadata_dispatches_to_service_on_cache_miss() {
         let url = "https://example.org/post".to_string();
         let expected = og_metadata(&url, Some("Example title"), Some("Example description"));
-        let og_metadata = Arc::new(
-            MockOgMetadataService::default().with_remote_response(Ok(expected.clone())),
-        );
+        let og_metadata =
+            Arc::new(MockOgMetadataService::default().with_remote_response(Ok(expected.clone())));
         let state = app_state(
             Arc::new(MockDiscoveryService::default()),
             Arc::new(MockMessagingService::default()),
@@ -1066,20 +1077,16 @@ mod commands {
         .expect("load cached og metadata");
 
         assert_eq!(loaded, metadata);
-        assert!(
-            service
-                .remote_requests
-                .lock()
-                .expect("lock requested og urls")
-                .is_empty()
-        );
-        assert!(
-            service
-                .saved_entries
-                .lock()
-                .expect("lock saved og entries")
-                .is_empty()
-        );
+        assert!(service
+            .remote_requests
+            .lock()
+            .expect("lock requested og urls")
+            .is_empty());
+        assert!(service
+            .saved_entries
+            .lock()
+            .expect("lock saved og entries")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1099,13 +1106,10 @@ mod commands {
         );
         let emitter = Arc::new(RecordingEmitter::default());
 
-        let returned = fetch_og_metadata_with_cache_policy(
-            service.clone(),
-            emitter.clone(),
-            url.clone(),
-        )
-        .await
-        .expect("return stale og metadata immediately");
+        let returned =
+            fetch_og_metadata_with_cache_policy(service.clone(), emitter.clone(), url.clone())
+                .await
+                .expect("return stale og metadata immediately");
 
         assert_eq!(returned, stale_metadata);
 
@@ -1168,27 +1172,21 @@ mod commands {
         .expect("invalid url should degrade to empty metadata");
 
         assert_eq!(metadata, OgMetadata::empty("not a url"));
-        assert!(
-            service
-                .cache_reads
-                .lock()
-                .expect("lock cached og urls")
-                .is_empty()
-        );
-        assert!(
-            service
-                .remote_requests
-                .lock()
-                .expect("lock requested og urls")
-                .is_empty()
-        );
-        assert!(
-            service
-                .saved_entries
-                .lock()
-                .expect("lock saved og entries")
-                .is_empty()
-        );
+        assert!(service
+            .cache_reads
+            .lock()
+            .expect("lock cached og urls")
+            .is_empty());
+        assert!(service
+            .remote_requests
+            .lock()
+            .expect("lock requested og urls")
+            .is_empty());
+        assert!(service
+            .saved_entries
+            .lock()
+            .expect("lock saved og entries")
+            .is_empty());
     }
 
     #[test]
