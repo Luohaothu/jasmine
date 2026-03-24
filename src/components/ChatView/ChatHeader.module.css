@@ -65,3 +65,27 @@
 .statusIndicator.offline {
   background-color: #ef4444;
 }
+
+.actions {
+  display: flex;
+  margin-left: auto;
+  gap: 8px;
+}
+
+.actionButton {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 8px;
+  color: var(--text-secondary);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.actionButton:hover {
+  background-color: var(--bg-secondary);
+  color: var(--primary-color, #3b82f6);
+}
