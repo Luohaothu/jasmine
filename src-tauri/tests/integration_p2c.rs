@@ -33,14 +33,12 @@ async fn test_call_signaling_relay_roundtrip() {
         let offer_cursor = bob.emitter.mark();
         tokio::time::timeout(
             ACTION_TIMEOUT,
-            alice
-                .state
-                .send_call_offer(
-                    bob_id.clone(),
-                    call_id.clone(),
-                    offer_sdp.clone(),
-                    CallType::Audio,
-                ),
+            alice.state.send_call_offer(
+                bob_id.clone(),
+                call_id.clone(),
+                offer_sdp.clone(),
+                CallType::Audio,
+            ),
         )
         .await
         .expect("send call offer timed out")
@@ -161,9 +159,14 @@ async fn test_call_signaling_after_reconnect() {
 
         let first_offer_payload = bob
             .emitter
-            .wait_for_event(first_offer_cursor, EVENT_CALL_OFFER, ACTION_TIMEOUT, |_| true)
+            .wait_for_event(first_offer_cursor, EVENT_CALL_OFFER, ACTION_TIMEOUT, |_| {
+                true
+            })
             .await;
-        assert_eq!(first_offer_payload["peerId"].as_str(), Some(alice_id.as_str()));
+        assert_eq!(
+            first_offer_payload["peerId"].as_str(),
+            Some(alice_id.as_str())
+        );
         assert_eq!(
             first_offer_payload["callId"].as_str(),
             Some(first_call_id.as_str())
@@ -186,9 +189,17 @@ async fn test_call_signaling_after_reconnect() {
 
         let first_hangup_payload = bob
             .emitter
-            .wait_for_event(first_hangup_cursor, EVENT_CALL_HANGUP, ACTION_TIMEOUT, |_| true)
+            .wait_for_event(
+                first_hangup_cursor,
+                EVENT_CALL_HANGUP,
+                ACTION_TIMEOUT,
+                |_| true,
+            )
             .await;
-        assert_eq!(first_hangup_payload["peerId"].as_str(), Some(alice_id.as_str()));
+        assert_eq!(
+            first_hangup_payload["peerId"].as_str(),
+            Some(alice_id.as_str())
+        );
         assert_eq!(
             first_hangup_payload["callId"].as_str(),
             Some(first_call_id.as_str())
@@ -222,9 +233,17 @@ async fn test_call_signaling_after_reconnect() {
 
         let second_offer_payload = bob2
             .emitter
-            .wait_for_event(second_offer_cursor, EVENT_CALL_OFFER, ACTION_TIMEOUT, |_| true)
+            .wait_for_event(
+                second_offer_cursor,
+                EVENT_CALL_OFFER,
+                ACTION_TIMEOUT,
+                |_| true,
+            )
             .await;
-        assert_eq!(second_offer_payload["peerId"].as_str(), Some(alice_id.as_str()));
+        assert_eq!(
+            second_offer_payload["peerId"].as_str(),
+            Some(alice_id.as_str())
+        );
         assert_eq!(
             second_offer_payload["callId"].as_str(),
             Some(second_call_id.as_str())
@@ -269,11 +288,9 @@ async fn test_concurrent_messaging_and_file_transfer() {
         let offer_cursor = bob.emitter.mark();
 
         let (msg_result, file_result) = tokio::join!(
-            alice.state.send_message(
-                bob_id.clone(),
-                "Hello while transferring".to_string(),
-                None,
-            ),
+            alice
+                .state
+                .send_message(bob_id.clone(), "Hello while transferring".to_string(), None,),
             alice
                 .state
                 .send_file(bob_id.clone(), source_path.to_string_lossy().into_owned()),

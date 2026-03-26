@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use common::*;
 use jasmine_app::commands::TransferPayload;
-use jasmine_core::{parse_mentions, Message, ProtocolMessage, StorageEngine, TransferStatus, CURRENT_PROTOCOL_VERSION};
+use jasmine_core::{
+    parse_mentions, Message, ProtocolMessage, StorageEngine, TransferStatus,
+    CURRENT_PROTOCOL_VERSION,
+};
 use jasmine_storage::SqliteStorage;
 use serde_json::Value;
 use uuid::Uuid;
@@ -76,7 +79,6 @@ async fn wait_for_transfer_thumbnail_payload(
     })
     .await
 }
-
 
 fn write_relative_file(root: &Path, relative_path: &str, bytes: &[u8]) {
     let path = join_relative_path(root, relative_path);

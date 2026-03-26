@@ -82,7 +82,10 @@ async fn test_encrypted_direct_message_roundtrip() {
             .wait_for_event(cursor, EVENT_MESSAGE_RECEIVED, ACTION_TIMEOUT, |_| true)
             .await;
 
-        assert_eq!(payload["content"].as_str().unwrap(), "Hello encrypted world!");
+        assert_eq!(
+            payload["content"].as_str().unwrap(),
+            "Hello encrypted world!"
+        );
 
         let messages = bob
             .state
@@ -119,15 +122,22 @@ async fn test_wire_level_encryption_verification() {
         let raw_peer_id = Uuid::new_v4().to_string();
         let (raw_private_key, raw_public_key) = generate_identity_keypair();
         let raw_identity = WsPeerIdentity::new(raw_peer_id.clone(), "Wire Probe Bob")
-            .with_transport_identity(public_key_to_base64(&raw_public_key), CURRENT_PROTOCOL_VERSION);
+            .with_transport_identity(
+                public_key_to_base64(&raw_public_key),
+                CURRENT_PROTOCOL_VERSION,
+            );
 
         let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{ws_port}"))
             .await
             .expect("connect raw websocket client");
 
         let RawClientHandshakeOutcome { mut session, .. } =
-            complete_raw_client_key_exchange_with_session(&mut socket, &raw_identity, &raw_private_key)
-                .await;
+            complete_raw_client_key_exchange_with_session(
+                &mut socket,
+                &raw_identity,
+                &raw_private_key,
+            )
+            .await;
 
         let secret = "secret message for wire test";
         wait_for(ACTION_TIMEOUT, || {
@@ -144,7 +154,8 @@ async fn test_wire_level_encryption_verification() {
 
         let mut verified = false;
         for _ in 0..16 {
-            let raw_frame = expect_binary_frame_payload(&mut socket, "encrypted outbound frame").await;
+            let raw_frame =
+                expect_binary_frame_payload(&mut socket, "encrypted outbound frame").await;
             let decrypted_message = decrypt_transport_frame(&mut session, &raw_frame);
             if let ProtocolMessage::TextMessage { content, .. } = decrypted_message {
                 assert!(
@@ -204,18 +215,8 @@ async fn test_encrypted_group_message_sender_keys() {
             .expect("create group");
         let group_id = group.id.clone();
         let _ = tokio::join!(
-            wait_for_group_snapshot(
-                &bob,
-                group_id.clone(),
-                "Crypto Group".to_string(),
-                3,
-            ),
-            wait_for_group_snapshot(
-                &charlie,
-                group_id.clone(),
-                "Crypto Group".to_string(),
-                3,
-            ),
+            wait_for_group_snapshot(&bob, group_id.clone(), "Crypto Group".to_string(), 3,),
+            wait_for_group_snapshot(&charlie, group_id.clone(), "Crypto Group".to_string(), 3,),
         );
 
         let bob_cursor = bob.emitter.mark();
@@ -226,11 +227,7 @@ async fn test_encrypted_group_message_sender_keys() {
             async move {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    state.send_group_message(
-                        group_id,
-                        "Secret group message".to_string(),
-                        None,
-                    ),
+                    state.send_group_message(group_id, "Secret group message".to_string(), None),
                 )
                 .await
                 {
@@ -246,13 +243,15 @@ async fn test_encrypted_group_message_sender_keys() {
                 bob_cursor,
                 EVENT_GROUP_MESSAGE_RECEIVED,
                 ACTION_TIMEOUT,
-                |payload| payload.get("id").and_then(serde_json::Value::as_str) == Some(message_id.as_str()),
+                |payload| payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some(message_id.as_str()),
             ),
             charlie.emitter.wait_for_event(
                 charlie_cursor,
                 EVENT_GROUP_MESSAGE_RECEIVED,
                 ACTION_TIMEOUT,
-                |payload| payload.get("id").and_then(serde_json::Value::as_str) == Some(message_id.as_str()),
+                |payload| payload.get("id").and_then(serde_json::Value::as_str)
+                    == Some(message_id.as_str()),
             ),
         );
 
@@ -660,23 +659,25 @@ async fn test_transfer_cancel_resume_completion() {
         let bob_resumed_offer_cursor = bob.emitter.mark();
         let resumed_transfer_id = match alice.state.resume_transfer(transfer_id.clone()).await {
             Ok(resumed_transfer_id) => resumed_transfer_id,
-            Err(_) => wait_for(TEST_TIMEOUT, || {
-                let state = Arc::clone(&alice.state);
-                let bob_id = bob_id.clone();
-                let source_path = source_path.clone();
-                async move {
-                    match tokio::time::timeout(
-                        Duration::from_secs(2),
-                        state.send_file(bob_id, source_path.to_string_lossy().into_owned()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resumed_transfer_id)) => Some(resumed_transfer_id),
-                        _ => None,
+            Err(_) => {
+                wait_for(TEST_TIMEOUT, || {
+                    let state = Arc::clone(&alice.state);
+                    let bob_id = bob_id.clone();
+                    let source_path = source_path.clone();
+                    async move {
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            state.send_file(bob_id, source_path.to_string_lossy().into_owned()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(resumed_transfer_id)) => Some(resumed_transfer_id),
+                            _ => None,
+                        }
                     }
-                }
-            })
-            .await,
+                })
+                .await
+            }
         };
 
         assert_ne!(resumed_transfer_id, transfer_id);
@@ -971,8 +972,8 @@ async fn test_tampered_ciphertext_rejection() {
 
         let tampered_sender_id = Uuid::new_v4().to_string();
         let (tampered_sender_private_key, tampered_sender_public_key) = generate_identity_keypair();
-        let tampered_sender =
-            WsPeerIdentity::new(tampered_sender_id, "Tampered Sender").with_transport_identity(
+        let tampered_sender = WsPeerIdentity::new(tampered_sender_id, "Tampered Sender")
+            .with_transport_identity(
                 public_key_to_base64(&tampered_sender_public_key),
                 CURRENT_PROTOCOL_VERSION,
             );
@@ -990,8 +991,8 @@ async fn test_tampered_ciphertext_rejection() {
 
         let tampered_cursor = bob.emitter.mark();
         let tampered_frame = vec![
-            0x00, 0x00, 0x00, 0x01,
-            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0xFF, 0xAA, 0xBB, 0x00, 0x11, 0x22, 0x33,
+            0x00, 0x00, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0xFF, 0xAA, 0xBB, 0x00, 0x11,
+            0x22, 0x33,
         ];
         raw_socket
             .send(WsMessage::Binary(tampered_frame.into()))
