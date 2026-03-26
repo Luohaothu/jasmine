@@ -29,7 +29,6 @@ async fn wait_for_group_snapshot(
         let state = Arc::clone(&node.state);
         let group_id = group_id.clone();
         let expected_name = expected_name.clone();
-        let expected_member_count = expected_member_count;
         async move {
             let groups = state.list_groups().await.ok()?;
             groups
@@ -349,7 +348,10 @@ where
     let maybe_frame = time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap_or_else(|_| panic!("{label} timeout"));
-    let frame = maybe_frame.unwrap_or_else(|| panic!("{label} missing frame"));
+    let frame = match maybe_frame {
+        Some(frame) => frame,
+        None => panic!("{label} missing frame"),
+    };
 
     match frame {
         Ok(WsMessage::Text(payload)) => {
@@ -366,7 +368,10 @@ where
     let maybe_frame = time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap_or_else(|_| panic!("{label} timeout"));
-    let frame = maybe_frame.unwrap_or_else(|| panic!("{label} missing frame"));
+    let frame = match maybe_frame {
+        Some(frame) => frame,
+        None => panic!("{label} missing frame"),
+    };
 
     match frame {
         Ok(WsMessage::Binary(payload)) => payload.to_vec(),
