@@ -621,6 +621,9 @@ async fn test_transfer_cancel_resume_completion() {
             .await
             .expect("accept initial transfer offer");
 
+        // NOTE: After cancel_transfer(), the sender-side transfer surfaces as state="failed"
+        // in get_transfers() payload mapping. The runtime does not use a separate "cancelled"
+        // state string — "failed" is the correct observed value for a cancelled sender transfer.
         wait_for(ACTION_TIMEOUT, || {
             let state = Arc::clone(&alice.state);
             let transfer_id = transfer_id.clone();
