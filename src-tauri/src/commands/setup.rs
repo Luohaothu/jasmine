@@ -135,21 +135,16 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         let (identity, generated_private_key) = identity_store
             .load_with_private_key()
             .map_err(|error| error.to_string())?;
-        let keystore_override = if context.runtime_config.keystore_mode.as_deref() == Some("file")
-        {
-            context.runtime_config
-                .keystore_root
-                .as_ref()
-                .map(|root| jasmine_crypto::Keystore::fallback_only(root.clone(), b"jasmine-test-mode".to_vec()))
+        let keystore_override = if context.runtime_config.keystore_mode.as_deref() == Some("file") {
+            context.runtime_config.keystore_root.as_ref().map(|root| {
+                jasmine_crypto::Keystore::fallback_only(root.clone(), b"jasmine-test-mode".to_vec())
+            })
         } else {
             None
         };
-        let local_private_key = resolve_local_private_key(
-            &identity,
-            generated_private_key,
-            keystore_override.as_ref(),
-        )
-        .map_err(|error| error.to_string())?;
+        let local_private_key =
+            resolve_local_private_key(&identity, generated_private_key, keystore_override.as_ref())
+                .map_err(|error| error.to_string())?;
         let settings_service = SettingsService::new(&context.app_data_dir);
         let storage = Arc::new(
             SqliteStorage::open(&context.database_path).map_err(|error| error.to_string())?,

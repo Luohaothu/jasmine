@@ -142,11 +142,8 @@ impl DiscoveryManager<MdnsDiscovery, UdpBroadcastDiscovery> {
 
     pub fn new_mdns_only(mdns_config: MdnsDiscoveryConfig) -> Result<Self> {
         let mdns = MdnsDiscovery::new(mdns_config)?;
-        let dummy_udp = UdpBroadcastDiscovery::new(UdpBroadcastConfig::new(
-            DeviceId(Uuid::nil()),
-            "unused",
-            0,
-        ));
+        let dummy_udp =
+            UdpBroadcastDiscovery::new(UdpBroadcastConfig::new(DeviceId(Uuid::nil()), "unused", 0));
         let mut manager = Self::with_services(mdns, dummy_udp);
         manager.skip_udp = true;
         Ok(manager)
