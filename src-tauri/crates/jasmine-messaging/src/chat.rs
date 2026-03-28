@@ -1429,7 +1429,13 @@ impl<S: ChatStorage + 'static> ChatServiceInner<S> {
         }
 
         self.rotate_sender_key_after_group_member_left(&updated)
-            .await
+            .await?;
+        self.fanout_group_create(
+            &updated,
+            other_group_member_peer_ids(&updated, &self.local_peer.device_id),
+        )
+        .await;
+        Ok(())
     }
 
     async fn handle_incoming_group_message(

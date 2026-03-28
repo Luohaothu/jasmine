@@ -11,6 +11,7 @@ use jasmine_core::{
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::{MdnsDiscovery, MdnsDiscoveryConfig, UdpBroadcastConfig, UdpBroadcastDiscovery};
 
@@ -127,6 +128,7 @@ pub struct DiscoveryManager<M = MdnsDiscovery, U = UdpBroadcastDiscovery> {
     udp: Arc<U>,
     state: Arc<Mutex<ManagerState>>,
     runtime: Arc<Mutex<RuntimeState>>,
+    skip_udp: bool,
 }
 
 impl DiscoveryManager<MdnsDiscovery, UdpBroadcastDiscovery> {
@@ -136,6 +138,15 @@ impl DiscoveryManager<MdnsDiscovery, UdpBroadcastDiscovery> {
             mdns,
             UdpBroadcastDiscovery::new(udp_config),
         ))
+    }
+
+    pub fn new_mdns_only(mdns_config: MdnsDiscoveryConfig) -> Result<Self> {
+        let mdns = MdnsDiscovery::new(mdns_config)?;
+        let dummy_udp =
+            UdpBroadcastDiscovery::new(UdpBroadcastConfig::new(DeviceId(Uuid::nil()), "unused", 0));
+        let mut manager = Self::with_services(mdns, dummy_udp);
+        manager.skip_udp = true;
+        Ok(manager)
     }
 }
 
@@ -154,6 +165,7 @@ where
             udp: Arc::new(udp),
             state,
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            skip_udp: false,
         }
     }
 
@@ -193,16 +205,22 @@ where
                     runtime.fallback_task = None;
                 }
 
-                let fallback_task = spawn_udp_fallback_task(
-                    Arc::clone(&self.udp),
-                    Arc::clone(&self.state),
-                    Arc::clone(&self.runtime),
-                );
-                let mut runtime = self.runtime.lock().expect("lock discovery manager runtime");
-                runtime.fallback_task = Some(fallback_task);
+                if !self.skip_udp {
+                    let fallback_task = spawn_udp_fallback_task(
+                        Arc::clone(&self.udp),
+                        Arc::clone(&self.state),
+                        Arc::clone(&self.runtime),
+                    );
+                    let mut runtime = self.runtime.lock().expect("lock discovery manager runtime");
+                    runtime.fallback_task = Some(fallback_task);
+                }
                 Ok(())
             }
             Err(mdns_error) => {
+                if self.skip_udp {
+                    return Err(mdns_error);
+                }
+
                 self.udp
                     .start_boxed()
                     .await

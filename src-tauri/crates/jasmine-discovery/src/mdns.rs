@@ -27,6 +27,7 @@ pub struct MdnsDiscoveryConfig {
     pub device_id: DeviceId,
     pub display_name: String,
     pub ws_port: u16,
+    pub service_type: Option<String>,
 }
 
 impl MdnsDiscoveryConfig {
@@ -40,7 +41,11 @@ impl MdnsDiscoveryConfig {
         let instance_name = format!("jasmine-{}", &instance_suffix[..6]);
 
         MdnsServiceRegistration {
-            service_type: JASMINE_MDNS_SERVICE_TYPE.to_string(),
+            service_type: self
+                .service_type
+                .as_deref()
+                .unwrap_or(JASMINE_MDNS_SERVICE_TYPE)
+                .to_string(),
             instance_name,
             host_name: format!("jasmine-{}.local.", self.device_id.0),
             port: self.ws_port,
@@ -72,6 +77,13 @@ impl MdnsDiscovery {
             runtime: Mutex::new(RuntimeState::default()),
         }
     }
+
+    fn service_type(&self) -> &str {
+        self.config
+            .service_type
+            .as_deref()
+            .unwrap_or(JASMINE_MDNS_SERVICE_TYPE)
+    }
 }
 
 impl DiscoveryService for MdnsDiscovery {
@@ -87,7 +99,8 @@ impl DiscoveryService for MdnsDiscovery {
 
         let registration = self.config.registration();
         let service_fullname = self.backend.register(registration)?;
-        let event_rx = match self.backend.browse(JASMINE_MDNS_SERVICE_TYPE) {
+        let service_type = self.service_type();
+        let event_rx = match self.backend.browse(service_type) {
             Ok(receiver) => receiver,
             Err(error) => {
                 let _ = self.backend.unregister(&service_fullname);
@@ -137,7 +150,7 @@ impl DiscoveryService for MdnsDiscovery {
             let _ = task.await;
         }
 
-        self.backend.stop_browse(JASMINE_MDNS_SERVICE_TYPE)?;
+        self.backend.stop_browse(self.service_type())?;
 
         if let Some(service_fullname) = service_fullname {
             self.backend.unregister(&service_fullname)?;
@@ -743,6 +756,7 @@ mod tests {
             device_id,
             display_name: display_name.to_string(),
             ws_port,
+            service_type: None,
         }
     }
 

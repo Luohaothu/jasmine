@@ -135,8 +135,16 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         let (identity, generated_private_key) = identity_store
             .load_with_private_key()
             .map_err(|error| error.to_string())?;
-        let local_private_key = resolve_local_private_key(&identity, generated_private_key)
-            .map_err(|error| error.to_string())?;
+        let keystore_override = if context.runtime_config.keystore_mode.as_deref() == Some("file") {
+            context.runtime_config.keystore_root.as_ref().map(|root| {
+                jasmine_crypto::Keystore::fallback_only(root.clone(), b"jasmine-test-mode".to_vec())
+            })
+        } else {
+            None
+        };
+        let local_private_key =
+            resolve_local_private_key(&identity, generated_private_key, keystore_override.as_ref())
+                .map_err(|error| error.to_string())?;
         let settings_service = SettingsService::new(&context.app_data_dir);
         let storage = Arc::new(
             SqliteStorage::open(&context.database_path).map_err(|error| error.to_string())?,
@@ -155,19 +163,31 @@ impl AppSetupFactory for DefaultAppSetupFactory {
         );
         let ws_port = server.local_addr().port();
 
-        let mut discovery = DiscoveryManager::new(
-            MdnsDiscoveryConfig {
+        let mut discovery = if context.runtime_config.discovery_mode.as_deref() == Some("mdns-only")
+        {
+            DiscoveryManager::new_mdns_only(MdnsDiscoveryConfig {
                 device_id: DeviceId(local_device_id),
                 display_name: identity.display_name.clone(),
                 ws_port,
-            },
-            UdpBroadcastConfig::new(
-                DeviceId(local_device_id),
-                identity.display_name.clone(),
-                ws_port,
-            ),
-        )
-        .map_err(|error| error.to_string())?;
+                service_type: context.runtime_config.mdns_service_type.clone(),
+            })
+            .map_err(|error| error.to_string())?
+        } else {
+            DiscoveryManager::new(
+                MdnsDiscoveryConfig {
+                    device_id: DeviceId(local_device_id),
+                    display_name: identity.display_name.clone(),
+                    ws_port,
+                    service_type: context.runtime_config.mdns_service_type.clone(),
+                },
+                UdpBroadcastConfig::new(
+                    DeviceId(local_device_id),
+                    identity.display_name.clone(),
+                    ws_port,
+                ),
+            )
+            .map_err(|error| error.to_string())?
+        };
 
         attach_discovery_callbacks(&mut discovery, Arc::clone(&storage), Arc::clone(&emitter));
 
@@ -2011,23 +2031,41 @@ fn local_peer_identity(identity: &DeviceIdentity) -> WsPeerIdentity {
 fn resolve_local_private_key(
     identity: &DeviceIdentity,
     generated_private_key: Option<Vec<u8>>,
+    keystore_override: Option<&jasmine_crypto::Keystore>,
 ) -> Result<Vec<u8>, jasmine_core::CoreError> {
     if let Some(private_key) = generated_private_key {
         let secret = static_secret_from_bytes(&private_key)?;
-        store_private_key(&identity.device_id, &secret)
-            .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?;
+        if let Some(ks) = keystore_override {
+            ks.store_private_key(&identity.device_id, &secret)
+                .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?;
+        } else {
+            store_private_key(&identity.device_id, &secret)
+                .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?;
+        }
         return Ok(private_key);
     }
 
-    load_private_key(&identity.device_id)
-        .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?
-        .map(|secret| secret.to_bytes().to_vec())
-        .ok_or_else(|| {
-            jasmine_core::CoreError::Persistence(format!(
-                "missing private key for device {}",
-                identity.device_id
-            ))
-        })
+    if let Some(ks) = keystore_override {
+        ks.load_private_key(&identity.device_id)
+            .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?
+            .map(|secret| secret.to_bytes().to_vec())
+            .ok_or_else(|| {
+                jasmine_core::CoreError::Persistence(format!(
+                    "missing private key for device {}",
+                    identity.device_id
+                ))
+            })
+    } else {
+        load_private_key(&identity.device_id)
+            .map_err(|error| jasmine_core::CoreError::Persistence(error.to_string()))?
+            .map(|secret| secret.to_bytes().to_vec())
+            .ok_or_else(|| {
+                jasmine_core::CoreError::Persistence(format!(
+                    "missing private key for device {}",
+                    identity.device_id
+                ))
+            })
+    }
 }
 
 fn static_secret_from_bytes(bytes: &[u8]) -> Result<StaticSecret, jasmine_core::CoreError> {

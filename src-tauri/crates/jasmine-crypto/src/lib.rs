@@ -16,7 +16,7 @@ pub use keypair::{
     fingerprint, generate_identity_keypair, public_key_from_base64, public_key_to_base64,
     PublicKeyBytes, SecretKeyBytes,
 };
-pub use keystore::{delete_private_key, load_private_key, store_private_key};
+pub use keystore::{delete_private_key, load_private_key, store_private_key, Keystore};
 pub use sender_keys::{
     create_distribution_message, generate_sender_key, process_distribution_message, SenderKey,
     SenderKeyDistribution, SENDER_KEY_MATERIAL_LEN,

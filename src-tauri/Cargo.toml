@@ -41,6 +41,10 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+e2e-test = ["dep:tauri-plugin-webdriver", "tauri/custom-protocol"]
+
 [dependencies]
 async-trait = "0.1"
 jasmine-core.workspace = true
@@ -54,6 +58,7 @@ serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-opener = "2"
+tauri-plugin-webdriver = { version = "0.2", optional = true }
 tokio.workspace = true
 tokio-util = "0.7"
 tracing.workspace = true

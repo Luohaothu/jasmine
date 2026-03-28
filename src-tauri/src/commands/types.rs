@@ -7,9 +7,33 @@ use jasmine_core::{
     protocol::CallType, AppSettings, DeviceIdentity, Message, OgMetadata, PeerInfo,
 };
 use jasmine_storage::CachedOgMetadata;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter as _;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestConfig {
+    pub instance_id: String,
+    pub app_data_dir: String,
+    pub download_dir: String,
+    pub ws_bind_addr: String,
+    pub discovery: TestDiscoveryConfig,
+    pub keystore: TestKeystoreConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestDiscoveryConfig {
+    pub mode: String,
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestKeystoreConfig {
+    pub mode: String,
+    pub root: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PeerPayload {
@@ -220,12 +244,20 @@ pub struct SetupContext {
 #[derive(Debug, Clone)]
 pub struct AppRuntimeConfig {
     pub ws_bind_addr: String,
+    pub discovery_mode: Option<String>,
+    pub mdns_service_type: Option<String>,
+    pub keystore_mode: Option<String>,
+    pub keystore_root: Option<std::path::PathBuf>,
 }
 
 impl Default for AppRuntimeConfig {
     fn default() -> Self {
         Self {
             ws_bind_addr: jasmine_messaging::DEFAULT_WS_BIND_ADDR.to_string(),
+            discovery_mode: None,
+            mdns_service_type: None,
+            keystore_mode: None,
+            keystore_root: None,
         }
     }
 }

@@ -34,28 +34,27 @@ pub fn delete_private_key(device_id: &str) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct Keystore {
+pub struct Keystore {
     keyring: KeyringBackend,
     fallback: FallbackResolver,
 }
 
 impl Keystore {
-    fn system() -> Self {
+    pub fn system() -> Self {
         Self {
             keyring: KeyringBackend::System,
             fallback: FallbackResolver::system(),
         }
     }
 
-    #[cfg(test)]
-    fn fallback_only(fallback_root: PathBuf, machine_material: Vec<u8>) -> Self {
+    pub fn fallback_only(fallback_root: PathBuf, machine_material: Vec<u8>) -> Self {
         Self {
             keyring: KeyringBackend::Unavailable,
             fallback: FallbackResolver::fixed(fallback_root, machine_material),
         }
     }
 
-    fn store_private_key(&self, device_id: &str, secret: &StaticSecret) -> Result<()> {
+    pub fn store_private_key(&self, device_id: &str, secret: &StaticSecret) -> Result<()> {
         validate_device_id(device_id)?;
 
         let mut secret_bytes = secret.to_bytes();
@@ -85,7 +84,7 @@ impl Keystore {
         result
     }
 
-    fn load_private_key(&self, device_id: &str) -> Result<Option<StaticSecret>> {
+    pub fn load_private_key(&self, device_id: &str) -> Result<Option<StaticSecret>> {
         validate_device_id(device_id)?;
 
         match self.keyring {
@@ -112,7 +111,7 @@ impl Keystore {
         }
     }
 
-    fn delete_private_key(&self, device_id: &str) -> Result<()> {
+    pub fn delete_private_key(&self, device_id: &str) -> Result<()> {
         validate_device_id(device_id)?;
 
         match self.keyring {
@@ -136,15 +135,14 @@ impl Keystore {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
-enum KeyringBackend {
+pub enum KeyringBackend {
     System,
     Unavailable,
 }
 
 #[derive(Debug, Clone)]
-struct FallbackResolver {
+pub struct FallbackResolver {
     root: FallbackRoot,
     machine_material: MachineMaterial,
 }
@@ -157,7 +155,6 @@ impl FallbackResolver {
         }
     }
 
-    #[cfg(test)]
     fn fixed(root: PathBuf, machine_material: Vec<u8>) -> Self {
         Self {
             root: FallbackRoot::Fixed(root),
@@ -294,9 +291,8 @@ impl FallbackResolver {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
-enum FallbackRoot {
+pub enum FallbackRoot {
     System,
     Fixed(PathBuf),
 }
@@ -310,9 +306,8 @@ impl FallbackRoot {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
-enum MachineMaterial {
+pub enum MachineMaterial {
     System,
     Fixed(Vec<u8>),
 }
