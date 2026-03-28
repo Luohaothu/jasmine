@@ -159,6 +159,7 @@ impl TestNode {
             emitter.clone(),
             AppRuntimeConfig {
                 ws_bind_addr: "0.0.0.0:0".to_string(),
+                ..AppRuntimeConfig::default()
             },
         )
         .await

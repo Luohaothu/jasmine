@@ -416,6 +416,83 @@ async fn test_group_fanout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_group_leave_propagates_to_remaining_members() {
+    let _guard = suite_lock().lock().await;
+    within_test_timeout("test_group_leave_propagates_to_remaining_members", async {
+        let alpha = TestNode::new().await;
+        let beta = TestNode::new().await;
+        let gamma = TestNode::new().await;
+        let alpha_id = alpha.device_id();
+        let beta_id = beta.device_id();
+        let gamma_id = gamma.device_id();
+
+        let _ = tokio::join!(
+            wait_for_peer(&alpha, beta_id.clone()),
+            wait_for_peer(&alpha, gamma_id.clone()),
+            wait_for_peer(&beta, alpha_id.clone()),
+            wait_for_peer(&gamma, alpha_id.clone()),
+        );
+
+        let group = alpha
+            .state
+            .create_group(
+                "Leave Group".to_string(),
+                vec![beta_id.clone(), gamma_id.clone()],
+            )
+            .await
+            .expect("create group");
+        let group_id = group.id.clone();
+
+        let _ = tokio::join!(
+            wait_for_group_snapshot(
+                alpha.database_path(),
+                group_id.clone(),
+                "Leave Group".to_string(),
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()],
+            ),
+            wait_for_group_snapshot(
+                beta.database_path(),
+                group_id.clone(),
+                "Leave Group".to_string(),
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()],
+            ),
+            wait_for_group_snapshot(
+                gamma.database_path(),
+                group_id.clone(),
+                "Leave Group".to_string(),
+                vec![alpha_id.clone(), beta_id.clone(), gamma_id.clone()],
+            ),
+        );
+
+        gamma
+            .state
+            .leave_group(group_id.clone())
+            .await
+            .expect("gamma leaves group");
+
+        let _ = tokio::join!(
+            wait_for_group_snapshot(
+                alpha.database_path(),
+                group_id.clone(),
+                "Leave Group".to_string(),
+                vec![alpha_id.clone(), beta_id.clone()],
+            ),
+            wait_for_group_snapshot(
+                beta.database_path(),
+                group_id.clone(),
+                "Leave Group".to_string(),
+                vec![alpha_id.clone(), beta_id.clone()],
+            ),
+        );
+
+        gamma.shutdown().await;
+        beta.shutdown().await;
+        alpha.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_file_transfer() {
     let _guard = suite_lock().lock().await;
     within_test_timeout("test_file_transfer", async {
